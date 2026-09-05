@@ -1,0 +1,246 @@
+@using StoryForge.Core.Pipeline
+@using StoryForge.Web.Pipeline
+@implements IDisposable
+@inject PipelineStatusState State
+@inject IJSRuntime JS
+
+<div class="ps-page">
+    <div class="ps-toolbar">
+        <button @onclick="Refresh">重新整理</button>
+        <button @onclick="DownloadSheet">下載Sheet</button>
+        <details class="ps-chapter-filter">
+            <summary>章節篩選 (@_selectedChapters.Count/@AllChapters.Count)</summary>
+            <div class="ps-chapter-filter-menu">
+                <label><input type="checkbox" checked="@AllSelected" @onchange="ToggleAll" /> 全選/全不選</label>
+                <hr />
+                @foreach (var chapter in AllChapters)
+                {
+                    <label><input type="checkbox" checked="@_selectedChapters.Contains(chapter)"
+                                  @onchange="e => ToggleChapter(chapter, e)" /> @chapter</label>
+                }
+            </div>
+        </details>
+        <input class="ps-search" placeholder="搜尋劇本名稱..." @bind="_searchText" @bind:event="oninput" />
+        <span class="ps-status">@State.StatusMessage</span>
+    </div>
+    <div class="ps-grid-wrap">
+        <table class="ps-grid">
+            <thead>
+                <tr id="ps-header-row">
+                    @foreach (var col in _columns)
+                    {
+                        <th @key="col.Key" title="拖曳可調整欄位順序">@col.Label</th>
+                    }
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var row in FilteredRows)
+                {
+                    <tr>
+                        @foreach (var col in _columns)
+                        {
+                            <td @key="col.Key" class="@GetCellClass(col.Key)" title="@GetCellTitle(col.Key)">@GetCellText(row, col.Key)</td>
+                        }
+                    </tr>
+                }
+            </tbody>
+        </table>
+        @if (State.Rows.Count == 0)
+        {
+            <div class="ps-empty">流程圖裡還沒有任何有劇本名稱的節點</div>
+        }
+    </div>
+</div>
+
+<style>
+    .ps-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; background: #262626; }
+    .ps-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1e1e1e; border-bottom: 1px solid #333; }
+    .ps-search { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 8px; border-radius: 3px; width: 220px; }
+    .ps-status { margin-left: auto; opacity: 0.8; font-size: 12px; }
+    .ps-chapter-filter { position: relative; font-size: 13px; }
+    .ps-chapter-filter summary { cursor: pointer; padding: 5px 10px; background: #2a2a2a; border: 1px solid #444; border-radius: 3px; list-style: none; }
+    .ps-chapter-filter summary::-webkit-details-marker { display: none; }
+    .ps-chapter-filter-menu { position: absolute; top: 100%; left: 0; z-index: 20; margin-top: 4px; background: #2a2a2a; border: 1px solid #444; border-radius: 3px; padding: 8px 12px; min-width: 140px; max-height: 320px; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+    .ps-chapter-filter-menu label { display: block; padding: 3px 0; white-space: nowrap; }
+    .ps-chapter-filter-menu hr { border-color: #444; margin: 4px 0; }
+    .ps-grid-wrap { flex: 1 1 auto; overflow: auto; }
+    .ps-grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .ps-grid th { position: sticky; top: 0; background: #1e1e1e; text-align: left; padding: 6px 10px; border-bottom: 1px solid #333; cursor: grab; user-select: none; }
+    .ps-grid td { padding: 5px 10px; border-bottom: 1px solid #2e2e2e; }
+    .ps-grid tr:hover td { background: #2f2f2f; }
+    .ps-name { word-break: break-all; }
+    .ps-check { text-align: center; color: #7fd77f; }
+    .ps-unknown { text-align: center; opacity: 0.35; }
+    .ps-empty { padding: 16px; opacity: 0.6; font-size: 13px; }
+</style>
+
+@code {
+    private sealed class ColumnDef
+    {
+        public string Key = string.Empty;
+        public string Label = string.Empty;
+    }
+
+    // Draggable order — matches DataGridView's AllowUserToOrderColumns from the original tool. A plain
+    // list (not persisted) since this is a cosmetic per-session preference, not data.
+    private List<ColumnDef> _columns = new()
+    {
+        new() { Key = "chapter", Label = "章節" },
+        new() { Key = "name", Label = "劇本名稱" },
+        new() { Key = "ldtk", Label = "LDtk" },
+        new() { Key = "graph", Label = "流程圖" },
+        new() { Key = "sheetDir", Label = "Sheet目錄" },
+        new() { Key = "sheetFile", Label = "Sheet檔案" },
+        new() { Key = "csharp", Label = "C#" },
+    };
+    private DotNetObjectReference<PipelineStatusPanel>? _selfRef;
+
+    private string _searchText = string.Empty;
+
+    // Chapters newly seen on a refresh default to selected so a refresh never silently hides new data —
+    // matching the original tool's own ChapterFilterSettings behavior — but a chapter the user has
+    // manually deselected stays deselected across refreshes (tracked via _knownChapters).
+    private HashSet<string> _selectedChapters = new();
+    private HashSet<string> _knownChapters = new();
+
+    // Loaded once at startup — null means no prior selection was ever saved, so the very first
+    // population falls back to "default everything to selected" instead of an empty filter. Persists
+    // across circuit restarts/page reloads (unlike the two HashSets above), matching the original tool.
+    private readonly HashSet<string>? _persistedSelectedChapters =
+        ChapterFilterSettings.LoadOrNull() is { } persisted
+            ? new HashSet<string>(persisted.SelectedChapters, StringComparer.Ordinal)
+            : null;
+
+    private List<string> AllChapters =>
+        State.Rows.Select(r => r.Chapter).Distinct().OrderBy(c => c, StringComparer.Ordinal).ToList();
+
+    private bool AllSelected => AllChapters.Count > 0 && AllChapters.All(_selectedChapters.Contains);
+
+    private IEnumerable<PipelineStatusRow> FilteredRows =>
+        State.Rows
+            .Where(r => _selectedChapters.Contains(r.Chapter))
+            .Where(r => string.IsNullOrWhiteSpace(_searchText) ||
+                        r.PlayscriptName.Contains(_searchText, StringComparison.OrdinalIgnoreCase));
+
+    protected override void OnInitialized()
+    {
+        State.Refresh();
+        SyncChapterSelection();
+    }
+
+    // Re-armed on every render (init() itself destroys any previous instance first) rather than only on
+    // firstRender — a reorder's own StateHasChanged() re-renders the header row, and the freshly-rendered
+    // <tr> needs SortableJS wired to it again for the next drag to work.
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _selfRef ??= DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("storyForgeColumnSort.init", "ps-header-row", _selfRef);
+    }
+
+    // Called by column-sort.js after a drag completes — SortableJS already physically moved the <th> in
+    // the DOM itself; this just updates the C# source of truth to match and re-renders from it, so a
+    // stray external DOM mutation never drifts out of sync with what Blazor thinks the column order is.
+    [JSInvokable]
+    public void OnColumnReordered(int oldIndex, int newIndex)
+    {
+        if (oldIndex < 0 || oldIndex >= _columns.Count || newIndex < 0 || newIndex >= _columns.Count)
+            return;
+
+        var column = _columns[oldIndex];
+        _columns.RemoveAt(oldIndex);
+        _columns.Insert(newIndex, column);
+        StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        _selfRef?.Dispose();
+    }
+
+    private void Refresh()
+    {
+        State.Refresh();
+        SyncChapterSelection();
+    }
+
+    private async Task DownloadSheet()
+    {
+        await State.DownloadSheetAsync();
+        SyncChapterSelection();
+    }
+
+    private void SyncChapterSelection()
+    {
+        var isFirstPopulation = _knownChapters.Count == 0;
+
+        foreach (var chapter in AllChapters)
+        {
+            if (!_knownChapters.Add(chapter))
+                continue;
+
+            // The very first time chapters are ever seen this run, respect a previously-saved selection
+            // if there is one, instead of defaulting everything to selected. A chapter that shows up later
+            // (a subsequent refresh finds something new) always defaults to selected regardless, so a
+            // refresh never silently hides data the user hasn't already chosen to filter out themselves.
+            if (isFirstPopulation && _persistedSelectedChapters != null)
+            {
+                if (_persistedSelectedChapters.Contains(chapter))
+                    _selectedChapters.Add(chapter);
+            }
+            else
+            {
+                _selectedChapters.Add(chapter);
+            }
+        }
+    }
+
+    private void ToggleAll(ChangeEventArgs e)
+    {
+        var check = e.Value is bool b && b;
+        _selectedChapters = check ? AllChapters.ToHashSet() : new HashSet<string>();
+        SaveChapterSelection();
+    }
+
+    private void ToggleChapter(string chapter, ChangeEventArgs e)
+    {
+        var check = e.Value is bool b && b;
+        if (check)
+            _selectedChapters.Add(chapter);
+        else
+            _selectedChapters.Remove(chapter);
+        SaveChapterSelection();
+    }
+
+    private void SaveChapterSelection()
+    {
+        new ChapterFilterSettings { SelectedChapters = _selectedChapters.ToList() }.Save();
+    }
+
+    private static string GetCellText(PipelineStatusRow row, string key) => key switch
+    {
+        "chapter" => row.Chapter,
+        "name" => row.PlayscriptName,
+        "ldtk" => row.IsOnLdtk ? "✔" : "",
+        "graph" => row.IsOnGraph ? "✔" : "",
+        "sheetDir" => row.IsOnSheet ? "✔" : "",
+        "sheetFile" => row.HasSheetFile ? "✔" : "",
+        "csharp" => row.IsOnCSharp ? "✔" : "",
+        _ => "",
+    };
+
+    private static string GetCellClass(string key) => key switch
+    {
+        "name" => "ps-name",
+        "ldtk" or "graph" or "sheetDir" or "sheetFile" or "csharp" => "ps-check",
+        _ => "",
+    };
+
+    // "Sheet目錄" = listed in the index sheet at all. "Sheet檔案" = that listing already has its own
+    // dedicated spreadsheet (a real link) and isn't marked "空" in that chapter tab's own empty-check column.
+    private static string GetCellTitle(string key) => key switch
+    {
+        "sheetDir" => "是否列在 Sheet 索引中",
+        "sheetFile" => "是否已有自己的 GoogleSheet 分頁，且未被標記為空",
+        _ => "",
+    };
+}

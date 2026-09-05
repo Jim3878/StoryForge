@@ -1,0 +1,212 @@
+@using StoryForge.Web.GraphEditor
+@implements IDisposable
+@inject GraphEditorState State
+@inject IJSRuntime JS
+@inject IWebHostEnvironment Env
+
+<div class="graph-page">
+    <div class="graph-toolbar">
+        <button @onclick="Reload">重新載入</button>
+        <button @onclick="Save">存檔</button>
+        <button @onclick="FitView">縮放至全部</button>
+        <span class="graph-status">@State.StatusMessage</span>
+        <span class="graph-version">graph-editor.js @JsLastModified</span>
+    </div>
+    <div class="graph-body">
+        <canvas id="story-forge-canvas" class="graph-canvas" tabindex="0"></canvas>
+        @if (_selectedNodeGuid != null)
+        {
+            <div class="graph-inspector">
+                <div class="graph-inspector-title">@_selectedNodeTitle</div>
+                <div class="graph-inspector-guid">@_selectedNodeGuid</div>
+                @if (_selectedNodeIdentityFields.Count == 0)
+                {
+                    <div class="graph-inspector-empty">這個節點類型沒有可編輯欄位</div>
+                }
+                else
+                {
+                    @foreach (var fieldName in _selectedNodeIdentityFields)
+                    {
+                        <label class="graph-inspector-field">
+                            <span>@fieldName</span>
+                            @if (fieldName == "memo")
+                            {
+                                <textarea value="@GetFieldValue(fieldName)"
+                                          @onchange="e => OnFieldChanged(fieldName, e)"></textarea>
+                            }
+                            else
+                            {
+                                <input value="@GetFieldValue(fieldName)"
+                                       @onchange="e => OnFieldChanged(fieldName, e)" />
+                            }
+                        </label>
+                    }
+                }
+            </div>
+        }
+    </div>
+</div>
+
+<style>
+    /* Fills the tab-body's .tab-pane wrapper (position:absolute; inset:0, sized by Home.razor's flex
+       layout below the menubar + tab strip) rather than the viewport directly — this component is now
+       always mounted (kept alive so its LiteGraph canvas state survives switching tabs), with the .tab-pane
+       wrapper's own display:none/block toggling visibility instead of this component being torn down. */
+    .graph-page { height: 100%; width: 100%; display: flex; flex-direction: column; }
+    .graph-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1e1e1e; color: #ddd; }
+    .graph-status { margin-left: 8px; opacity: 0.8; }
+    .graph-version { margin-left: auto; opacity: 0.5; font-size: 11px; font-family: monospace; }
+    .graph-body { flex: 1 1 auto; display: flex; min-height: 0; }
+    /* No width/height:100% here — against a sibling (.graph-inspector) that itself has a fixed width, an
+       explicit 100% here ignores that sibling entirely and both end up wider than .graph-body, pushing the
+       inspector off past the viewport edge (invisible, but present in the DOM). flex:1 1 auto with
+       min-width:0 lets it correctly claim only whatever's left after the fixed-width sidebar. */
+    /* tabindex="0" on the canvas element (see markup) is required for LiteGraph's own keyboard handling
+       (Delete/Backspace to remove selected nodes) to work at all — a plain canvas is never in the
+       browser's focus chain, so LiteGraph's canvas.focus() call on mousedown was previously a no-op and
+       its keydown listener (bound to the canvas element itself, not document) never fired. outline:none
+       here just hides the resulting focus ring, which looks out of place against the graph background. */
+    .graph-canvas { flex: 1 1 auto; min-width: 0; display: block; background: #333; outline: none; }
+    /* flex:0 0 280px (a fixed *basis*) instead of an explicit width: the browser's own native resize handle
+       (from the plain `resize` property below) works by writing directly to this element's width style —
+       against a flex-basis, that write would just get overridden back to 280px on the next layout pass. An
+       explicit width free of any flex sizing keeps whatever the user drags it to. */
+    .graph-inspector { flex: 0 0 auto; width: 280px; min-width: 160px; max-width: 70vw; resize: horizontal; overflow: auto; background: #1e1e1e; color: #ddd; padding: 12px; border-left: 1px solid #333; }
+    .graph-inspector-title { font-weight: bold; margin-bottom: 4px; word-break: break-all; }
+    .graph-inspector-guid { font-size: 11px; opacity: 0.5; font-family: monospace; margin-bottom: 12px; word-break: break-all; }
+    .graph-inspector-empty { opacity: 0.6; font-size: 13px; }
+    .graph-inspector-field { display: block; margin-bottom: 10px; font-size: 13px; }
+    .graph-inspector-field span { display: block; margin-bottom: 4px; opacity: 0.8; }
+    .graph-inspector-field input { width: 100%; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 6px; border-radius: 3px; }
+    /* Multi-line, and its own native drag-to-resize handle (bottom-right corner) — same free browser
+       behavior as the sidebar's own resize above, just vertical-only here since width already follows the
+       sidebar's width. min-height keeps it from being dragged down to a sliver. */
+    .graph-inspector-field textarea { width: 100%; min-height: 80px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 6px; border-radius: 3px; font: inherit; resize: vertical; }
+</style>
+
+@code {
+    private GraphEditorPayload? _payload;
+    private DotNetObjectReference<FlowGraphPanel>? _selfRef;
+
+    private string? _selectedNodeGuid;
+    private string _selectedNodeTitle = string.Empty;
+    private List<string> _selectedNodeIdentityFields = new();
+    private Dictionary<string, string> _selectedNodeFieldValues = new();
+
+    // Shown in the toolbar so a stale-cache/stale-build question can be answered by eye instead of guessed
+    // at — reads the actual file on disk each render rather than a hand-maintained version constant, so it
+    // can never drift out of sync with what's really being served.
+    private string JsLastModified =>
+        File.GetLastWriteTime(Path.Combine(Env.WebRootPath, "js", "graph-editor.js")).ToString("MM/dd HH:mm:ss");
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadAndInit();
+    }
+
+    private async Task LoadAndInit()
+    {
+        try
+        {
+            DiagnosticsLog.Write("LoadAndInit: start");
+            _payload = State.LoadGraph();
+            _selfRef ??= DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("storyForgeGraph.init", "story-forge-canvas", _payload, _selfRef);
+            DiagnosticsLog.Write("LoadAndInit: done, status=" + State.StatusMessage);
+            StateHasChanged();
+        }
+        catch (Exception e)
+        {
+            DiagnosticsLog.Write("LoadAndInit: EXCEPTION " + e);
+            throw;
+        }
+    }
+
+    // Called from graph-editor.js the instant it creates a node via the add-node menu (before the node is
+    // necessarily selected) — makes the node real in the live model right away rather than waiting for
+    // 存檔, so OnNodeSelectionChanged below can find it immediately.
+    [JSInvokable]
+    public void OnNodeCreated(string guid, string typeName, float x, float y)
+    {
+        State.CreateNode(guid, typeName, x, y);
+    }
+
+    // Called from graph-editor.js's onSelectionChange — guid is null when nothing (or more than one node)
+    // is selected, since the sidebar only ever shows a single node's fields at a time.
+    [JSInvokable]
+    public void OnNodeSelectionChanged(string? guid)
+    {
+        _selectedNodeGuid = guid;
+        if (guid == null)
+        {
+            _selectedNodeFieldValues = new();
+            _selectedNodeIdentityFields = new();
+            _selectedNodeTitle = string.Empty;
+        }
+        else
+        {
+            // TypeName is read from the live model (via State), not the initial-load _payload.Nodes
+            // snapshot — a node created this session via the add-node menu is never in that stale
+            // snapshot, but OnNodeCreated above already added it to the live model by the time selection
+            // can happen, so this always resolves correctly for both existing and brand-new nodes.
+            var typeName = State.GetNodeTypeName(guid);
+            var typeDto = _payload?.NodeTypes.FirstOrDefault(t => t.TypeName == typeName);
+            var nodeDto = _payload?.Nodes.FirstOrDefault(n => n.Guid == guid);
+            _selectedNodeTitle = nodeDto?.Title ?? typeDto?.DisplayName ?? guid;
+            _selectedNodeIdentityFields = typeDto?.IdentityFields ?? new();
+            // Re-read from the live model rather than trusting the payload snapshot, in case this node's
+            // fields were already edited earlier in the session.
+            _selectedNodeFieldValues = State.GetNodeFields(guid)?.ToDictionary(kv => kv.Key, kv => kv.Value)
+                                        ?? new();
+        }
+
+        StateHasChanged();
+    }
+
+    private string GetFieldValue(string fieldName) =>
+        _selectedNodeFieldValues.TryGetValue(fieldName, out var value) ? value : string.Empty;
+
+    private void OnFieldChanged(string fieldName, ChangeEventArgs e)
+    {
+        if (_selectedNodeGuid == null)
+            return;
+
+        var value = e.Value?.ToString() ?? string.Empty;
+        _selectedNodeFieldValues[fieldName] = value;
+        State.UpdateNodeField(_selectedNodeGuid, fieldName, value);
+    }
+
+    public void Dispose()
+    {
+        _selfRef?.Dispose();
+    }
+
+    private async Task Reload()
+    {
+        await LoadAndInit();
+    }
+
+    private async Task Save()
+    {
+        try
+        {
+            DiagnosticsLog.Write("Save: clicked");
+            var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
+            DiagnosticsLog.Write($"Save: exported {export.NodePositions.Count} positions, {export.Edges.Count} edges");
+            State.ApplyAndSave(export);
+            DiagnosticsLog.Write("Save: done, status=" + State.StatusMessage);
+            StateHasChanged();
+        }
+        catch (Exception e)
+        {
+            DiagnosticsLog.Write("Save: EXCEPTION " + e);
+            throw;
+        }
+    }
+
+    private async Task FitView()
+    {
+        await JS.InvokeVoidAsync("storyForgeGraph.fitView");
+    }
+}

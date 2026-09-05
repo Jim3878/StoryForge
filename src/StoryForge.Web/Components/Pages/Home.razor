@@ -1,0 +1,53 @@
+@page "/"
+@using StoryForge.Web.Components.Panels
+
+@* The "分頁" layer between MainLayout's global 工具列 and each panel's own 分頁工具列 (流程圖's
+   重新載入/存檔/縮放至全部, 角色卡's 新增角色/刪除角色). Both panels are ALWAYS rendered — switching
+   tabs only toggles a wrapper div's display:none/block — rather than @if-ing one away, so a panel's own
+   state (FlowGraphPanel's LiteGraph canvas especially) survives switching tabs and back with no reload. *@
+<PageTitle>StoryForge</PageTitle>
+
+<div class="tab-shell">
+    <div class="tab-strip">
+        <button class="tab-strip-item @(_activeTab == "outline" ? "active" : "")" @onclick='() => SetTab("outline")'>世界書</button>
+        <button class="tab-strip-item @(_activeTab == "pipeline" ? "active" : "")" @onclick='() => SetTab("pipeline")'>劇本管線狀態</button>
+        <button class="tab-strip-item @(_activeTab == "graph" ? "active" : "")" @onclick='() => SetTab("graph")'>流程圖</button>
+        <button class="tab-strip-item @(_activeTab == "card" ? "active" : "")" @onclick='() => SetTab("card")'>角色卡</button>
+    </div>
+    <div class="tab-body">
+        <div class="tab-pane" style="display:@(_activeTab == "outline" ? "block" : "none")">
+            <StoryOutlinePanel />
+        </div>
+        <div class="tab-pane" style="display:@(_activeTab == "pipeline" ? "block" : "none")">
+            <PipelineStatusPanel />
+        </div>
+        <div class="tab-pane" style="display:@(_activeTab == "graph" ? "block" : "none")">
+            <FlowGraphPanel />
+        </div>
+        <div class="tab-pane" style="display:@(_activeTab == "card" ? "block" : "none")">
+            <CharacterCardPanel />
+        </div>
+    </div>
+</div>
+
+<style>
+    /* Fills MainLayout's .app-content box (fixed, top:32px, below the global menubar). */
+    .tab-shell { position: absolute; inset: 0; display: flex; flex-direction: column; }
+    .tab-strip { flex: 0 0 auto; display: flex; gap: 4px; padding: 4px 8px 0; background: #1a1a1a; border-bottom: 1px solid #333; font-family: sans-serif; }
+    .tab-strip-item { background: #242424; color: #aaa; border: 1px solid #3a3a3a; border-bottom: none; padding: 6px 18px; border-radius: 4px 4px 0 0; cursor: pointer; font-size: 13px; }
+    .tab-strip-item:hover { background: #2c2c2c; }
+    .tab-strip-item.active { background: #333; color: #fff; }
+    /* position:relative establishes the containing block .tab-pane's position:absolute measures against —
+       without it, each pane would size itself against the viewport instead of this flex-allotted box. */
+    .tab-body { flex: 1 1 auto; position: relative; min-height: 0; }
+    .tab-pane { position: absolute; inset: 0; }
+</style>
+
+@code {
+    private string _activeTab = "graph";
+
+    private void SetTab(string tab)
+    {
+        _activeTab = tab;
+    }
+}

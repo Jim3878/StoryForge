@@ -1,0 +1,191 @@
+@using StoryForge.Core.CharacterCard
+@using StoryForge.Web.CharacterCard
+@inject CharacterCardState State
+@inject StoryForge.Core.Graph.AppSettings Settings
+@inject IJSRuntime JS
+
+<div class="cc-page">
+    <div class="cc-toolbar">
+        <button @onclick="AddCard">新增角色</button>
+        <button @onclick="DeleteSelected" disabled="@(_selectedId == null)">刪除角色</button>
+        <label class="cc-size-slider">
+            <span>縮圖大小</span>
+            <input type="range" min="100" max="500" step="10" value="@Settings.PortraitPreviewSize"
+                   @oninput="OnPreviewSizeInput" @onchange="OnPreviewSizeCommitted" />
+            <span>@((int)Settings.PortraitPreviewSize)px</span>
+        </label>
+        <span class="cc-status">@State.StatusMessage</span>
+    </div>
+    <div class="cc-body">
+        <div class="cc-list">
+            @if (State.Cards.Count == 0)
+            {
+                <div class="cc-list-empty">還沒有角色卡</div>
+            }
+            @foreach (var card in State.Cards)
+            {
+                <div class="cc-list-item @(card.Id == _selectedId ? "selected" : "")" @onclick="() => Select(card.Id)">
+                    @GetDisplayLabel(card)
+                </div>
+            }
+        </div>
+        <div class="cc-detail">
+            @if (_selected != null)
+            {
+                <label class="cc-field">
+                    <span>中文名稱</span>
+                    <input value="@_selected.ChineseName" @onchange="e => UpdateField(_selected, FieldName.ChineseName, e)" />
+                </label>
+                <label class="cc-field">
+                    <span>立繪分組連結</span>
+                    <select value="@_selected.LinkedPortraitCharacter" @onchange="e => UpdateField(_selected, FieldName.LinkedPortraitCharacter, e)">
+                        <option value="">（未連結立繪）</option>
+                        @foreach (var name in State.PortraitCharacters)
+                        {
+                            <option value="@name">@name</option>
+                        }
+                        @if (!string.IsNullOrEmpty(_selected.LinkedPortraitCharacter) && !State.PortraitCharacters.Contains(_selected.LinkedPortraitCharacter))
+                        {
+                            <option value="@_selected.LinkedPortraitCharacter">@_selected.LinkedPortraitCharacter（找不到對應立繪）</option>
+                        }
+                    </select>
+                </label>
+                @if (!string.IsNullOrEmpty(_selected.LinkedPortraitCharacter))
+                {
+                    var portraits = State.GetPortraitEntries(_selected.LinkedPortraitCharacter);
+                    <div class="cc-portrait-gallery">
+                        @if (portraits.Count == 0)
+                        {
+                            <div class="cc-portrait-empty">找不到「@_selected.LinkedPortraitCharacter」的立繪檔案</div>
+                        }
+                        @foreach (var entry in portraits)
+                        {
+                            <div class="cc-portrait-thumb" style="width:@(Settings.PortraitPreviewSize)px;">
+                                <img src="@GetThumbnailUrl(entry.FileName)" alt="@State.GetFaceLabel(entry.Variant)"
+                                     style="width:@(Settings.PortraitPreviewSize)px;" />
+                                <span>@State.GetFaceLabel(entry.Variant)</span>
+                                <span class="cc-portrait-filename">@entry.FileName</span>
+                                <textarea class="cc-portrait-note" placeholder="這個表情的其他意思／用途（給 AI 參考）"
+                                          value="@State.GetPortraitDescription(entry.FileName)"
+                                          @onchange="e => UpdatePortraitDescription(entry.FileName, e)"></textarea>
+                            </div>
+                        }
+                    </div>
+                }
+                <label class="cc-field">
+                    <span>備註（個性/語氣/背景等，給 AI 參考）</span>
+                    <textarea @onchange="e => UpdateField(_selected, FieldName.Note, e)">@_selected.Note</textarea>
+                </label>
+            }
+            else
+            {
+                <div class="cc-empty">選一個角色來編輯，或按「新增角色」</div>
+            }
+        </div>
+    </div>
+</div>
+
+<style>
+    .cc-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; }
+    .cc-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1e1e1e; }
+    .cc-status { margin-left: 8px; opacity: 0.8; font-size: 13px; }
+    .cc-size-slider { display: flex; align-items: center; gap: 6px; font-size: 12px; opacity: 0.85; margin-left: 12px; }
+    .cc-size-slider input[type="range"] { width: 120px; }
+    .cc-body { flex: 1 1 auto; display: flex; min-height: 0; background: #262626; }
+    .cc-list { flex: 0 0 240px; overflow-y: auto; border-right: 1px solid #333; }
+    .cc-list-empty { padding: 12px; opacity: 0.6; font-size: 13px; }
+    .cc-list-item { padding: 8px 12px; font-size: 13px; cursor: pointer; border-bottom: 1px solid #2e2e2e; word-break: break-all; }
+    .cc-list-item:hover { background: #2f2f2f; }
+    .cc-list-item.selected { background: #37507a; color: #fff; }
+    .cc-detail { flex: 1 1 auto; padding: 16px; overflow-y: auto; }
+    .cc-empty { opacity: 0.6; font-size: 13px; }
+    .cc-field { display: block; margin-bottom: 14px; font-size: 13px; max-width: 480px; }
+    .cc-field span { display: block; margin-bottom: 4px; opacity: 0.8; }
+    .cc-field input, .cc-field select { width: 100%; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; }
+    .cc-field textarea { width: 100%; min-height: 120px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: vertical; }
+    .cc-portrait-gallery { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; width: 100%; }
+    .cc-portrait-empty { opacity: 0.6; font-size: 12px; }
+    .cc-portrait-thumb { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; }
+    .cc-portrait-thumb img { border: 1px solid #444; border-radius: 3px; background: #1c1c1c; display: block; }
+    .cc-portrait-filename { opacity: 0.5; word-break: break-all; text-align: center; }
+    .cc-portrait-note { width: 100%; box-sizing: border-box; min-height: 40px; resize: vertical; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 6px; border-radius: 3px; font: inherit; font-size: 11px; }
+</style>
+
+@code {
+    private enum FieldName { ChineseName, LinkedPortraitCharacter, Note }
+
+    private string? _selectedId;
+    private CharacterCardEntry? _selected => State.Cards.FirstOrDefault(c => c.Id == _selectedId);
+
+    protected override void OnInitialized()
+    {
+        State.Load();
+    }
+
+    private void Select(string id)
+    {
+        _selectedId = id;
+    }
+
+    private void AddCard()
+    {
+        var card = State.AddCard();
+        _selectedId = card.Id;
+    }
+
+    private async Task DeleteSelected()
+    {
+        if (_selectedId == null)
+            return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"確定要刪除「{GetDisplayLabel(_selected!)}」嗎？");
+        if (!confirmed)
+            return;
+
+        State.DeleteCard(_selectedId);
+        _selectedId = null;
+    }
+
+    private void UpdateField(CharacterCardEntry card, FieldName field, ChangeEventArgs e)
+    {
+        var value = e.Value?.ToString() ?? string.Empty;
+        switch (field)
+        {
+            case FieldName.ChineseName: card.ChineseName = value; break;
+            case FieldName.LinkedPortraitCharacter: card.LinkedPortraitCharacter = value; break;
+            case FieldName.Note: card.Note = value; break;
+        }
+        State.Save();
+    }
+
+    private void UpdatePortraitDescription(string fileName, ChangeEventArgs e)
+    {
+        State.SetPortraitDescription(fileName, e.Value?.ToString() ?? string.Empty);
+    }
+
+    // oninput updates the in-memory value on every drag tick (live resize feedback, no disk write);
+    // onchange (fires once, on release) is the only point that actually persists it — dragging a range
+    // input fires oninput far too often to save on every tick.
+    private void OnPreviewSizeInput(ChangeEventArgs e)
+    {
+        if (float.TryParse(e.Value?.ToString(), out var value))
+            Settings.PortraitPreviewSize = value;
+    }
+
+    private void OnPreviewSizeCommitted(ChangeEventArgs e)
+    {
+        Settings.Save();
+    }
+
+    // Crop percentages ride along as a query string so the browser treats a settings change as a
+    // different image URL — otherwise it would keep showing an already-cached thumbnail cropped under the
+    // old ratio even after the Settings dialog saves a new one.
+    private string GetThumbnailUrl(string fileName) =>
+        $"/api/portraits/{Uri.EscapeDataString(fileName)}?top={Settings.PortraitTopCutPercent}&bottom={Settings.PortraitBottomCutPercent}";
+
+    private static string GetDisplayLabel(CharacterCardEntry card)
+    {
+        var name = string.IsNullOrEmpty(card.ChineseName) ? "(未命名)" : card.ChineseName;
+        return string.IsNullOrEmpty(card.LinkedPortraitCharacter) ? name : $"{name}［{card.LinkedPortraitCharacter}］";
+    }
+}

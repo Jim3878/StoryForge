@@ -1,0 +1,49 @@
+@inherits LayoutComponentBase
+@using StoryForge.Web.Components
+
+@* The global chrome every page sits under — 工具列 in the "工具列 / 分頁 / 分頁工具列" hierarchy the old
+   WinForms tool had (a MenuStrip with 檔案/工具/檢視, 設定 living under 工具). Each page's own toolbar
+   (e.g. Home.razor's 重新載入/存檔/縮放至全部) is the "分頁工具列" one level below this — page-specific,
+   not global, so it stays in the page rather than moving up here. Only one page/tab exists so far
+   (流程圖), so there's no real tab strip to build yet; this just reserves the correct global layer above
+   it so 設定 — and future 檔案/工具/檢視-style items — don't end up bolted onto whichever page happens to
+   be open, the way 設定 briefly was as a link inside Home.razor's own toolbar. *@
+<div class="app-menubar">
+    <span class="app-menubar-brand">StoryForge</span>
+    <button class="app-menubar-item" @onclick="() => _settingsDialog?.Open()">設定</button>
+</div>
+<div class="app-content">
+    @Body
+</div>
+
+<SettingsDialog @ref="_settingsDialog" />
+
+<div id="blazor-error-ui">
+    An unhandled error has occurred.
+    <a href="" class="reload">Reload</a>
+    <a class="dismiss">🗙</a>
+</div>
+
+<style>
+    html, body { height: 100%; margin: 0; }
+
+    .app-menubar {
+        position: fixed; top: 0; left: 0; right: 0; height: 32px; z-index: 500;
+        display: flex; align-items: center; gap: 8px; padding: 0 10px;
+        background: #151515; color: #ddd; border-bottom: 1px solid #333;
+        font-family: sans-serif; font-size: 13px; box-sizing: border-box;
+    }
+    .app-menubar-brand { font-weight: bold; opacity: 0.6; margin-right: 4px; }
+    .app-menubar-item { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 3px 10px; border-radius: 3px; cursor: pointer; }
+    .app-menubar-item:hover { background: #333; }
+
+    /* Every page's own root container (e.g. Home.razor's .graph-page) should fill exactly this box —
+       position:fixed + top:32px rather than the menubar's own flex layout, since a page's content (the
+       LiteGraph canvas especially) needs a definite, stable box to measure itself against regardless of
+       what's rendered above it. */
+    .app-content { position: fixed; top: 32px; left: 0; right: 0; bottom: 0; }
+</style>
+
+@code {
+    private SettingsDialog? _settingsDialog;
+}

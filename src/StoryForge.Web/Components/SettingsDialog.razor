@@ -1,0 +1,152 @@
+@* Non-modal, draggable settings panel — mirrors the old WinForms tool's SettingsForm (套用/確定/取消
+   buttons, opened from a 工具/設定 menu item), but explicitly NOT a modal dialog per user feedback: no
+   backdrop, no close-on-outside-click, and the canvas behind it stays fully interactive while it's open —
+   only the ×/確定/取消 buttons close it. Draggable by its header via ui-draggable.js (plain DOM mouse
+   listeners, not Blazor's own mouse events, so dragging doesn't round-trip over SignalR per pixel). *@
+@using StoryForge.Core.Graph
+@inject AppSettings AppSettingsStore
+@inject IJSRuntime JS
+
+@if (_isOpen)
+{
+    <div class="settings-dialog" id="settings-dialog">
+        <div class="settings-dialog-header" id="settings-dialog-header">
+            <span>設定</span>
+            <button class="settings-dialog-close" @onclick="Cancel">×</button>
+        </div>
+        <div class="settings-dialog-body">
+            <h3>節點/群組文字尺寸</h3>
+            <p class="settings-hint">
+                流程圖縮小時，節點劇本名稱與群組標題不會無限縮小——會停在「最小尺寸」；
+                放大時則不會無限放大——會停在「最大尺寸」。（節點標題只有真的有劇本名稱/Flag名稱時才會這樣放大縮小，
+                沒有名稱、只顯示節點類型通用名稱的節點固定在最小尺寸。）
+            </p>
+            <div class="settings-grid">
+                <label>
+                    <span>節點文字 — 最小尺寸 (px)</span>
+                    <input type="number" step="0.5" @bind="_nodeFrozenTextSize" />
+                </label>
+                <label>
+                    <span>節點文字 — 最大尺寸 (px)</span>
+                    <input type="number" step="0.5" @bind="_nodeMaxTextSize" />
+                </label>
+                <label>
+                    <span>群組標題 — 最小尺寸 (px)</span>
+                    <input type="number" step="0.5" @bind="_groupFrozenTextSize" />
+                </label>
+                <label>
+                    <span>群組標題 — 最大尺寸 (px)</span>
+                    <input type="number" step="0.5" @bind="_groupMaxTextSize" />
+                </label>
+            </div>
+
+            <h3>立繪縮圖裁切</h3>
+            <p class="settings-hint">
+                角色卡的立繪縮圖只裁切上下（保留全寬），裁切比例是相對於原圖高度的百分比。
+                縮圖尺寸本身已經移到角色卡分頁自己的工具列，用拉桿直接調整。
+            </p>
+            <div class="settings-grid">
+                <label>
+                    <span>頂部裁切 (%)</span>
+                    <input type="number" step="1" min="0" max="95" @bind="_portraitTopCutPercent" />
+                </label>
+                <label>
+                    <span>底部裁切 (%)</span>
+                    <input type="number" step="1" min="0" max="95" @bind="_portraitBottomCutPercent" />
+                </label>
+            </div>
+        </div>
+        <div class="settings-dialog-footer">
+            <span class="settings-status">@_statusMessage</span>
+            <button @onclick="Apply">套用</button>
+            <button @onclick="Ok">確定</button>
+            <button @onclick="Cancel">取消</button>
+        </div>
+    </div>
+}
+
+<style>
+    /* No backdrop element at all (a modal overlay is what let an outside click dismiss the panel, and
+       what visually/functionally "locked" the canvas behind it) — this floats directly over the page,
+       positioned initially via top/left percentages; ui-draggable.js switches it to explicit pixel
+       left/top the moment a drag starts, from wherever it already was (no jump). */
+    .settings-dialog { position: fixed; top: 12%; left: 50%; transform: translateX(-50%); z-index: 1000; width: 420px; max-width: 90vw; max-height: 85vh; overflow: auto; background: #1e1e1e; color: #ddd; border: 1px solid #444; border-radius: 4px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); font-family: sans-serif; }
+    .settings-dialog-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #2a2a2a; border-bottom: 1px solid #444; font-weight: bold; cursor: move; user-select: none; }
+    .settings-dialog-close { background: none; border: none; color: #ddd; font-size: 18px; cursor: pointer; line-height: 1; padding: 0 4px; }
+    .settings-dialog-body { padding: 14px; }
+    .settings-dialog-body h3 { margin: 0 0 8px; font-size: 14px; }
+    .settings-hint { opacity: 0.75; font-size: 12px; line-height: 1.5; margin: 0 0 14px; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .settings-grid label { display: block; font-size: 13px; }
+    .settings-grid span { display: block; margin-bottom: 4px; opacity: 0.8; }
+    .settings-grid input { width: 100%; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 7px; border-radius: 3px; }
+    .settings-dialog-footer { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid #444; }
+    .settings-status { flex: 1 1 auto; opacity: 0.8; font-size: 12px; }
+</style>
+
+@code {
+    private bool _isOpen;
+    private string _statusMessage = string.Empty;
+
+    private float _nodeFrozenTextSize;
+    private float _nodeMaxTextSize;
+    private float _groupFrozenTextSize;
+    private float _groupMaxTextSize;
+    private float _portraitTopCutPercent;
+    private float _portraitBottomCutPercent;
+
+    // Called from the toolbar's 設定 button — snapshots current values into local scratch fields (rather
+    // than binding the inputs straight to AppSettingsStore) so 取消 has something to discard back to.
+    public void Open()
+    {
+        _nodeFrozenTextSize = AppSettingsStore.NodeFrozenTextSize;
+        _nodeMaxTextSize = AppSettingsStore.NodeMaxTextSize;
+        _groupFrozenTextSize = AppSettingsStore.GroupFrozenTextSize;
+        _groupMaxTextSize = AppSettingsStore.GroupMaxTextSize;
+        _portraitTopCutPercent = AppSettingsStore.PortraitTopCutPercent;
+        _portraitBottomCutPercent = AppSettingsStore.PortraitBottomCutPercent;
+        _statusMessage = string.Empty;
+        _isOpen = true;
+        StateHasChanged();
+    }
+
+    // ui-draggable.js's own _dragInitialized guard makes this safe to call on every render while open
+    // (typing in a field re-renders this component too), not just the render that first shows the panel.
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_isOpen)
+            await JS.InvokeVoidAsync("storyForgeUi.makeDraggable", "settings-dialog", "settings-dialog-header");
+    }
+
+    private async Task Apply()
+    {
+        AppSettingsStore.NodeFrozenTextSize = _nodeFrozenTextSize;
+        AppSettingsStore.NodeMaxTextSize = _nodeMaxTextSize;
+        AppSettingsStore.GroupFrozenTextSize = _groupFrozenTextSize;
+        AppSettingsStore.GroupMaxTextSize = _groupMaxTextSize;
+        AppSettingsStore.PortraitTopCutPercent = _portraitTopCutPercent;
+        AppSettingsStore.PortraitBottomCutPercent = _portraitBottomCutPercent;
+        AppSettingsStore.Save();
+
+        await JS.InvokeVoidAsync("storyForgeGraph.updateSettings", new
+        {
+            nodeFrozenTextSize = _nodeFrozenTextSize,
+            nodeMaxTextSize = _nodeMaxTextSize,
+            groupFrozenTextSize = _groupFrozenTextSize,
+            groupMaxTextSize = _groupMaxTextSize,
+        });
+
+        _statusMessage = "已套用";
+    }
+
+    private async Task Ok()
+    {
+        await Apply();
+        _isOpen = false;
+    }
+
+    private void Cancel()
+    {
+        _isOpen = false;
+    }
+}

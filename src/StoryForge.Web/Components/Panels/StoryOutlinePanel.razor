@@ -1,0 +1,100 @@
+@using StoryForge.Web.StoryOutline
+@inject StoryOutlineState State
+
+<div class="so-page">
+    <div class="so-global">
+        <div class="so-caption">整體大綱（世界觀、故事背景、角色關係等，給 AI 參考）</div>
+        <textarea class="so-global-box" value="@State.GlobalOutline" @onchange="OnGlobalOutlineChanged"></textarea>
+    </div>
+    <div class="so-guidelines">
+        <div class="so-caption">AI 寫作規範（語氣、文風、格式等寫作規則，每次匯出都會一起帶給 AI）</div>
+        <textarea class="so-guidelines-box" value="@State.AiWritingGuidelines" @onchange="OnAiWritingGuidelinesChanged"></textarea>
+    </div>
+    <div class="so-chapter-toolbar">
+        <span>章節</span>
+        <select class="so-chapter-select" value="@_chapterKey" @onchange="OnChapterCommitted">
+            <option value="">— 選擇既有章節 —</option>
+            @foreach (var chapter in _suggestions)
+            {
+                <option value="@chapter">@chapter</option>
+            }
+        </select>
+        <span>或輸入新章節：</span>
+        <input class="so-chapter-input" value="@_chapterKey" @onchange="OnChapterCommitted" placeholder="例如 A7" />
+        <button @onclick="RefreshSuggestions">重新整理章節列表</button>
+        <span class="so-status">@State.StatusMessage</span>
+    </div>
+    <div class="so-chapter">
+        <div class="so-caption">
+            @if (string.IsNullOrEmpty(_chapterKey))
+            {
+                <text>先在上面輸入或選擇一個章節</text>
+            }
+            else
+            {
+                <text>「@_chapterKey」章節大綱（該章節的劇情細節，給 AI 參考）</text>
+            }
+        </div>
+        <textarea class="so-chapter-box" value="@_chapterText" disabled="@string.IsNullOrEmpty(_chapterKey)"
+                  @onchange="OnChapterTextChanged"></textarea>
+    </div>
+</div>
+
+<style>
+    .so-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; background: #262626; }
+    .so-caption { padding: 8px 10px 4px; font-size: 12px; opacity: 0.75; }
+    .so-global { flex: 0 0 180px; display: flex; flex-direction: column; border-bottom: 1px solid #333; }
+    .so-global-box { flex: 1 1 auto; margin: 0 10px 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
+    .so-guidelines { flex: 0 0 140px; display: flex; flex-direction: column; border-bottom: 1px solid #333; }
+    .so-guidelines-box { flex: 1 1 auto; margin: 0 10px 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
+    .so-chapter-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1e1e1e; border-bottom: 1px solid #333; }
+    .so-chapter-input, .so-chapter-select { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 8px; border-radius: 3px; }
+    .so-chapter-input { width: 140px; }
+    .so-status { margin-left: auto; opacity: 0.8; font-size: 12px; }
+    .so-chapter { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+    .so-chapter-box { flex: 1 1 auto; margin: 0 10px 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
+    .so-chapter-box:disabled { opacity: 0.5; }
+</style>
+
+@code {
+    private string _chapterKey = string.Empty;
+    private string _chapterText = string.Empty;
+    private List<string> _suggestions = new();
+
+    protected override void OnInitialized()
+    {
+        State.Load();
+        _suggestions = State.GetChapterSuggestions();
+    }
+
+    private void RefreshSuggestions()
+    {
+        _suggestions = State.GetChapterSuggestions();
+    }
+
+    private void OnGlobalOutlineChanged(ChangeEventArgs e)
+    {
+        State.GlobalOutline = e.Value?.ToString() ?? string.Empty;
+        State.SaveGlobalOutline();
+    }
+
+    private void OnAiWritingGuidelinesChanged(ChangeEventArgs e)
+    {
+        State.AiWritingGuidelines = e.Value?.ToString() ?? string.Empty;
+        State.SaveAiWritingGuidelines();
+    }
+
+    private void OnChapterCommitted(ChangeEventArgs e)
+    {
+        _chapterKey = e.Value?.ToString()?.Trim() ?? string.Empty;
+        _chapterText = string.IsNullOrEmpty(_chapterKey) ? string.Empty : State.GetChapterOutline(_chapterKey);
+        if (!string.IsNullOrEmpty(_chapterKey) && !_suggestions.Contains(_chapterKey))
+            _suggestions = _suggestions.Append(_chapterKey).OrderBy(c => c, StringComparer.Ordinal).ToList();
+    }
+
+    private void OnChapterTextChanged(ChangeEventArgs e)
+    {
+        _chapterText = e.Value?.ToString() ?? string.Empty;
+        State.SetChapterOutline(_chapterKey, _chapterText);
+    }
+}
