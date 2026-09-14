@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "storyforge-web",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["watch", "--non-interactive", "run", "--project", "src/StoryForge.Web"],
+      "port": 5194
+    },
+    {
+      "name": "storyforge-web-test",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["watch", "--non-interactive", "run", "--project", "src/StoryForge.Web", "--", "--urls", "http://localhost:5195"],
+      "port": 5195
+    }
+  ]
+}

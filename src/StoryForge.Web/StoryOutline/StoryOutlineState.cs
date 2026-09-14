@@ -1,4 +1,5 @@
 using StoryForge.Core;
+using StoryForge.Core.Graph;
 using StoryForge.Core.StoryOutline;
 using StoryForge.Web.GraphEditor;
 
@@ -9,12 +10,14 @@ namespace StoryForge.Web.StoryOutline;
 public sealed class StoryOutlineState
 {
     private readonly GraphEditorState _graphState;
-    private string? _projectRoot;
+    private readonly AppSettings _appSettings;
     private StoryOutlineSettings _settings = new();
+    private string _agentsMdContent = string.Empty;
 
-    public StoryOutlineState(GraphEditorState graphState)
+    public StoryOutlineState(GraphEditorState graphState, AppSettings appSettings)
     {
         _graphState = graphState;
+        _appSettings = appSettings;
     }
 
     public string StatusMessage { get; private set; } = string.Empty;
@@ -25,18 +28,21 @@ public sealed class StoryOutlineState
         set => _settings.GlobalOutline = value;
     }
 
-    public string AiWritingGuidelines
+    // Backed by AGENTS.md directly (see AgentsMdStore), not StoryOutlineSettings' JSON — this is the same
+    // file an external Codex/Claude agent auto-loads by filename convention, so the panel edits that one
+    // real copy instead of keeping a second, easily-out-of-sync writing-rules text elsewhere.
+    public string AgentsMdContent
     {
-        get => _settings.AiWritingGuidelines;
-        set => _settings.AiWritingGuidelines = value;
+        get => _agentsMdContent;
+        set => _agentsMdContent = value;
     }
 
     public void Load()
     {
         try
         {
-            _projectRoot = ProjectPaths.ResolveUnityProjectRoot();
-            _settings = StoryOutlineSettings.LoadOrDefault(_projectRoot);
+            _settings = StoryOutlineSettings.LoadOrDefault(_appSettings.ExternalDataFolder);
+            _agentsMdContent = AgentsMdStore.LoadOrDefault(_appSettings.ExternalDataFolder);
             StatusMessage = $"已載入：{_settings.ChapterOutlines.Count} 個章節大綱";
         }
         catch (Exception e)
@@ -47,7 +53,18 @@ public sealed class StoryOutlineState
 
     public void SaveGlobalOutline() => Save();
 
-    public void SaveAiWritingGuidelines() => Save();
+    public void SaveAgentsMd()
+    {
+        try
+        {
+            AgentsMdStore.Save(_appSettings.ExternalDataFolder, _agentsMdContent);
+            StatusMessage = "已儲存";
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"儲存失敗：{e.Message}";
+        }
+    }
 
     public string GetChapterOutline(string chapter) =>
         _settings.ChapterOutlines.TryGetValue(chapter, out var text) ? text : string.Empty;
@@ -72,7 +89,7 @@ public sealed class StoryOutlineState
     // already has a Group but zero outline text yet still shows up to pick from.
     public List<string> GetChapterSuggestions()
     {
-        var set = new SortedSet<string>(StringComparer.Ordinal);
+        var set = new SortedSet<string>(NaturalStringComparer.Instance);
         foreach (var key in _settings.ChapterOutlines.Keys)
             set.Add(key);
         foreach (var title in _graphState.GetGroupTitles())
@@ -82,12 +99,9 @@ public sealed class StoryOutlineState
 
     private void Save()
     {
-        if (_projectRoot == null)
-            return;
-
         try
         {
-            _settings.Save(_projectRoot);
+            _settings.Save(_appSettings.ExternalDataFolder);
             StatusMessage = "已儲存";
         }
         catch (Exception e)

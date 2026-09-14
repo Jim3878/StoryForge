@@ -3,6 +3,12 @@ namespace StoryForge.Core.Graph;
 // A full snapshot of a GraphDocumentModel's editable state — unlike GraphChangelistDocument (which only
 // carries the delta to send to Unity), this captures everything needed to resume exactly where an
 // editing session left off, purely locally. Saving/loading this never touches Unity in any way.
+//
+// Edges live in the sibling GraphConnectionsDocument (its own file), not here — split out so the
+// node/group canvas data (positions, sizes, identity fields — pure "what does the graph look like")
+// and the connection/logic data (which node feeds into which — "what does the graph mean") can
+// eventually be handed to different consumers independently, without one giant file mixing rendering
+// noise (X/Y/Width/Height) into what an external reader actually cares about.
 public sealed class GraphSessionDocument
 {
     public int Version { get; set; } = 1;
@@ -10,8 +16,16 @@ public sealed class GraphSessionDocument
     public string GraphName { get; set; } = string.Empty;
     public string BaseYamlHash { get; set; } = string.Empty;
     public List<GraphSessionNode> Nodes { get; set; } = new();
-    public List<GraphSessionEdge> Edges { get; set; } = new();
     public List<GraphSessionGroup> Groups { get; set; } = new();
+}
+
+// Sibling of GraphSessionDocument — see its own comment for why edges live in their own file/document
+// rather than inline here.
+public sealed class GraphConnectionsDocument
+{
+    public int Version { get; set; } = 1;
+    public DateTime SavedAtUtc { get; set; }
+    public List<GraphSessionEdge> Edges { get; set; } = new();
 }
 
 public sealed class GraphSessionNode

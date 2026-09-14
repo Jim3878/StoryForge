@@ -24,6 +24,9 @@ public sealed class GraphSettingsDto
     // dragged into/out of a group — see graph-editor.js's own recomputeGroupBounds.
     public float GroupPadding { get; set; }
     public float GroupTitleBarHeight { get; set; }
+
+    // Floor applied when the search box jumps to a match — see AppSettings.SearchMinZoom.
+    public float SearchMinZoom { get; set; }
 }
 
 public sealed class NodeTypeDto
@@ -119,4 +122,34 @@ public sealed class NewNodeDto
     public string TypeName { get; set; } = string.Empty;
     public float X { get; set; }
     public float Y { get; set; }
+}
+
+// Live (disk-checked, not payload-snapshot) state graph-editor.js's node right-click menu needs to decide
+// whether 開啟劇本檔/複製劇本名稱 should be enabled — fetched on demand when the menu is about to open,
+// since the initial payload's Fields can go stale after a sidebar edit (see GraphEditorState.UpdateNodeField).
+public sealed class NodeContextMenuInfoDto
+{
+    public string PlayscriptName { get; set; } = string.Empty;
+    public bool HasScriptFile { get; set; }
+}
+
+// What GraphEditorState.DuplicateNode hands back to graph-editor.js so the client can paint the new node's
+// title correctly right away, without waiting for a full reload (see the "title only updates on next
+// reload" gap this app otherwise accepts for a plain field edit — a freshly duplicated node needs to look
+// right immediately, the same way a brand-new node from the add-node menu does).
+public sealed class NodeDuplicateResultDto
+{
+    public string Title { get; set; } = string.Empty;
+    public bool HasIdentityTitle { get; set; }
+    public Dictionary<string, string> Fields { get; set; } = new();
+}
+
+// What GraphEditorState.GetNodeTitleInfo hands back after a plain sidebar field edit (UpdateNodeField) so
+// the canvas can repaint the node's title live instead of only on the next reload — the same Title/
+// HasIdentityTitle pair NodeDuplicateResultDto carries, without the Fields dictionary a field edit has no
+// use for.
+public sealed class NodeTitleInfoDto
+{
+    public string Title { get; set; } = string.Empty;
+    public bool HasIdentityTitle { get; set; }
 }

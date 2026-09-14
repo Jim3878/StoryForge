@@ -1,14 +1,20 @@
+@using StoryForge.Core
 @using StoryForge.Web.StoryOutline
+@implements IDisposable
 @inject StoryOutlineState State
+@inject ReloadCoordinator ReloadCoordinator
+@inject IJSRuntime JS
 
 <div class="so-page">
     <div class="so-global">
         <div class="so-caption">整體大綱（世界觀、故事背景、角色關係等，給 AI 參考）</div>
-        <textarea class="so-global-box" value="@State.GlobalOutline" @onchange="OnGlobalOutlineChanged"></textarea>
+        <textarea id="so-global-box" class="so-global-box" value="@State.GlobalOutline" @onchange="OnGlobalOutlineChanged"></textarea>
+        <div class="so-vresize-handle" id="so-global-resize-handle"></div>
     </div>
     <div class="so-guidelines">
-        <div class="so-caption">AI 寫作規範（語氣、文風、格式等寫作規則，每次匯出都會一起帶給 AI）</div>
-        <textarea class="so-guidelines-box" value="@State.AiWritingGuidelines" @onchange="OnAiWritingGuidelinesChanged"></textarea>
+        <div class="so-caption">AGENTS.md（語氣、文風、格式、功能欄等完整寫作與技術規範；跟外部 AI 工具讀取的是同一份檔案）</div>
+        <textarea id="so-guidelines-box" class="so-guidelines-box" value="@State.AgentsMdContent" @onchange="OnAgentsMdContentChanged"></textarea>
+        <div class="so-vresize-handle" id="so-guidelines-resize-handle"></div>
     </div>
     <div class="so-chapter-toolbar">
         <span>章節</span>
@@ -35,24 +41,30 @@
                 <text>「@_chapterKey」章節大綱（該章節的劇情細節，給 AI 參考）</text>
             }
         </div>
-        <textarea class="so-chapter-box" value="@_chapterText" disabled="@string.IsNullOrEmpty(_chapterKey)"
+        <textarea id="so-chapter-box" class="so-chapter-box" value="@_chapterText" disabled="@string.IsNullOrEmpty(_chapterKey)"
                   @onchange="OnChapterTextChanged"></textarea>
+        <div class="so-vresize-handle" id="so-chapter-resize-handle"></div>
     </div>
 </div>
 
 <style>
-    .so-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; background: #262626; }
+    .so-page { height: 100%; width: 100%; display: flex; flex-direction: column; overflow-y: auto; font-family: sans-serif; color: #ddd; background: #262626; }
     .so-caption { padding: 8px 10px 4px; font-size: 12px; opacity: 0.75; }
-    .so-global { flex: 0 0 180px; display: flex; flex-direction: column; border-bottom: 1px solid #333; }
-    .so-global-box { flex: 1 1 auto; margin: 0 10px 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
-    .so-guidelines { flex: 0 0 140px; display: flex; flex-direction: column; border-bottom: 1px solid #333; }
-    .so-guidelines-box { flex: 1 1 auto; margin: 0 10px 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
+    .so-global { flex: 0 0 auto; display: flex; flex-direction: column; border-bottom: 1px solid #333; }
+    .so-global-box { height: 180px; min-height: 60px; margin: 0 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
+    .so-guidelines { flex: 0 0 auto; display: flex; flex-direction: column; border-bottom: 1px solid #333; }
+    .so-guidelines-box { height: 140px; min-height: 60px; margin: 0 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
+    /* A full-width drag strip below each box, in place of CSS's native `resize` handle — that handle only
+       ever renders as a tiny triangle in the box's bottom-right corner, easy to miss and fiddly to grab.
+       This strip runs the full width instead, like a divider you can drag. */
+    .so-vresize-handle { flex: 0 0 6px; margin: 0 10px 10px; cursor: row-resize; background: #333; border-radius: 3px; }
+    .so-vresize-handle:hover, .so-vresize-handle:active { background: #555; }
     .so-chapter-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1e1e1e; border-bottom: 1px solid #333; }
     .so-chapter-input, .so-chapter-select { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 8px; border-radius: 3px; }
     .so-chapter-input { width: 140px; }
     .so-status { margin-left: auto; opacity: 0.8; font-size: 12px; }
-    .so-chapter { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
-    .so-chapter-box { flex: 1 1 auto; margin: 0 10px 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
+    .so-chapter { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 200px; }
+    .so-chapter-box { flex: 1 1 auto; min-height: 60px; margin: 0 10px; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 8px; border-radius: 3px; font: inherit; resize: none; }
     .so-chapter-box:disabled { opacity: 0.5; }
 </style>
 
@@ -65,11 +77,40 @@
     {
         State.Load();
         _suggestions = State.GetChapterSuggestions();
+        ReloadCoordinator.Subscribe(OnReload);
+    }
+
+    // This panel is one of the always-mounted tab panes (see CLAUDE.md), never destroyed/recreated by an
+    // @if, so wiring the resize handles once on firstRender is enough — no need to re-invoke on every
+    // render the way FlowGraphPanel does for its conditionally-rendered inspector sidebar.
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        await JS.InvokeVoidAsync("storyForgeUi.makeVResizable", "so-global-box", "so-global-resize-handle");
+        await JS.InvokeVoidAsync("storyForgeUi.makeVResizable", "so-guidelines-box", "so-guidelines-resize-handle");
+        await JS.InvokeVoidAsync("storyForgeUi.makeVResizable", "so-chapter-box", "so-chapter-resize-handle");
     }
 
     private void RefreshSuggestions()
     {
         _suggestions = State.GetChapterSuggestions();
+    }
+
+    // Re-reads GlobalOutline/AgentsMdContent (bound straight to State, so they update on their own) plus
+    // the chapter suggestion list; also re-fetches the currently-open chapter's own text in case that
+    // specific chapter changed externally, so the visible textarea doesn't keep showing a stale value.
+    private async Task OnReload()
+    {
+        State.Load();
+        _suggestions = State.GetChapterSuggestions();
+        if (!string.IsNullOrEmpty(_chapterKey))
+            _chapterText = State.GetChapterOutline(_chapterKey);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        ReloadCoordinator.Unsubscribe(OnReload);
     }
 
     private void OnGlobalOutlineChanged(ChangeEventArgs e)
@@ -78,10 +119,10 @@
         State.SaveGlobalOutline();
     }
 
-    private void OnAiWritingGuidelinesChanged(ChangeEventArgs e)
+    private void OnAgentsMdContentChanged(ChangeEventArgs e)
     {
-        State.AiWritingGuidelines = e.Value?.ToString() ?? string.Empty;
-        State.SaveAiWritingGuidelines();
+        State.AgentsMdContent = e.Value?.ToString() ?? string.Empty;
+        State.SaveAgentsMd();
     }
 
     private void OnChapterCommitted(ChangeEventArgs e)
@@ -89,7 +130,7 @@
         _chapterKey = e.Value?.ToString()?.Trim() ?? string.Empty;
         _chapterText = string.IsNullOrEmpty(_chapterKey) ? string.Empty : State.GetChapterOutline(_chapterKey);
         if (!string.IsNullOrEmpty(_chapterKey) && !_suggestions.Contains(_chapterKey))
-            _suggestions = _suggestions.Append(_chapterKey).OrderBy(c => c, StringComparer.Ordinal).ToList();
+            _suggestions = _suggestions.Append(_chapterKey).OrderBy(c => c, NaturalStringComparer.Instance).ToList();
     }
 
     private void OnChapterTextChanged(ChangeEventArgs e)

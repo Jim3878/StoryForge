@@ -59,9 +59,10 @@ public static class LegacyToolMigration
     // settings.json needs field-level merging rather than a straight copy: AppSettings' schema has moved on
     // since the WinForms tool (NodeMaxTextSize/GroupMaxTextSize/InspectorPanelWidth/MemoFieldHeight are new
     // here and don't exist there; AiReferencePrompt/AiReferenceSelectedCharacters/AiReferenceOtherCharacters
-    // existed there but were removed here — the first moved into StoryOutlineSettings.AiWritingGuidelines,
-    // the other two into CharacterCardSettings' own separate migration). Legacy values win for every
-    // overlapping field since they reflect real day-to-day tuning, not this tool's stock defaults.
+    // existed there but were removed here — the first no longer has an equivalent (writing guidelines now
+    // live only in AGENTS.md, see AgentsMdStore), the other two moved into CharacterCardSettings' own
+    // separate migration). Legacy values win for every overlapping field since they reflect real day-to-day
+    // tuning, not this tool's stock defaults.
     private static void MergeSettingsJson(string legacyFolder, string currentFolder)
     {
         var legacyPath = Path.Combine(legacyFolder, "settings.json");
@@ -80,7 +81,6 @@ public static class LegacyToolMigration
                      "Padding", "TitleBarHeight", "NodeFrozenTextSize", "NodeMinTextZoomBeforeShrinkResumes",
                      "GroupFrozenTextSize", "GroupMinTextZoomBeforeShrinkResumes", "PortraitPreviewSize",
                      "PortraitTopCutPercent", "PortraitBottomCutPercent", "SearchMinZoom", "WireSnapDistance",
-                     "AiReferenceExportFolder", "AiReferenceIncludeContentLinks",
                  })
         {
             if (legacyRoot[key] != null)

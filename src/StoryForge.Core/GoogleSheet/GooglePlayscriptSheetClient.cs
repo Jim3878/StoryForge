@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using OfficeOpenXml;
 using StoryForge.Core.Pipeline;
@@ -36,6 +37,17 @@ public static class GooglePlayscriptSheetClient
 
     private static readonly HttpClient HttpClient = new();
 
+    // Column order of a playscript's own dedicated "劇本檔範本" spreadsheet (the one SpreadsheetLink points
+    // at) — must match NodeScriptTableStore's local .md table exactly, since DownloadScriptTableAsync's
+    // whole job is to feed that store real remote content instead of a blank template. These 6 are the
+    // required, position-checked prefix; "參數" (NodeScriptTableStore.Headers' 7th column) was added later
+    // and is optional here — an already-created playscript spreadsheet from before that change has no such
+    // column, and DownloadScriptTableAsync pads it with an empty string rather than rejecting the sheet.
+    private static readonly string[] ScriptTableHeaders = { "名字", "表情", "配音情緒", "台詞", "功能", "備註" };
+    private const string ScriptTableParameterHeader = "參數";
+
+    private static readonly Regex SpreadsheetIdPattern = new(@"/d/([a-zA-Z0-9_-]+)", RegexOptions.Compiled);
+
     public static async Task<string> DownloadAsync(string projectAssetsRoot)
     {
         var folderPath = Path.Combine(projectAssetsRoot, GooglePlayscriptFolder);
@@ -47,6 +59,75 @@ public static class GooglePlayscriptSheetClient
         await response.CopyToAsync(fileStream);
 
         return excelPath;
+    }
+
+    // Downloads one playscript's own dedicated spreadsheet (SpreadsheetLink from GooglePlayscriptSheetEntry)
+    // and reads its dialogue rows — the actual content behind NodeScriptTableStore's "建立劇本檔" blank
+    // template. Throws ScriptTableDownloadException (message is user-facing, shown in the panel's "無法
+    // 下載" list) for anything that keeps this from producing a usable row set; every other exception is
+    // let through as-is since it isn't something the caller can explain to the user.
+    public static async Task<List<string[]>> DownloadScriptTableAsync(string spreadsheetLink)
+    {
+        var idMatch = SpreadsheetIdPattern.Match(spreadsheetLink);
+        if (!idMatch.Success)
+            throw new ScriptTableDownloadException($"無法從連結解析出試算表 ID：{spreadsheetLink}");
+
+        var exportUrl = $"https://docs.google.com/spreadsheets/d/{idMatch.Groups[1].Value}/export?format=xlsx";
+
+        byte[] bytes;
+        try
+        {
+            bytes = await HttpClient.GetByteArrayAsync(exportUrl);
+        }
+        catch (Exception e)
+        {
+            throw new ScriptTableDownloadException($"下載失敗：{e.Message}");
+        }
+
+        ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+        using var stream = new MemoryStream(bytes);
+        using var package = new ExcelPackage(stream);
+        var sheet = package.Workbook.Worksheets.FirstOrDefault(s => s?.Dimension != null);
+        if (sheet == null)
+            throw new ScriptTableDownloadException("試算表沒有任何工作表內容");
+
+        for (var col = 0; col < ScriptTableHeaders.Length; col++)
+        {
+            var headerText = sheet.Cells[1, col + 1].Text?.Trim();
+            if (!string.Equals(headerText, ScriptTableHeaders[col], StringComparison.Ordinal))
+                throw new ScriptTableDownloadException(
+                    $"欄位格式不符合預期（第 {col + 1} 欄應為「{ScriptTableHeaders[col]}」，實際為「{headerText}」）");
+        }
+
+        var parameterColumn = ScriptTableHeaders.Length + 1;
+        var hasParameterColumn = string.Equals(
+            sheet.Cells[1, parameterColumn].Text?.Trim(), ScriptTableParameterHeader, StringComparison.Ordinal);
+        var columnCount = ScriptTableHeaders.Length + 1;
+
+        var rows = new List<string[]>();
+        var endRow = sheet.Dimension.End.Row;
+        for (var row = 2; row <= endRow; row++)
+        {
+            var cells = new string[columnCount];
+            var isBlank = true;
+            for (var col = 0; col < ScriptTableHeaders.Length; col++)
+            {
+                var text = sheet.Cells[row, col + 1].Text ?? string.Empty;
+                cells[col] = text;
+                if (!string.IsNullOrWhiteSpace(text))
+                    isBlank = false;
+            }
+
+            var parameterText = hasParameterColumn ? sheet.Cells[row, parameterColumn].Text ?? string.Empty : string.Empty;
+            cells[ScriptTableHeaders.Length] = parameterText;
+            if (!string.IsNullOrWhiteSpace(parameterText))
+                isBlank = false;
+
+            if (!isBlank)
+                rows.Add(cells);
+        }
+
+        return rows;
     }
 
     public static HashSet<string> LoadPlayscriptNames(string excelPath)
@@ -253,6 +334,15 @@ public static class GooglePlayscriptSheetClient
     private static bool IsPlayscriptNameHeader(string? value)
     {
         return string.Equals(value?.Trim(), PlayscriptNameHeader, StringComparison.Ordinal);
+    }
+}
+
+// Message is written straight into the "無法下載" summary shown to the user, so it's always plain,
+// user-facing Chinese text rather than a technical exception dump.
+public sealed class ScriptTableDownloadException : Exception
+{
+    public ScriptTableDownloadException(string message) : base(message)
+    {
     }
 }
 

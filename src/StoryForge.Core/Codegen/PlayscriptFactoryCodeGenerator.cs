@@ -1,3 +1,4 @@
+using System.Globalization;
 using OfficeOpenXml;
 
 namespace StoryForge.Core.Codegen;
@@ -233,17 +234,12 @@ public static class PlayscriptFactoryCodeGenerator
             var function = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["功能"]].Text);
             var note = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["備註"]].Text);
             var functionLower = function.ToLowerInvariant();
-            var res = columns.TryGetValue("RES", out var resColumn)
-                ? CodegenTextUtility.SanitizeText(sheet.Cells[row, resColumn].Text)
-                : string.Empty;
+            var parameter = GetParameter(sheet, row, columns);
 
-            if (!string.IsNullOrEmpty(res))
-            {
-                CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
-                lines.Add($"            //RES {CodegenTextUtility.EscapeComment(res)}");
-            }
-
-            if (!string.IsNullOrEmpty(note) && !IsChoiceFunction(function))
+            // Button/Choice借用備註欄放跳轉 Label 是舊資料的相容路徑（見 ResolveChoiceLabel）——只有這種情況才
+            // 不能把備註當一般註解印出來；一旦該列有填「參數」欄，備註就恢復成單純註解。
+            var noteHoldsChoiceLabel = IsChoiceFunction(function) && string.IsNullOrEmpty(parameter);
+            if (!string.IsNullOrEmpty(note) && !noteHoldsChoiceLabel)
             {
                 CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
                 lines.Add($"            // {CodegenTextUtility.EscapeComment(note)}");
@@ -282,7 +278,7 @@ public static class PlayscriptFactoryCodeGenerator
                         break;
 
                     var choiceText = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["台詞"]].Text);
-                    var choiceLabel = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["備註"]].Text);
+                    var choiceLabel = ResolveChoiceLabel(sheet, row, columns);
                     if (string.IsNullOrEmpty(choiceText) || string.IsNullOrEmpty(choiceLabel))
                         throw new InvalidOperationException($"第 {row} 列選項缺少台詞或 Label。");
 
@@ -308,22 +304,25 @@ public static class PlayscriptFactoryCodeGenerator
                 continue;
             }
 
-            var textLiteral = BuildDialogueTextLiteral(text, IsLargeTextFunction(function));
+            var textLiteral = BuildDialogueTextLiteral(text, function);
 
             if (functionLower == "fadeondark")
             {
+                CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
                 lines.Add("            FadeOnDark();");
                 continue;
             }
 
             if (functionLower == "fadeoff")
             {
+                CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
                 lines.Add("            FadeOff();");
                 continue;
             }
 
             if (functionLower == "fadeonwhite")
             {
+                CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
                 lines.Add("            FadeOnWhite();");
                 continue;
             }
@@ -331,14 +330,41 @@ public static class PlayscriptFactoryCodeGenerator
             if (functionLower == "opencg")
             {
                 CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
-                lines.Add($"            Gallery({textLiteral}).OpenCg();");
+                var openCgArg = !string.IsNullOrEmpty(parameter) ? parameter : text;
+                lines.Add($"            Gallery({BuildDialogueTextLiteral(openCgArg, function)}).OpenCg();");
                 continue;
             }
 
             if (functionLower == "diff")
             {
                 CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
-                lines.Add($"            Gallery().SetDiff({textLiteral});");
+                var diffArg = !string.IsNullOrEmpty(parameter) ? parameter : text;
+                lines.Add($"            Gallery().SetDiff({BuildDialogueTextLiteral(diffArg, function)});");
+                continue;
+            }
+
+            if (functionLower == "closecg")
+            {
+                CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
+                lines.Add("            Gallery().CloseCg();");
+                continue;
+            }
+
+            if (functionLower == "closedialogue")
+            {
+                lines.Add("            CloseDialogue();");
+                dialogueOpened = false;
+                currentPortrait = string.Empty;
+                currentFace = string.Empty;
+                continue;
+            }
+
+            if (functionLower == "waitseconds")
+            {
+                CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
+                if (!float.TryParse(parameter, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
+                    throw new InvalidOperationException($"第 {row} 列 WaitSeconds 的參數欄不是合法秒數：「{parameter}」。");
+                lines.Add($"            WaitSeconds({seconds.ToString(CultureInfo.InvariantCulture)}f);");
                 continue;
             }
 
@@ -354,6 +380,32 @@ public static class PlayscriptFactoryCodeGenerator
             {
                 lines.Add(
                     $"            Chat().TryAddChatLobby({textLiteral}, \"{CodegenTextUtility.EscapeCSharpString(parsed.ClassName)}\");");
+                continue;
+            }
+
+            if (functionLower is "upblock" or "downblock" or "leftblock" or "rightblock")
+            {
+                CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
+                var blockMethod = functionLower switch
+                {
+                    "upblock" => "UpBlock",
+                    "downblock" => "DownBlock",
+                    "leftblock" => "LeftBlock",
+                    _ => "RightBlock",
+                };
+
+                var dialogNameArg = string.Empty;
+                if (!string.IsNullOrEmpty(name))
+                {
+                    if (!enumLabelMaps.DialogNameMap.TryGetValue(name, out var blockDialogEnum))
+                        throw new InvalidOperationException($"名字「{name}」沒有設定 DialogName 對應。");
+                    dialogNameArg = $"DialogName.{blockDialogEnum}, ";
+                }
+
+                lines.Add($"            {blockMethod}({dialogNameArg}{textLiteral}, {autoKey});");
+                autoKey += 100;
+                currentPortrait = string.Empty;
+                currentFace = string.Empty;
                 continue;
             }
 
@@ -441,7 +493,7 @@ public static class PlayscriptFactoryCodeGenerator
                         break;
 
                     var choiceText = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["台詞"]].Text);
-                    var choiceLabel = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["備註"]].Text);
+                    var choiceLabel = ResolveChoiceLabel(sheet, row, columns);
                     if (string.IsNullOrEmpty(choiceText) || string.IsNullOrEmpty(choiceLabel))
                         errors.Add($"Row {row}: Choice requires text and label.");
 
@@ -455,9 +507,24 @@ public static class PlayscriptFactoryCodeGenerator
             if (function == "Label")
                 continue;
 
-            if (functionLower is "fadeondark" or "fadeoff" or "fadeonwhite" or "opencg" or "diff" or "chat"
-                or "lobby")
+            if (functionLower is "fadeondark" or "fadeoff" or "fadeonwhite" or "opencg" or "diff" or "closecg"
+                or "closedialogue" or "chat" or "lobby")
                 continue;
+
+            if (functionLower is "upblock" or "downblock" or "leftblock" or "rightblock")
+            {
+                if (!string.IsNullOrEmpty(name) && !enumLabelMaps.DialogNameMap.ContainsKey(name))
+                    errors.Add($"Row {row}: DialogName not found for name '{name}'.");
+                continue;
+            }
+
+            if (functionLower == "waitseconds")
+            {
+                var waitParameter = GetParameter(sheet, row, columns);
+                if (!float.TryParse(waitParameter, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+                    errors.Add($"Row {row}: WaitSeconds 的參數欄不是合法秒數：「{waitParameter}」。");
+                continue;
+            }
 
             if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(name))
                 continue;
@@ -577,22 +644,55 @@ public static class PlayscriptFactoryCodeGenerator
         return clean.Substring(startIndex, endIndex - startIndex);
     }
 
+    // "選項"/"Choice" are legacy aliases from before the dropdown had a real option for this — the sheet's
+    // actual "功能" dropdown value for a multi-row choice block is "Button".
     private static bool IsChoiceFunction(string value)
     {
-        return value == "選項" || string.Equals(value, "Choice", StringComparison.OrdinalIgnoreCase);
+        return value == "選項"
+            || string.Equals(value, "Choice", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "Button", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsLargeTextFunction(string value)
     {
-        return value == "大字" || string.Equals(value, "LargeText", StringComparison.OrdinalIgnoreCase);
+        return value == "大字"
+            || string.Equals(value, "LargeText", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "Large", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string BuildDialogueTextLiteral(string text, bool isLargeText)
+    private static bool IsSmallTextFunction(string value)
+    {
+        return string.Equals(value, "Small", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildDialogueTextLiteral(string text, string function)
     {
         var escaped = CodegenTextUtility.EscapeCSharpString(text);
-        return isLargeText
-            ? $"$\"<size={{CoreConfig.FontLarge}}>{escaped}</size>\""
-            : $"\"{escaped}\"";
+        if (IsLargeTextFunction(function))
+            return $"$\"<size={{CoreConfig.FontLarge}}>{escaped}</size>\"";
+        if (IsSmallTextFunction(function))
+            return $"$\"<size={{CoreConfig.FontSmall}}>{escaped}</size>\"";
+        return $"\"{escaped}\"";
+    }
+
+    // "參數" is an optional column (see GooglePlayscriptSheetClient.DownloadScriptTableAsync) added after
+    // the "功能" dropdown's existing values were already in use — a playscript spreadsheet created before
+    // it exists simply doesn't have the column.
+    private static string GetParameter(ExcelWorksheet sheet, int row, Dictionary<string, int> columns)
+    {
+        return columns.TryGetValue("參數", out var parameterColumn)
+            ? CodegenTextUtility.SanitizeText(sheet.Cells[row, parameterColumn].Text)
+            : string.Empty;
+    }
+
+    // Button/Choice's jump-target label used to be written into "備註" (there was nowhere else to put it);
+    // that still works for a row with no "參數" value, but "參數" wins when both are present.
+    private static string ResolveChoiceLabel(ExcelWorksheet sheet, int row, Dictionary<string, int> columns)
+    {
+        var parameter = GetParameter(sheet, row, columns);
+        return !string.IsNullOrEmpty(parameter)
+            ? parameter
+            : CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["備註"]].Text);
     }
 
     private static string BuildChatNameLiteral(string name, EnumLabelMaps enumLabelMaps)

@@ -55,6 +55,18 @@
                     <input type="number" step="1" min="0" max="95" @bind="_portraitBottomCutPercent" />
                 </label>
             </div>
+
+            <h3>存檔資料夾</h3>
+            <p class="settings-hint">
+                角色卡、世界書大綱、流程圖的真正存檔位置——不是複本，是這幾個分頁直接讀寫的地方，方便指向這個路徑的外部
+                AI 工具（例如 Codex/Claude 專案）直接編輯。改了路徑後，要重新整理頁面（或切換分頁）才會用新路徑重新載入。
+            </p>
+            <div class="settings-grid settings-grid-1col">
+                <label>
+                    <span>資料夾路徑</span>
+                    <input type="text" @bind="_externalDataFolder" />
+                </label>
+            </div>
         </div>
         <div class="settings-dialog-footer">
             <span class="settings-status">@_statusMessage</span>
@@ -77,6 +89,7 @@
     .settings-dialog-body h3 { margin: 0 0 8px; font-size: 14px; }
     .settings-hint { opacity: 0.75; font-size: 12px; line-height: 1.5; margin: 0 0 14px; }
     .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .settings-grid-1col { grid-template-columns: 1fr; }
     .settings-grid label { display: block; font-size: 13px; }
     .settings-grid span { display: block; margin-bottom: 4px; opacity: 0.8; }
     .settings-grid input { width: 100%; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 7px; border-radius: 3px; }
@@ -94,6 +107,7 @@
     private float _groupMaxTextSize;
     private float _portraitTopCutPercent;
     private float _portraitBottomCutPercent;
+    private string _externalDataFolder = string.Empty;
 
     // Called from the toolbar's 設定 button — snapshots current values into local scratch fields (rather
     // than binding the inputs straight to AppSettingsStore) so 取消 has something to discard back to.
@@ -105,6 +119,7 @@
         _groupMaxTextSize = AppSettingsStore.GroupMaxTextSize;
         _portraitTopCutPercent = AppSettingsStore.PortraitTopCutPercent;
         _portraitBottomCutPercent = AppSettingsStore.PortraitBottomCutPercent;
+        _externalDataFolder = AppSettingsStore.ExternalDataFolder;
         _statusMessage = string.Empty;
         _isOpen = true;
         StateHasChanged();
@@ -126,6 +141,7 @@
         AppSettingsStore.GroupMaxTextSize = _groupMaxTextSize;
         AppSettingsStore.PortraitTopCutPercent = _portraitTopCutPercent;
         AppSettingsStore.PortraitBottomCutPercent = _portraitBottomCutPercent;
+        AppSettingsStore.ExternalDataFolder = _externalDataFolder;
         AppSettingsStore.Save();
 
         await JS.InvokeVoidAsync("storyForgeGraph.updateSettings", new

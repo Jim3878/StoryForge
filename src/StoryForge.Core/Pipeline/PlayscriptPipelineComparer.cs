@@ -39,8 +39,8 @@ public static class PlayscriptPipelineComparer
             GetOrCreate(name).IsOnCSharp = true;
 
         return byName.Values
-            .OrderBy(x => x.Chapter, StringComparer.Ordinal)
-            .ThenBy(x => x.PlayscriptName, StringComparer.Ordinal)
+            .OrderBy(x => x.Chapter, NaturalStringComparer.Instance)
+            .ThenBy(x => x.PlayscriptName, NaturalStringComparer.Instance)
             .ToList();
     }
 }

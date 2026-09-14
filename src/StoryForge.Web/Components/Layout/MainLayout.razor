@@ -1,16 +1,34 @@
 @inherits LayoutComponentBase
+@implements IDisposable
+@using System.Reflection
 @using StoryForge.Web.Components
+@using StoryForge.Web.GraphEditor
+@inject GraphEditorState GraphState
+@inject ReloadCoordinator ReloadCoordinator
+@inject IJSRuntime JS
 
 @* The global chrome every page sits under — 工具列 in the "工具列 / 分頁 / 分頁工具列" hierarchy the old
    WinForms tool had (a MenuStrip with 檔案/工具/檢視, 設定 living under 工具). Each page's own toolbar
-   (e.g. Home.razor's 重新載入/存檔/縮放至全部) is the "分頁工具列" one level below this — page-specific,
-   not global, so it stays in the page rather than moving up here. Only one page/tab exists so far
-   (流程圖), so there's no real tab strip to build yet; this just reserves the correct global layer above
-   it so 設定 — and future 檔案/工具/檢視-style items — don't end up bolted onto whichever page happens to
-   be open, the way 設定 briefly was as a link inside Home.razor's own toolbar. *@
+   (e.g. Home.razor's 縮放至全部/從舊工具匯入) is the "分頁工具列" one level below this — page-specific,
+   not global, so it stays in the page rather than moving up here.
+
+   存檔/讀取 live here, not in the 流程圖 tab's own toolbar — even though the flow graph is the only one of
+   the three save locations that actually needs an explicit "commit" step (角色卡/世界書/節點內容都是
+   save-on-edit), that's an implementation detail, not something a user should have to know to find the
+   button. A traditional 檔案 menu's 存檔/開啟 always acts on "the document", not on whichever tab happens
+   to be open.
+
+   There used to be an "AI協作" 匯出/匯入 dropdown here — retired once 角色卡/世界書/流程圖 all became the
+   real save files an external AI tool reads and writes directly (AppSettings.ExternalDataFolder). *@
 <div class="app-menubar">
     <span class="app-menubar-brand">StoryForge</span>
+    <span class="app-menubar-group">
+        <button class="app-menubar-item" @onclick="Save">存檔</button>
+        <button class="app-menubar-item" @onclick="Load">讀取</button>
+    </span>
     <button class="app-menubar-item" @onclick="() => _settingsDialog?.Open()">設定</button>
+    <span class="app-menubar-status">@_fileStatus</span>
+    <span class="app-menubar-version">@BuildVersion</span>
 </div>
 <div class="app-content">
     @Body
@@ -34,8 +52,11 @@
         font-family: sans-serif; font-size: 13px; box-sizing: border-box;
     }
     .app-menubar-brand { font-weight: bold; opacity: 0.6; margin-right: 4px; }
+    .app-menubar-group { display: flex; gap: 4px; padding-right: 8px; border-right: 1px solid #333; }
     .app-menubar-item { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 3px 10px; border-radius: 3px; cursor: pointer; }
     .app-menubar-item:hover { background: #333; }
+    .app-menubar-status { margin-left: auto; opacity: 0.8; font-size: 12px; }
+    .app-menubar-version { opacity: 0.5; font-size: 11px; font-family: monospace; margin-left: 12px; }
 
     /* Every page's own root container (e.g. Home.razor's .graph-page) should fill exactly this box —
        position:fixed + top:32px rather than the menubar's own flex layout, since a page's content (the
@@ -46,4 +67,55 @@
 
 @code {
     private SettingsDialog? _settingsDialog;
+    private string _fileStatus = string.Empty;
+    private DotNetObjectReference<MainLayout>? _selfRef;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _selfRef = DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("storyForgeUi.bindSaveShortcut", _selfRef);
+        }
+    }
+
+    // Shown in the toolbar so "am I running the latest build?" can be answered by eye. The informational
+    // version is stamped at compile time from SourceRevisionId (see StoryForge.Web.csproj) with the wall-
+    // clock time of the actual `dotnet build`/`publish` invocation that produced this binary — unlike a
+    // source file's own last-write time, this can't be stale relative to the running process.
+    private static readonly string BuildVersion =
+        Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? "(unknown build)";
+
+    // The only one of the three save locations that needs an explicit commit — 角色卡/世界書/節點內容 all
+    // save on every edit already. storyForgeGraph.exportGraph is a plain global JS function (set up once
+    // by FlowGraphPanel's own init(), not scoped to that component instance), so calling it from here
+    // works regardless of which tab is currently visible — the canvas element itself is always mounted.
+    private async Task Save()
+    {
+        var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
+        GraphState.ApplyAndSave(export);
+        _fileStatus = GraphState.StatusMessage ?? string.Empty;
+        StateHasChanged();
+    }
+
+    // Ctrl/Cmd+S — bound globally in JS (see ui-draggable.js's bindSaveShortcut) rather than through
+    // Blazor's own @onkeydown, since the shortcut has to fire no matter which element on the page currently
+    // has focus, not just whichever one Blazor happens to be listening on.
+    [JSInvokable]
+    public Task SaveFromShortcut() => Save();
+
+    // Asks every always-mounted panel (世界書/角色卡/流程圖/劇本管線狀態) to reload its own data from
+    // AppSettings.ExternalDataFolder in place — not a full page reload, which would also reset client-only
+    // UI state that has nothing to do with the data itself (which tab is currently showing, in particular).
+    private async Task Load()
+    {
+        await ReloadCoordinator.RequestReloadAsync();
+        _fileStatus = "已重新讀取";
+    }
+
+    public void Dispose()
+    {
+        _selfRef?.Dispose();
+    }
 }

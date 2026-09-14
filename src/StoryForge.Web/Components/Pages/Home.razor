@@ -18,11 +18,17 @@
         <div class="tab-pane" style="display:@(_activeTab == "outline" ? "block" : "none")">
             <StoryOutlinePanel />
         </div>
-        <div class="tab-pane" style="display:@(_activeTab == "pipeline" ? "block" : "none")">
-            <PipelineStatusPanel />
-        </div>
+        @* FlowGraphPanel is mounted before PipelineStatusPanel deliberately — this DOM order has no visual
+           effect (each .tab-pane is absolutely positioned and shown/hidden via display), but it does drive
+           Blazor's OnAfterRenderAsync ordering: PipelineStatusPanel's own firstRender reads
+           GraphEditorState's model (via PipelineStatusState.Refresh), which is only populated once
+           FlowGraphPanel.LoadAndInit's synchronous LoadGraph() call has run. Reordering these two divs back
+           would silently reintroduce that race. *@
         <div class="tab-pane" style="display:@(_activeTab == "graph" ? "block" : "none")">
             <FlowGraphPanel />
+        </div>
+        <div class="tab-pane" style="display:@(_activeTab == "pipeline" ? "block" : "none")">
+            <PipelineStatusPanel />
         </div>
         <div class="tab-pane" style="display:@(_activeTab == "card" ? "block" : "none")">
             <CharacterCardPanel />

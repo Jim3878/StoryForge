@@ -1,44 +1,63 @@
+@using StoryForge.Core.Graph
 @using StoryForge.Web.GraphEditor
 @implements IDisposable
 @inject GraphEditorState State
+@inject ReloadCoordinator ReloadCoordinator
 @inject IJSRuntime JS
-@inject IWebHostEnvironment Env
 
 <div class="graph-page">
     <div class="graph-toolbar">
-        <button @onclick="Reload">重新載入</button>
-        <button @onclick="Save">存檔</button>
         <button @onclick="FitView">縮放至全部</button>
+        <button @onclick="ImportLegacy" title="從 PlayscriptOfflineTool 的 session.json 重新匯入流程圖存檔">從舊工具匯入</button>
+        <input class="graph-search-box" placeholder="搜尋劇本名稱..."
+               value="@_searchQuery" @oninput="e => _searchQuery = e.Value?.ToString() ?? string.Empty"
+               @onkeydown="OnSearchKeyDown" />
+        <button @onclick="RunSearch">搜尋</button>
+        <span class="graph-search-status">@_searchStatus</span>
         <span class="graph-status">@State.StatusMessage</span>
-        <span class="graph-version">graph-editor.js @JsLastModified</span>
     </div>
     <div class="graph-body">
         <canvas id="story-forge-canvas" class="graph-canvas" tabindex="0"></canvas>
         @if (_selectedNodeGuid != null)
         {
-            <div class="graph-inspector">
+            <div class="graph-inspector-resize-handle" id="graph-inspector-resize-handle"></div>
+            <div class="graph-inspector" id="graph-inspector-panel">
                 <div class="graph-inspector-title">@_selectedNodeTitle</div>
                 <div class="graph-inspector-guid">@_selectedNodeGuid</div>
-                @if (_selectedNodeIdentityFields.Count == 0)
+                @{
+                    // "memo" is excluded here — it moved out of the graph's own Fields entirely and into
+                    // its own NodeContentStore file (see GraphEditorState.SyncNodeContentFiles), rendered
+                    // as its own section below instead of through the generic schema-driven field loop.
+                    var identityFields = _selectedNodeIdentityFields.Where(f => f != "memo").ToList();
+                }
+                @if (identityFields.Count == 0 && _nodeContent == null)
                 {
                     <div class="graph-inspector-empty">這個節點類型沒有可編輯欄位</div>
                 }
                 else
                 {
-                    @foreach (var fieldName in _selectedNodeIdentityFields)
+                    @foreach (var fieldName in identityFields)
                     {
                         <label class="graph-inspector-field">
                             <span>@fieldName</span>
-                            @if (fieldName == "memo")
-                            {
-                                <textarea value="@GetFieldValue(fieldName)"
-                                          @onchange="e => OnFieldChanged(fieldName, e)"></textarea>
-                            }
-                            else
-                            {
-                                <input value="@GetFieldValue(fieldName)"
-                                       @onchange="e => OnFieldChanged(fieldName, e)" />
-                            }
+                            <input value="@GetFieldValue(fieldName)"
+                                   @onchange="e => OnFieldChanged(fieldName, e)" />
+                        </label>
+                    }
+
+                    @if (_nodeContent != null)
+                    {
+                        <label class="graph-inspector-field">
+                            <span>memo（存在 Nodes\ 底下的獨立檔案，不是流程圖存檔的一部分）</span>
+                            <textarea value="@_nodeContent.Memo" @onchange="OnMemoChanged"></textarea>
+                        </label>
+                        <label class="graph-inspector-field">
+                            <span>衝突</span>
+                            <textarea value="@_nodeContent.Conflict" @onchange="OnConflictChanged"></textarea>
+                        </label>
+                        <label class="graph-inspector-field">
+                            <span>變化</span>
+                            <textarea value="@_nodeContent.Change" @onchange="OnChangeChanged"></textarea>
                         </label>
                     }
                 }
@@ -54,8 +73,9 @@
        wrapper's own display:none/block toggling visibility instead of this component being torn down. */
     .graph-page { height: 100%; width: 100%; display: flex; flex-direction: column; }
     .graph-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1e1e1e; color: #ddd; }
+    .graph-search-box { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 3px 6px; border-radius: 3px; width: 160px; }
+    .graph-search-status { opacity: 0.8; font-size: 12px; }
     .graph-status { margin-left: 8px; opacity: 0.8; }
-    .graph-version { margin-left: auto; opacity: 0.5; font-size: 11px; font-family: monospace; }
     .graph-body { flex: 1 1 auto; display: flex; min-height: 0; }
     /* No width/height:100% here — against a sibling (.graph-inspector) that itself has a fixed width, an
        explicit 100% here ignores that sibling entirely and both end up wider than .graph-body, pushing the
@@ -67,11 +87,19 @@
        its keydown listener (bound to the canvas element itself, not document) never fired. outline:none
        here just hides the resulting focus ring, which looks out of place against the graph background. */
     .graph-canvas { flex: 1 1 auto; min-width: 0; display: block; background: #333; outline: none; }
-    /* flex:0 0 280px (a fixed *basis*) instead of an explicit width: the browser's own native resize handle
-       (from the plain `resize` property below) works by writing directly to this element's width style —
-       against a flex-basis, that write would just get overridden back to 280px on the next layout pass. An
-       explicit width free of any flex sizing keeps whatever the user drags it to. */
-    .graph-inspector { flex: 0 0 auto; width: 280px; min-width: 160px; max-width: 70vw; resize: horizontal; overflow: auto; background: #1e1e1e; color: #ddd; padding: 12px; border-left: 1px solid #333; }
+    /* flex:0 0 auto plus an explicit width (not a flex-basis) instead: the resize handle below writes
+       directly to this element's width style, and against a flex-basis that write would just get
+       overridden back to 280px on the next layout pass. An explicit width free of any flex sizing keeps
+       whatever the user drags it to. min/max-width stay in CSS rather than duplicated in JS — the browser
+       clamps any style.width write against them on every layout pass regardless of what the drag handler
+       computes. */
+    .graph-inspector { flex: 0 0 auto; width: 280px; min-width: 160px; max-width: 70vw; overflow: auto; background: #1e1e1e; color: #ddd; padding: 12px; border-left: 1px solid #333; }
+    /* A dedicated drag strip on the sidebar's left edge, in place of CSS's native `resize` handle — that
+       handle only ever renders as a tiny triangle in the bottom-right corner, which for this sidebar sits
+       exactly at the bottom-right corner of the whole page (the sidebar spans full height), making it
+       nearly impossible to grab. This strip runs the full height of the sidebar instead. */
+    .graph-inspector-resize-handle { flex: 0 0 6px; cursor: col-resize; background: #333; }
+    .graph-inspector-resize-handle:hover, .graph-inspector-resize-handle:active { background: #555; }
     .graph-inspector-title { font-weight: bold; margin-bottom: 4px; word-break: break-all; }
     .graph-inspector-guid { font-size: 11px; opacity: 0.5; font-family: monospace; margin-bottom: 12px; word-break: break-all; }
     .graph-inspector-empty { opacity: 0.6; font-size: 13px; }
@@ -92,17 +120,25 @@
     private string _selectedNodeTitle = string.Empty;
     private List<string> _selectedNodeIdentityFields = new();
     private Dictionary<string, string> _selectedNodeFieldValues = new();
+    private NodeContentEntry? _nodeContent;
 
-    // Shown in the toolbar so a stale-cache/stale-build question can be answered by eye instead of guessed
-    // at — reads the actual file on disk each render rather than a hand-maintained version constant, so it
-    // can never drift out of sync with what's really being served.
-    private string JsLastModified =>
-        File.GetLastWriteTime(Path.Combine(Env.WebRootPath, "js", "graph-editor.js")).ToString("MM/dd HH:mm:ss");
+    private string _searchQuery = string.Empty;
+    private string _searchStatus = string.Empty;
+
+    protected override void OnInitialized()
+    {
+        ReloadCoordinator.Subscribe(LoadAndInit);
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
             await LoadAndInit();
+
+        // ui-draggable.js's own _resizeInitialized guard makes this safe to call on every render while the
+        // inspector is shown, not just the render that first shows it (editing a field re-renders too).
+        if (_selectedNodeGuid != null)
+            await JS.InvokeVoidAsync("storyForgeUi.makeResizable", "graph-inspector-panel", "graph-inspector-resize-handle");
     }
 
     private async Task LoadAndInit()
@@ -132,6 +168,18 @@
         State.CreateNode(guid, typeName, x, y);
     }
 
+    // Called from graph-editor.js's own undo/redo stack when it rolls back past the point a node was
+    // created — that creation already reached the live model immediately (OnNodeCreated above), so undoing
+    // it client-side alone would leave a server-side orphan (no edges, but still written into session.json
+    // on the next unrelated 存檔) unless this mirrors the removal there too.
+    [JSInvokable]
+    public void OnNodeUndoRemoved(string guid)
+    {
+        State.RemoveUnsavedNode(guid);
+        if (_selectedNodeGuid == guid)
+            OnNodeSelectionChanged(null);
+    }
+
     // Called from graph-editor.js's onSelectionChange — guid is null when nothing (or more than one node)
     // is selected, since the sidebar only ever shows a single node's fields at a time.
     [JSInvokable]
@@ -143,6 +191,7 @@
             _selectedNodeFieldValues = new();
             _selectedNodeIdentityFields = new();
             _selectedNodeTitle = string.Empty;
+            _nodeContent = null;
         }
         else
         {
@@ -159,6 +208,7 @@
             // fields were already edited earlier in the session.
             _selectedNodeFieldValues = State.GetNodeFields(guid)?.ToDictionary(kv => kv.Key, kv => kv.Value)
                                         ?? new();
+            _nodeContent = State.GetNodeContent(guid);
         }
 
         StateHasChanged();
@@ -167,46 +217,115 @@
     private string GetFieldValue(string fieldName) =>
         _selectedNodeFieldValues.TryGetValue(fieldName, out var value) ? value : string.Empty;
 
-    private void OnFieldChanged(string fieldName, ChangeEventArgs e)
+    // Called from graph-editor.js's node right-click menu just before it opens, to decide whether
+    // 開啟劇本檔/複製劇本名稱 should be enabled — a live disk/model read rather than trusting the initial
+    // payload snapshot, which can go stale after a sidebar field edit (see GraphEditorState.UpdateNodeField).
+    [JSInvokable]
+    public NodeContextMenuInfoDto GetNodeContextMenuInfo(string guid) => State.GetNodeContextMenuInfo(guid);
+
+    // 開啟劇本檔 moved here from its old sidebar button — the right-click menu passes the guid explicitly
+    // since it's never tied to whichever node the sidebar currently has selected.
+    [JSInvokable]
+    public void OpenScriptTableForGuid(string guid)
+    {
+        State.OpenScriptTable(guid);
+        StateHasChanged();
+    }
+
+    // The server-side half of the right-click menu's 複製 action — see GraphEditorState.DuplicateNode for
+    // what actually gets copied (every field including playscriptId, plus 劇本 content). Edge duplication
+    // is entirely graph-editor.js's own responsibility since links never round-trip through this class
+    // until 存檔.
+    [JSInvokable]
+    public NodeDuplicateResultDto? DuplicateNode(string sourceGuid, string newGuid, float x, float y) =>
+        State.DuplicateNode(sourceGuid, newGuid, x, y);
+
+    private void OnMemoChanged(ChangeEventArgs e)
+    {
+        if (_selectedNodeGuid == null || _nodeContent == null)
+            return;
+
+        var value = e.Value?.ToString() ?? string.Empty;
+        _nodeContent.Memo = value;
+        State.SetNodeMemo(_selectedNodeGuid, value);
+    }
+
+    private void OnConflictChanged(ChangeEventArgs e)
+    {
+        if (_selectedNodeGuid == null || _nodeContent == null)
+            return;
+
+        var value = e.Value?.ToString() ?? string.Empty;
+        _nodeContent.Conflict = value;
+        State.SetNodeConflict(_selectedNodeGuid, value);
+    }
+
+    private void OnChangeChanged(ChangeEventArgs e)
+    {
+        if (_selectedNodeGuid == null || _nodeContent == null)
+            return;
+
+        var value = e.Value?.ToString() ?? string.Empty;
+        _nodeContent.Change = value;
+        State.SetNodeChange(_selectedNodeGuid, value);
+    }
+
+    // Pushes the node's recomputed title (GetNodeTitleInfo — the same playscriptId/flagId-or-fallback
+    // formula the initial payload and 複製 use) to both the canvas and this sidebar's own header the moment
+    // an identity field changes, instead of leaving them stale until the next reload — UpdateNodeField
+    // itself only touches the server-side model, see its own comment for why.
+    private async Task OnFieldChanged(string fieldName, ChangeEventArgs e)
     {
         if (_selectedNodeGuid == null)
             return;
 
         var value = e.Value?.ToString() ?? string.Empty;
-        _selectedNodeFieldValues[fieldName] = value;
-        State.UpdateNodeField(_selectedNodeGuid, fieldName, value);
+        var finalValue = State.UpdateNodeField(_selectedNodeGuid, fieldName, value) ?? value;
+        _selectedNodeFieldValues[fieldName] = finalValue;
+
+        var titleInfo = State.GetNodeTitleInfo(_selectedNodeGuid);
+        if (titleInfo != null)
+        {
+            _selectedNodeTitle = titleInfo.Title;
+            await JS.InvokeVoidAsync("storyForgeGraph.updateNodeTitle",
+                _selectedNodeGuid, titleInfo.Title, titleInfo.HasIdentityTitle);
+        }
     }
 
     public void Dispose()
     {
+        ReloadCoordinator.Unsubscribe(LoadAndInit);
         _selfRef?.Dispose();
     }
 
-    private async Task Reload()
+    private async Task ImportLegacy()
     {
-        await LoadAndInit();
-    }
-
-    private async Task Save()
-    {
-        try
-        {
-            DiagnosticsLog.Write("Save: clicked");
-            var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
-            DiagnosticsLog.Write($"Save: exported {export.NodePositions.Count} positions, {export.Edges.Count} edges");
-            State.ApplyAndSave(export);
-            DiagnosticsLog.Write("Save: done, status=" + State.StatusMessage);
-            StateHasChanged();
-        }
-        catch (Exception e)
-        {
-            DiagnosticsLog.Write("Save: EXCEPTION " + e);
-            throw;
-        }
+        _payload = State.ImportLegacySession();
+        _selfRef ??= DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("storyForgeGraph.init", "story-forge-canvas", _payload, _selfRef);
+        StateHasChanged();
     }
 
     private async Task FitView()
     {
         await JS.InvokeVoidAsync("storyForgeGraph.fitView");
+    }
+
+    // Mirrors the WinForms ProcessGraphPanel toolbar's own search box+button+Enter-key wiring — same
+    // "找不到/已定位到" status wording, and repeating the identical query cycles through matches instead of
+    // re-jumping to the first one (see graph-editor.js's searchNode).
+    private async Task OnSearchKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+            await RunSearch();
+    }
+
+    private async Task RunSearch()
+    {
+        if (string.IsNullOrWhiteSpace(_searchQuery))
+            return;
+
+        var found = await JS.InvokeAsync<bool>("storyForgeGraph.searchNode", _searchQuery);
+        _searchStatus = found ? $"已定位到：{_searchQuery}" : $"找不到符合「{_searchQuery}」的節點";
     }
 }

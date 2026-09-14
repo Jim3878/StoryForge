@@ -1,13 +1,17 @@
+@using StoryForge.Core
 @using StoryForge.Core.Pipeline
 @using StoryForge.Web.Pipeline
 @implements IDisposable
 @inject PipelineStatusState State
 @inject IJSRuntime JS
+@inject ReloadCoordinator ReloadCoordinator
 
 <div class="ps-page">
     <div class="ps-toolbar">
         <button @onclick="Refresh">重新整理</button>
-        <button @onclick="DownloadSheet">下載Sheet</button>
+        <button @onclick="BuildNodeFiles">建立劇本檔</button>
+        <button @onclick="DownloadSheetScripts" disabled="@State.IsSheetScriptDownloadRunning">下載Sheet劇本</button>
+        <button @onclick="DownloadSheet">讀取Sheet資料</button>
         <details class="ps-chapter-filter">
             <summary>章節篩選 (@_selectedChapters.Count/@AllChapters.Count)</summary>
             <div class="ps-chapter-filter-menu">
@@ -23,13 +27,30 @@
         <input class="ps-search" placeholder="搜尋劇本名稱..." @bind="_searchText" @bind:event="oninput" />
         <span class="ps-status">@State.StatusMessage</span>
     </div>
+    @if (State.IsSheetScriptDownloadRunning)
+    {
+        <div class="ps-progress-wrap">
+            <div class="ps-progress-bar"><div class="ps-progress-fill" style="width:@(SheetScriptProgressPercent)%"></div></div>
+            <span class="ps-progress-text">
+                下載中 @State.SheetScriptProcessedCount / @State.SheetScriptQueueTotal
+                @if (!string.IsNullOrEmpty(State.SheetScriptCurrentName))
+                {
+                    <text> — @State.SheetScriptCurrentName</text>
+                }
+            </span>
+        </div>
+    }
     <div class="ps-grid-wrap">
         <table class="ps-grid">
             <thead>
                 <tr id="ps-header-row">
+                    <th class="ps-select-col">
+                        <input type="checkbox" title="全選/全不選（僅目前篩選後可見的列）"
+                               checked="@AllVisibleRowsSelected" @onchange="ToggleAllVisibleRows" />
+                    </th>
                     @foreach (var col in _columns)
                     {
-                        <th @key="col.Key" title="拖曳可調整欄位順序">@col.Label</th>
+                        <th @key="col.Key" class="@GetCellClass(col.Key)" title="拖曳可調整欄位順序">@col.Label</th>
                     }
                 </tr>
             </thead>
@@ -37,6 +58,10 @@
                 @foreach (var row in FilteredRows)
                 {
                     <tr>
+                        <td class="ps-select-col">
+                            <input type="checkbox" checked="@_selectedNames.Contains(row.PlayscriptName)"
+                                   @onchange="e => ToggleRowSelected(row.PlayscriptName, e)" />
+                        </td>
                         @foreach (var col in _columns)
                         {
                             <td @key="col.Key" class="@GetCellClass(col.Key)" title="@GetCellTitle(col.Key)">@GetCellText(row, col.Key)</td>
@@ -52,6 +77,78 @@
     </div>
 </div>
 
+@if (State.PendingConflict is { } conflict)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>劇本檔已存在</h3>
+            <p>劇本「@conflict.PlayscriptName」本機已經有 .md 劇本檔，要用剛下載的內容覆蓋它嗎？</p>
+            <div class="ps-modal-actions">
+                <button @onclick='() => ResolveConflict(SheetScriptConflictChoice.OverwriteOne)'>覆蓋這個</button>
+                <button @onclick='() => ResolveConflict(SheetScriptConflictChoice.SkipOne)'>略過這個</button>
+                @if (conflict.RemainingConflictCount > 0)
+                {
+                    <button @onclick='() => ResolveConflict(SheetScriptConflictChoice.OverwriteRemaining)'>覆蓋接下來的 @conflict.RemainingConflictCount 個檔案</button>
+                    <button @onclick='() => ResolveConflict(SheetScriptConflictChoice.SkipRemaining)'>略過接下來的 @conflict.RemainingConflictCount 個檔案</button>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+@if (State.PendingScriptFileConflict is { } scriptConflict)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>劇本檔名稱衝突</h3>
+            <p>劇本「@scriptConflict.PlayscriptName」的檔名已經被另一個（流程圖上已不存在的）節點佔用，要讓這個節點接管、覆蓋掉舊檔案嗎？</p>
+            <div class="ps-modal-actions">
+                <button @onclick='() => ResolveScriptFileConflict(SheetScriptConflictChoice.OverwriteOne)'>覆蓋這個</button>
+                <button @onclick='() => ResolveScriptFileConflict(SheetScriptConflictChoice.SkipOne)'>略過這個</button>
+                @if (scriptConflict.RemainingConflictCount > 0)
+                {
+                    <button @onclick='() => ResolveScriptFileConflict(SheetScriptConflictChoice.OverwriteRemaining)'>覆蓋接下來的 @scriptConflict.RemainingConflictCount 個</button>
+                    <button @onclick='() => ResolveScriptFileConflict(SheetScriptConflictChoice.SkipRemaining)'>略過接下來的 @scriptConflict.RemainingConflictCount 個</button>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+@if (State.SheetScriptResults is { } results)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>下載結果</h3>
+            @if (results.Count == 0)
+            {
+                <p>全部劇本都已成功下載並寫入劇本檔。</p>
+            }
+            else
+            {
+                <p>以下 @results.Count 個劇本無法下載：</p>
+                <div class="ps-result-list">
+                    @foreach (var failure in results)
+                    {
+                        <div class="ps-result-row"><b>@failure.PlayscriptName</b> — @failure.Reason</div>
+                    }
+                </div>
+            }
+            <div class="ps-modal-actions">
+                @if (!string.IsNullOrEmpty(_copyFeedback))
+                {
+                    <span class="ps-copy-feedback">@_copyFeedback</span>
+                }
+                @if (results.Count > 0)
+                {
+                    <button @onclick="CopyResultsToClipboard">複製結果</button>
+                }
+                <button @onclick="CloseResults">關閉</button>
+            </div>
+        </div>
+    </div>
+}
+
 <style>
     .ps-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; background: #262626; }
     .ps-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1e1e1e; border-bottom: 1px solid #333; }
@@ -66,12 +163,35 @@
     .ps-grid-wrap { flex: 1 1 auto; overflow: auto; }
     .ps-grid { width: 100%; border-collapse: collapse; font-size: 13px; }
     .ps-grid th { position: sticky; top: 0; background: #1e1e1e; text-align: left; padding: 6px 10px; border-bottom: 1px solid #333; cursor: grab; user-select: none; }
+    .ps-grid th.ps-check { text-align: center; }
     .ps-grid td { padding: 5px 10px; border-bottom: 1px solid #2e2e2e; }
     .ps-grid tr:hover td { background: #2f2f2f; }
     .ps-name { word-break: break-all; }
     .ps-check { text-align: center; color: #7fd77f; }
     .ps-unknown { text-align: center; opacity: 0.35; }
     .ps-empty { padding: 16px; opacity: 0.6; font-size: 13px; }
+    .ps-select-col { width: 28px; text-align: center; }
+
+    .ps-progress-wrap { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: #1e1e1e; border-bottom: 1px solid #333; }
+    .ps-progress-bar { flex: 1 1 auto; height: 8px; border-radius: 4px; background: #333; overflow: hidden; }
+    .ps-progress-fill { height: 100%; background: #4c8bf5; transition: width 0.15s ease-out; }
+    .ps-progress-text { flex: 0 0 auto; font-size: 12px; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+
+    .ps-modal-backdrop {
+        position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 1000;
+        display: flex; align-items: center; justify-content: center;
+    }
+    .ps-modal {
+        background: #262626; color: #ddd; border: 1px solid #444; border-radius: 6px;
+        padding: 18px 20px; max-width: 560px; width: 90%; max-height: 80vh;
+        display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+    .ps-modal h3 { margin: 0; }
+    .ps-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .ps-result-list { overflow-y: auto; max-height: 40vh; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 10px; }
+    .ps-result-row { padding: 3px 0; font-size: 13px; border-bottom: 1px solid #333; }
+    .ps-result-row:last-child { border-bottom: none; }
+    .ps-copy-feedback { align-self: center; font-size: 12px; opacity: 0.8; margin-right: auto; }
 </style>
 
 @code {
@@ -89,6 +209,7 @@
         new() { Key = "name", Label = "劇本名稱" },
         new() { Key = "ldtk", Label = "LDtk" },
         new() { Key = "graph", Label = "流程圖" },
+        new() { Key = "localScript", Label = "本地劇本" },
         new() { Key = "sheetDir", Label = "Sheet目錄" },
         new() { Key = "sheetFile", Label = "Sheet檔案" },
         new() { Key = "csharp", Label = "C#" },
@@ -96,6 +217,16 @@
     private DotNetObjectReference<PipelineStatusPanel>? _selfRef;
 
     private string _searchText = string.Empty;
+
+    // Row-level selection for "建立劇本檔" and "下載Sheet劇本" — independent of the chapter filter above,
+    // which only controls which rows are visible/selectable here. Deliberately not cleared when a row is
+    // hidden by the chapter filter or search box, so a selection made before narrowing the view still
+    // counts once the view widens again.
+    private readonly HashSet<string> _selectedNames = new();
+
+    // Transient feedback shown next to the "複製結果" button after a click — cleared whenever the results
+    // dialog is dismissed so it never lingers into the next batch's dialog.
+    private string? _copyFeedback;
 
     // Chapters newly seen on a refresh default to selected so a refresh never silently hides new data —
     // matching the original tool's own ChapterFilterSettings behavior — but a chapter the user has
@@ -112,7 +243,7 @@
             : null;
 
     private List<string> AllChapters =>
-        State.Rows.Select(r => r.Chapter).Distinct().OrderBy(c => c, StringComparer.Ordinal).ToList();
+        State.Rows.Select(r => r.Chapter).Distinct().OrderBy(c => c, NaturalStringComparer.Instance).ToList();
 
     private bool AllSelected => AllChapters.Count > 0 && AllChapters.All(_selectedChapters.Contains);
 
@@ -122,19 +253,57 @@
             .Where(r => string.IsNullOrWhiteSpace(_searchText) ||
                         r.PlayscriptName.Contains(_searchText, StringComparison.OrdinalIgnoreCase));
 
-    protected override void OnInitialized()
+    private double SheetScriptProgressPercent =>
+        State.SheetScriptQueueTotal == 0 ? 0 : 100.0 * State.SheetScriptProcessedCount / State.SheetScriptQueueTotal;
+
+    private bool AllVisibleRowsSelected
     {
-        State.Refresh();
-        SyncChapterSelection();
+        get
+        {
+            var visible = FilteredRows.ToList();
+            return visible.Count > 0 && visible.All(r => _selectedNames.Contains(r.PlayscriptName));
+        }
     }
 
+    protected override void OnInitialized()
+    {
+        ReloadCoordinator.Subscribe(OnReload);
+        State.OnSheetScriptProgress += OnSheetScriptProgress;
+    }
+
+    // Deferred to firstRender rather than done in OnInitialized: GraphEditorState's model (this panel's
+    // 流程圖 column source, via PipelineStatusState.Refresh -> GetPlayscriptIdentities) is only populated by
+    // FlowGraphPanel's own LoadAndInit, which itself runs from OnAfterRenderAsync — OnInitialized for every
+    // always-mounted panel (see Home.razor) runs before any of them reach OnAfterRenderAsync, so refreshing
+    // here instead would always see an empty/not-yet-loaded graph. Relies on Home.razor mounting
+    // <FlowGraphPanel /> before <PipelineStatusPanel /> so its OnAfterRenderAsync (and thus LoadAndInit's
+    // synchronous LoadGraph() call, which runs before that method's own first await) has already populated
+    // the model by the time this one runs.
+    //
     // Re-armed on every render (init() itself destroys any previous instance first) rather than only on
     // firstRender — a reorder's own StateHasChanged() re-renders the header row, and the freshly-rendered
     // <tr> needs SortableJS wired to it again for the next drag to work.
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        if (firstRender)
+        {
+            State.Refresh();
+            SyncChapterSelection();
+            StateHasChanged();
+        }
+
         _selfRef ??= DotNetObjectReference.Create(this);
         await JS.InvokeVoidAsync("storyForgeColumnSort.init", "ps-header-row", _selfRef);
+    }
+
+    // Wired to the global 讀取 toolbar button (MainLayout) via ReloadCoordinator, same as the other three
+    // always-mounted panels — previously missing here, which meant 讀取 silently left this tab showing
+    // stale data and the user had to remember to also press this tab's own 重新整理 button every time.
+    private async Task OnReload()
+    {
+        State.Refresh();
+        SyncChapterSelection();
+        await InvokeAsync(StateHasChanged);
     }
 
     // Called by column-sort.js after a drag completes — SortableJS already physically moved the <th> in
@@ -154,6 +323,8 @@
 
     public void Dispose()
     {
+        ReloadCoordinator.Unsubscribe(OnReload);
+        State.OnSheetScriptProgress -= OnSheetScriptProgress;
         _selfRef?.Dispose();
     }
 
@@ -167,6 +338,83 @@
     {
         await State.DownloadSheetAsync();
         SyncChapterSelection();
+    }
+
+    // 建立劇本檔 — writes NodeContentStore/NodeScriptTableStore's .json/.md files for every 劇本 node whose
+    // playscript name is currently checked in the row-selection checkboxes, not the chapter filter (which
+    // only controls what's visible/checkable here).
+    private void BuildNodeFiles()
+    {
+        State.BuildNodeContentFiles(_selectedNames);
+    }
+
+    private async Task DownloadSheetScripts()
+    {
+        await State.StartSheetScriptDownloadAsync(_selectedNames);
+    }
+
+    private async Task ResolveConflict(SheetScriptConflictChoice choice)
+    {
+        await State.ResolveSheetScriptConflictAsync(choice);
+    }
+
+    private void ResolveScriptFileConflict(SheetScriptConflictChoice choice)
+    {
+        State.ResolveScriptFileConflict(choice);
+    }
+
+    private void CloseResults()
+    {
+        State.DismissSheetScriptResults();
+        _copyFeedback = null;
+    }
+
+    private async Task CopyResultsToClipboard()
+    {
+        if (State.SheetScriptResults is not { } results || results.Count == 0)
+            return;
+
+        var text = string.Join("\n", results.Select(r => $"{r.PlayscriptName} — {r.Reason}"));
+        try
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+            _copyFeedback = "已複製到剪貼簿";
+        }
+        catch (Exception)
+        {
+            // Clipboard access can be denied by the browser (permissions, non-HTTPS context, focus) —
+            // never let that crash the circuit; just tell the user to copy the list by hand instead.
+            _copyFeedback = "複製失敗，請手動選取上方清單文字複製";
+        }
+    }
+
+    // State's batch loop calls this synchronously from within an event-handler Task, so re-rendering here
+    // needs InvokeAsync the same way OnReload does — without it, progress made after the initial await would
+    // never reach the UI until the whole method returns.
+    private void OnSheetScriptProgress()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void ToggleAllVisibleRows(ChangeEventArgs e)
+    {
+        var check = e.Value is bool b && b;
+        foreach (var row in FilteredRows)
+        {
+            if (check)
+                _selectedNames.Add(row.PlayscriptName);
+            else
+                _selectedNames.Remove(row.PlayscriptName);
+        }
+    }
+
+    private void ToggleRowSelected(string playscriptName, ChangeEventArgs e)
+    {
+        var check = e.Value is bool b && b;
+        if (check)
+            _selectedNames.Add(playscriptName);
+        else
+            _selectedNames.Remove(playscriptName);
     }
 
     private void SyncChapterSelection()
@@ -222,6 +470,7 @@
         "name" => row.PlayscriptName,
         "ldtk" => row.IsOnLdtk ? "✔" : "",
         "graph" => row.IsOnGraph ? "✔" : "",
+        "localScript" => row.HasLocalScriptFile ? "✔" : "",
         "sheetDir" => row.IsOnSheet ? "✔" : "",
         "sheetFile" => row.HasSheetFile ? "✔" : "",
         "csharp" => row.IsOnCSharp ? "✔" : "",
@@ -231,14 +480,17 @@
     private static string GetCellClass(string key) => key switch
     {
         "name" => "ps-name",
-        "ldtk" or "graph" or "sheetDir" or "sheetFile" or "csharp" => "ps-check",
+        "ldtk" or "graph" or "localScript" or "sheetDir" or "sheetFile" or "csharp" => "ps-check",
         _ => "",
     };
 
     // "Sheet目錄" = listed in the index sheet at all. "Sheet檔案" = that listing already has its own
     // dedicated spreadsheet (a real link) and isn't marked "空" in that chapter tab's own empty-check column.
+    // "本地劇本" checks disk only, independent of "流程圖" — a row with this checked but not "流程圖" means
+    // the .md file is a leftover from a node that no longer exists on the graph.
     private static string GetCellTitle(string key) => key switch
     {
+        "localScript" => "本機是否已有這個劇本名稱的 .md 劇本檔（與流程圖節點是否存在無關）",
         "sheetDir" => "是否列在 Sheet 索引中",
         "sheetFile" => "是否已有自己的 GoogleSheet 分頁，且未被標記為空",
         _ => "",

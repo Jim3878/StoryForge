@@ -22,6 +22,7 @@ builder.Services.AddScoped<GraphEditorState>();
 builder.Services.AddScoped<StoryForge.Web.CharacterCard.CharacterCardState>();
 builder.Services.AddScoped<StoryForge.Web.StoryOutline.StoryOutlineState>();
 builder.Services.AddScoped<StoryForge.Web.Pipeline.PipelineStatusState>();
+builder.Services.AddScoped<StoryForge.Web.ReloadCoordinator>();
 
 // DetailedErrors surfaces the real reason in the browser console/reconnect UI instead of a bare
 // "connection closed", and CircuitDiagnosticsHandler below logs every open/close/error to a plain file so

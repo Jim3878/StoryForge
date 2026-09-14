@@ -1,13 +1,16 @@
 @using StoryForge.Core.CharacterCard
 @using StoryForge.Web.CharacterCard
+@implements IDisposable
 @inject CharacterCardState State
 @inject StoryForge.Core.Graph.AppSettings Settings
+@inject ReloadCoordinator ReloadCoordinator
 @inject IJSRuntime JS
 
 <div class="cc-page">
     <div class="cc-toolbar">
         <button @onclick="AddCard">新增角色</button>
         <button @onclick="DeleteSelected" disabled="@(_selectedId == null)">刪除角色</button>
+        <button @onclick="OpenPortraitFolder">開啟立繪資料夾</button>
         <label class="cc-size-slider">
             <span>縮圖大小</span>
             <input type="range" min="100" max="500" step="10" value="@Settings.PortraitPreviewSize"
@@ -17,15 +20,17 @@
         <span class="cc-status">@State.StatusMessage</span>
     </div>
     <div class="cc-body">
-        <div class="cc-list">
+        <div class="cc-list" id="cc-card-list">
             @if (State.Cards.Count == 0)
             {
                 <div class="cc-list-empty">還沒有角色卡</div>
             }
             @foreach (var card in State.Cards)
             {
-                <div class="cc-list-item @(card.Id == _selectedId ? "selected" : "")" @onclick="() => Select(card.Id)">
-                    @GetDisplayLabel(card)
+                <div class="cc-list-item @(card.Id == _selectedId ? "selected" : "")" @key="(card.Id, _listRevision)"
+                     data-card-id="@card.Id" @onclick="() => Select(card.Id)">
+                    <span class="cc-drag-handle" title="拖曳調整順序" @onclick:stopPropagation="true">⠿</span>
+                    <span class="cc-list-item-label">@GetDisplayLabel(card)</span>
                 </div>
             }
         </div>
@@ -63,18 +68,21 @@
                             <div class="cc-portrait-thumb" style="width:@(Settings.PortraitPreviewSize)px;">
                                 <img src="@GetThumbnailUrl(entry.FileName)" alt="@State.GetFaceLabel(entry.Variant)"
                                      style="width:@(Settings.PortraitPreviewSize)px;" />
-                                <span>@State.GetFaceLabel(entry.Variant)</span>
+                                <span class="cc-portrait-label-row">
+                                    <span>@State.GetFaceLabel(entry.Variant)</span>
+                                    <button type="button" class="cc-portrait-copy" @onclick="() => CopyToClipboard(State.GetFaceLabel(entry.Variant))">複製中文</button>
+                                </span>
                                 <span class="cc-portrait-filename">@entry.FileName</span>
                                 <textarea class="cc-portrait-note" placeholder="這個表情的其他意思／用途（給 AI 參考）"
-                                          value="@State.GetPortraitDescription(entry.FileName)"
-                                          @onchange="e => UpdatePortraitDescription(entry.FileName, e)"></textarea>
+                                          value="@State.GetPortraitDescription(_selected!, entry.FileName)"
+                                          @onchange="e => UpdatePortraitDescription(_selected!, entry.FileName, e)"></textarea>
                             </div>
                         }
                     </div>
                 }
                 <label class="cc-field">
                     <span>備註（個性/語氣/背景等，給 AI 參考）</span>
-                    <textarea @onchange="e => UpdateField(_selected, FieldName.Note, e)">@_selected.Note</textarea>
+                    <textarea value="@_selected.Note" @onchange="e => UpdateField(_selected, FieldName.Note, e)"></textarea>
                 </label>
             }
             else
@@ -94,9 +102,20 @@
     .cc-body { flex: 1 1 auto; display: flex; min-height: 0; background: #262626; }
     .cc-list { flex: 0 0 240px; overflow-y: auto; border-right: 1px solid #333; }
     .cc-list-empty { padding: 12px; opacity: 0.6; font-size: 13px; }
-    .cc-list-item { padding: 8px 12px; font-size: 13px; cursor: pointer; border-bottom: 1px solid #2e2e2e; word-break: break-all; }
+    .cc-list-item { display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; border-bottom: 1px solid #2e2e2e; }
     .cc-list-item:hover { background: #2f2f2f; }
     .cc-list-item.selected { background: #37507a; color: #fff; }
+    .cc-list-item-label { word-break: break-all; }
+    /* cursor:grab (not the item's own pointer cursor) marks this as the one draggable spot in the row —
+       the rest of the row still only selects, per explicit user decision to keep drag and click-to-select
+       from fighting over the same hit area. */
+    .cc-drag-handle { flex: 0 0 auto; cursor: grab; opacity: 0.5; user-select: none; }
+    .cc-drag-handle:hover { opacity: 0.9; }
+    /* Applied by ui-draggable.js's makeSortableList for the duration of a drag — the row being moved stays
+       visible (not a ghost/ ~drag image~, since this list reorders live by actually relocating the DOM node
+       under the cursor, not via native HTML5 drag-and-drop) but dimmed so the eye can track it separately
+       from the rows shifting out of its way. */
+    .cc-list-item.dragging { opacity: 0.4; }
     .cc-detail { flex: 1 1 auto; padding: 16px; overflow-y: auto; }
     .cc-empty { opacity: 0.6; font-size: 13px; }
     .cc-field { display: block; margin-bottom: 14px; font-size: 13px; max-width: 480px; }
@@ -108,6 +127,9 @@
     .cc-portrait-thumb { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; }
     .cc-portrait-thumb img { border: 1px solid #444; border-radius: 3px; background: #1c1c1c; display: block; }
     .cc-portrait-filename { opacity: 0.5; word-break: break-all; text-align: center; }
+    .cc-portrait-label-row { display: flex; align-items: center; gap: 6px; }
+    .cc-portrait-copy { font-size: 10px; padding: 2px 8px; background: #37507a; color: #eee; border: 1px solid #4a6ba0; border-radius: 3px; cursor: pointer; }
+    .cc-portrait-copy:hover { background: #45638f; }
     .cc-portrait-note { width: 100%; box-sizing: border-box; min-height: 40px; resize: vertical; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 6px; border-radius: 3px; font: inherit; font-size: 11px; }
 </style>
 
@@ -116,10 +138,61 @@
 
     private string? _selectedId;
     private CharacterCardEntry? _selected => State.Cards.FirstOrDefault(c => c.Id == _selectedId);
+    private DotNetObjectReference<CharacterCardPanel>? _selfRef;
+
+    // Bumped on every drag-to-reorder so each row's @key changes, forcing Blazor to tear down and rebuild
+    // every .cc-list-item element from scratch instead of diffing against its own pre-drag memory of their
+    // positions — that stale memory no longer matches the real DOM, since makeSortableList already
+    // physically relocated the live elements during the drag itself (see its own comment on why), and an
+    // incremental patch computed against the wrong starting point was landing rows a slot off. A full
+    // rebuild sidesteps that mismatch entirely by never trying to reuse/move the now-misplaced nodes.
+    private int _listRevision;
 
     protected override void OnInitialized()
     {
         State.Load();
+        ReloadCoordinator.Subscribe(OnReload);
+    }
+
+    // Bound once — the #cc-card-list container itself is never torn down/recreated (this panel is
+    // always-mounted per Home.razor's design, and the list div isn't behind an @if), so a single mousedown
+    // listener on it (see makeSortableList's own event-delegation comment) keeps working correctly as cards
+    // are added/removed, with no re-binding needed on every render.
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _selfRef = DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("storyForgeUi.makeSortableList",
+                "cc-card-list", ".cc-list-item", ".cc-drag-handle", _selfRef, nameof(OnCardsReordered));
+        }
+    }
+
+    // Called once, when the user releases the mouse after dragging a card's handle — orderedIds is every
+    // card's Id read back from the DOM in its now-final order (see makeSortableList). ReorderCards both
+    // updates State.Cards to match and saves immediately, per explicit product decision: this list has no
+    // separate 存檔 step, same as every other field here.
+    [JSInvokable]
+    public void OnCardsReordered(string[] orderedIds)
+    {
+        State.ReorderCards(orderedIds);
+        _listRevision++;
+        StateHasChanged();
+    }
+
+    // _selected is computed live from State.Cards by Id, so a reload that changes the roster just falls
+    // back to "nothing selected" gracefully if the currently-selected card is gone — no extra handling
+    // needed here beyond re-loading and re-rendering.
+    private async Task OnReload()
+    {
+        State.Load();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        ReloadCoordinator.Unsubscribe(OnReload);
+        _selfRef?.Dispose();
     }
 
     private void Select(string id)
@@ -158,9 +231,20 @@
         State.Save();
     }
 
-    private void UpdatePortraitDescription(string fileName, ChangeEventArgs e)
+    private void UpdatePortraitDescription(CharacterCardEntry card, string fileName, ChangeEventArgs e)
     {
-        State.SetPortraitDescription(fileName, e.Value?.ToString() ?? string.Empty);
+        State.SetPortraitDescription(card, fileName, e.Value?.ToString() ?? string.Empty);
+    }
+
+    private void OpenPortraitFolder()
+    {
+        State.OpenPortraitFolder(_selected);
+        StateHasChanged();
+    }
+
+    private async Task CopyToClipboard(string text)
+    {
+        await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
     }
 
     // oninput updates the in-memory value on every drag tick (live resize feedback, no disk write);

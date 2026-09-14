@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using StoryForge.Core;
 using StoryForge.Core.CharacterCard;
+using StoryForge.Core.Graph;
 using StoryForge.Core.Portrait;
 
 namespace StoryForge.Web.CharacterCard;
@@ -10,8 +12,19 @@ namespace StoryForge.Web.CharacterCard;
 // in the original WinForms tool — there's no explicit 存檔 button here.
 public sealed class CharacterCardState
 {
+    private readonly AppSettings _appSettings;
+
+    // Still resolved and kept around for the portrait-folder scan below — that stays reading from the
+    // Unity project (立繪差分 art lives in Assets, not in the external save folder). CharacterCardSettings
+    // itself, though, now saves to _appSettings.ExternalDataFolder, not here.
     private string? _projectRoot;
     private CharacterCardSettings _settings = new();
+    private string? _portraitFolder;
+
+    public CharacterCardState(AppSettings appSettings)
+    {
+        _appSettings = appSettings;
+    }
 
     public string StatusMessage { get; private set; } = string.Empty;
     public List<CharacterCardEntry> Cards => _settings.Cards;
@@ -28,21 +41,23 @@ public sealed class CharacterCardState
     // variant token itself when a file's variant doesn't match any known Face member.
     private Dictionary<string, string> _faceLabelMap = new(StringComparer.OrdinalIgnoreCase);
 
-    // User-authored per-file notes on what a specific expression variant actually conveys — a Face label
-    // like "生氣" doesn't capture nuance (e.g. "假裝生氣" vs "真的暴怒"), so this lets the user annotate each
-    // file individually. Shared with the original tool's 立繪差分 panel (same portrait-descriptions.json).
-    private PortraitDescriptionSettings _descriptionSettings = new();
-
     public void Load()
     {
         try
         {
             _projectRoot = ProjectPaths.ResolveUnityProjectRoot();
-            _settings = CharacterCardSettings.LoadOrDefault(_projectRoot);
+            _settings = CharacterCardSettings.LoadOrDefault(_appSettings.ExternalDataFolder);
 
-            var portraitFolder = Path.Combine(_projectRoot, "Assets",
+            _portraitFolder = Path.Combine(_projectRoot, "Assets",
                 PortraitAssetScanner.PortraitFolderRelativePath.Replace('/', Path.DirectorySeparatorChar));
-            _portraitEntries = PortraitAssetScanner.ScanFolder(portraitFolder);
+
+            // Character Card only wants the plain "Portrait_" line — "BattlePortrait_" variants are a
+            // separate in-combat art set the user doesn't want cluttering the character-linking dropdown
+            // or thumbnail gallery here.
+            _portraitEntries = PortraitAssetScanner.ScanFolder(_portraitFolder)
+                .Where(entry => !string.Equals(entry.Category, PortraitAssetScanner.BattlePortraitCategory,
+                    StringComparison.OrdinalIgnoreCase))
+                .ToList();
             PortraitCharacters = _portraitEntries
                 .Select(entry => entry.Character)
                 .Distinct(StringComparer.Ordinal)
@@ -50,7 +65,7 @@ public sealed class CharacterCardState
                 .ToList();
 
             _faceLabelMap = PortraitFaceLabelLoader.LoadFaceLabelMap(_projectRoot);
-            _descriptionSettings = PortraitDescriptionSettings.LoadOrDefault();
+            SyncExpressionLabels();
 
             StatusMessage = $"已載入：{_settings.Cards.Count} 個角色卡（立繪角色 {PortraitCharacters.Count} 個）";
         }
@@ -70,19 +85,88 @@ public sealed class CharacterCardState
     public string GetFaceLabel(string variant) =>
         _faceLabelMap.TryGetValue(variant, out var label) ? label : variant;
 
-    public string GetPortraitDescription(string fileName) =>
-        _descriptionSettings.DescriptionsByFileName.GetValueOrDefault(fileName, string.Empty);
-
-    public void SetPortraitDescription(string fileName, string text)
+    // Stamps every linked card's expression entries with the current Chinese label for each of its
+    // portrait files, creating the entry if it doesn't exist yet — this is what makes the label show up in
+    // CharacterCards.json even for variants the user has never typed a manual note for. Only ChineseLabel
+    // is touched here; an existing Note is left alone.
+    private void SyncExpressionLabels()
     {
-        var trimmed = text.Trim();
-        if (string.IsNullOrEmpty(trimmed))
-            _descriptionSettings.DescriptionsByFileName.Remove(fileName);
-        else
-            _descriptionSettings.DescriptionsByFileName[fileName] = trimmed;
+        var changed = false;
+        foreach (var card in _settings.Cards)
+        {
+            if (string.IsNullOrEmpty(card.LinkedPortraitCharacter))
+                continue;
 
-        _descriptionSettings.Save();
+            foreach (var entry in GetPortraitEntries(card.LinkedPortraitCharacter))
+            {
+                var label = GetFaceLabel(entry.Variant);
+                if (card.ExpressionNotesByFileName.TryGetValue(entry.FileName, out var note))
+                {
+                    if (note.ChineseLabel != label)
+                    {
+                        note.ChineseLabel = label;
+                        changed = true;
+                    }
+                }
+                else
+                {
+                    card.ExpressionNotesByFileName[entry.FileName] = new CharacterCardExpressionNote { ChineseLabel = label };
+                    changed = true;
+                }
+            }
+        }
+
+        if (changed)
+            Save();
     }
+
+    // All characters' portraits live in one shared, flat folder (see PortraitAssetScanner), so there's no
+    // per-character subfolder to open. When the given card is linked to a portrait character with at least
+    // one scanned file, Explorer opens with that character's first file (same sort order as the thumbnail
+    // gallery) pre-selected/highlighted so the user can actually find it; otherwise this just opens the
+    // shared folder itself. Errors (no project-root override, folder missing on disk) are reported through
+    // StatusMessage rather than thrown, matching GraphEditorState.OpenScriptTable.
+    public void OpenPortraitFolder(CharacterCardEntry? selectedCard)
+    {
+        if (string.IsNullOrEmpty(_portraitFolder))
+        {
+            StatusMessage = "開啟立繪資料夾失敗：尚未載入立繪資料夾路徑";
+            return;
+        }
+
+        try
+        {
+            var targetFile = string.IsNullOrEmpty(selectedCard?.LinkedPortraitCharacter)
+                ? null
+                : GetPortraitEntries(selectedCard.LinkedPortraitCharacter).FirstOrDefault()?.FilePath;
+
+            if (targetFile != null)
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{targetFile}\"") { UseShellExecute = true });
+            else
+                Process.Start(new ProcessStartInfo(_portraitFolder) { UseShellExecute = true });
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"開啟立繪資料夾失敗：{e.Message}";
+        }
+    }
+
+    public string GetPortraitDescription(CharacterCardEntry card, string fileName) =>
+        card.ExpressionNotesByFileName.TryGetValue(fileName, out var note) ? note.Note : string.Empty;
+
+    public void SetPortraitDescription(CharacterCardEntry card, string fileName, string text)
+    {
+        if (!card.ExpressionNotesByFileName.TryGetValue(fileName, out var note))
+        {
+            note = new CharacterCardExpressionNote { ChineseLabel = GetFaceLabel(GetVariant(fileName)) };
+            card.ExpressionNotesByFileName[fileName] = note;
+        }
+
+        note.Note = text.Trim();
+        Save();
+    }
+
+    private static string GetVariant(string fileName) => PortraitAssetScanner.CreateEntry(fileName).Variant;
 
     public CharacterCardEntry AddCard()
     {
@@ -98,14 +182,28 @@ public sealed class CharacterCardState
         Save();
     }
 
-    public void Save()
+    // Called after a drag-to-reorder in the 角色卡 list — orderedIds is the panel's own DOM read-back of
+    // every row's data-card-id, in its final dropped order. Rebuilt from a dictionary lookup rather than an
+    // in-place sort so the panel's JS side never needs to know anything about CharacterCardEntry itself.
+    // Cards.Count must match exactly or this is a no-op — a mismatch means the id list is stale relative to
+    // the live roster (e.g. a card was deleted from another circuit mid-drag), and silently dropping or
+    // duplicating a card would be worse than just leaving the reorder unapplied.
+    public void ReorderCards(IReadOnlyList<string> orderedIds)
     {
-        if (_projectRoot == null)
+        var byId = _settings.Cards.ToDictionary(c => c.Id);
+        var reordered = orderedIds.Where(byId.ContainsKey).Select(id => byId[id]).ToList();
+        if (reordered.Count != _settings.Cards.Count)
             return;
 
+        _settings.Cards = reordered;
+        Save();
+    }
+
+    public void Save()
+    {
         try
         {
-            _settings.Save(_projectRoot);
+            _settings.Save(_appSettings.ExternalDataFolder);
             StatusMessage = $"已儲存：{_settings.Cards.Count} 個角色卡";
         }
         catch (Exception e)

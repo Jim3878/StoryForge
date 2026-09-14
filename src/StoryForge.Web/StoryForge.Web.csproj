@@ -4,6 +4,11 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Baked into AssemblyInformationalVersion below, so it changes on every real `dotnet build`/`publish`
+         invocation (forces AssemblyInfo regeneration since the string differs from the cached one), unlike
+         reading a source file's own last-write time, which says nothing about whether the running process
+         was actually rebuilt from it. -->
+    <SourceRevisionId>build-$([System.DateTime]::Now.ToString(yyyyMMdd-HHmmss))</SourceRevisionId>
   </PropertyGroup>
 
   <ItemGroup>

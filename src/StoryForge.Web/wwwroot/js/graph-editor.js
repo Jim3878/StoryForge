@@ -18,13 +18,45 @@ window.storyForgeGraph = (function () {
                          // selection change (see OnNodeCreated below)
     let groupPadding = 25.6;      // from AppSettings.Padding — see recomputeGroupBounds
     let groupTitleBarHeight = 60; // from AppSettings.TitleBarHeight
+    let liteTypeToTypeName = new Map(); // "storyforge/xxx" -> original schema typeName, for snapshot/restore
+    let searchMinZoom = 0.5;      // from AppSettings.SearchMinZoom — see focusOnNode
+
+    // Ported from the WinForms tool's ProcessGraphCanvas.SearchNode: matches by identity title only
+    // (hasIdentityTitle — playscriptId/flagId, never a node's generic type-label fallback), case-insensitive
+    // substring. Repeating the exact same query cycles to the next match instead of re-jumping to the
+    // first one; a new/different query starts a fresh match list.
+    let lastSearchQuery = null;
+    let lastSearchMatchGuids = [];
+    let lastSearchMatchIndex = -1;
 
     patchLiteGraphForMultiInputLinks();
     patchEdgeBodyRewiring();
     patchAddNodeMenu();
     patchDisableNodePropertiesPanel();
     patchCaptureShiftOnMouseUp();
-    patchDisableNodeContextMenu();
+    patchNodeContextMenu();
+    patchDeleteWithUndo();
+    patchUndoRedoKeys();
+    patchPersistViewportOnWheel();
+    patchGroupRendering();
+
+    // Set for the duration of a multi-node drag (see patchEdgeBodyRewiring's beginMultiNodeDrag) so
+    // onNodeMoved — which LiteGraph only ever calls once, for whichever node the mouse actually grabbed —
+    // knows to recompute group membership for every dragged node, not just that one. Cleared the moment
+    // onNodeMoved consumes it.
+    let pendingMultiDragNodes = null;
+
+    // Set the moment a REWIRE gesture begins — either our own edge-body grab (beginRewireFromEdgeGrab)
+    // or LiteGraph's native "grab an input dot that already has a link" gesture (stock processMouseDown,
+    // gated on allow_reconnect_links) — and consumed once at drop time by showConnectionMenu. Distinguishes
+    // "this connecting_node drag is moving an EXISTING line" from "this is a brand-new line being pulled
+    // off a port" (which sets up the identical connecting_node/connecting_input/connecting_output state,
+    // but should always show the add-node menu on an empty-space drop). Ported from the WinForms tool's
+    // own DragStartThreshold/IsNearNode grace (ProcessGraphCanvas.OnMouseMove/OnMouseUp), which this port's
+    // first pass explicitly skipped (see the comment above EDGE_CLICK_THRESHOLD_PX).
+    let pendingRewireInfo = null;
+    const REWIRE_DRAG_THRESHOLD_PX = 4;   // world units = this / ds.scale — WinForms' own DragStartThreshold
+    const REWIRE_SNAPBACK_BUFFER_PX = 24; // world units = this / ds.scale — WinForms' own IsNearNode buffer
 
     // Shift's role here (held when a node drag ends = detach from its current group instead of the
     // default "stays a member, group just grows to follow" — see updateNodeGroupMembership) needs the
@@ -37,8 +69,183 @@ window.storyForgeGraph = (function () {
         const originalProcessMouseUp = LGraphCanvas.prototype.processMouseUp;
         LGraphCanvas.prototype.processMouseUp = function (e) {
             lastMouseUpShiftKey = !!e.shiftKey;
-            return originalProcessMouseUp.call(this, e);
+
+            // A plain click (no real drag) on empty canvas should clear the current selection — matching
+            // every other "click empty space deselects everything" gesture in this app (and the original
+            // WinForms tool's own OnMouseUp: "_pendingBoxSelectStartScreen != null && !_isBoxSelecting ->
+            // clear selection"). Our own forced-ctrlKey box-select (see patchEdgeBodyRewiring) means EVERY
+            // such click now goes through LiteGraph's native dragging_rectangle release code instead of its
+            // separate plain-click branch — and that code only ever calls selectNodes when the rectangle
+            // actually overlaps a node, silently leaving a prior selection untouched otherwise. Needs
+            // adjustMouseEvent first since nothing has computed e.canvasX/canvasY for this event yet.
+            if (this.dragging_rectangle && !e.shiftKey && Object.keys(this.selected_nodes).length > 0) {
+                this.adjustMouseEvent(e);
+                const width = Math.abs(this.dragging_rectangle[2]);
+                const height = Math.abs(this.dragging_rectangle[3]);
+                const nodeAtPoint = this.graph.getNodeOnPos(e.canvasX, e.canvasY, this.visible_nodes);
+                if (!nodeAtPoint && !(width > 10 && height > 10))
+                    this.deselectAllNodes();
+            }
+
+            const result = originalProcessMouseUp.call(this, e);
+            commitUndoableChange();
+            saveViewport();
+            return result;
         };
+    }
+
+    // Mouse-wheel zoom changes ds.scale directly inside LiteGraph's own processMouseWheel, with no
+    // mouseup/mousedown pair around it for patchCaptureShiftOnMouseUp's own saveViewport() call to piggyback
+    // on — needs its own wrapper so a wheel-only zoom (no click/drag) still gets remembered across a reload.
+    function patchPersistViewportOnWheel() {
+        const originalProcessMouseWheel = LGraphCanvas.prototype.processMouseWheel;
+        LGraphCanvas.prototype.processMouseWheel = function (e) {
+            const result = originalProcessMouseWheel.call(this, e);
+            saveViewport();
+            return result;
+        };
+    }
+
+    // Snapshot-based undo/redo — mirrors the old WinForms tool's own approach (ProcessGraphCanvas's
+    // BeginUndoableChange/Undo snapshot the whole GraphDocumentModel) rather than recording individual
+    // commands, since a full-state snapshot is far simpler to get right than diffing/inverting every
+    // possible mutation (drag, rewire, delete, group resize, ...) by hand. Scoped to what the canvas itself
+    // owns — node positions, connections, node/group existence and group membership — NOT the inspector
+    // sidebar's text fields (playscriptId/memo/衝突/變化), which write straight into the server-side model
+    // (see GraphEditorState.UpdateNodeField) with no client-side record to snapshot; a known v1 gap, not an
+    // oversight, matching the same "server sync is explicit, not automatic" boundary the rest of this file
+    // already draws around 存檔.
+    let undoStack = [];
+    let redoStack = [];
+    let pendingUndoSnapshot = null; // "before" state for whichever gesture is currently in flight
+    const MAX_UNDO_DEPTH = 50;
+
+    // Idempotent within one gesture — a drag/rewire/etc. spans a mousedown..mouseup pair, sometimes with
+    // several internal steps (e.g. our own edge-rewire detaches at mousedown, reconnects at mouseup); only
+    // the FIRST call in that span should capture "before", matching the original tool's own
+    // BeginUndoGroupIfNeeded/_undoSnapshotPending guard.
+    function beginUndoableChange() {
+        if (pendingUndoSnapshot === null)
+            pendingUndoSnapshot = captureSnapshot();
+    }
+
+    // Only actually pushes an undo entry if the gesture turned out to change something — a plain click,
+    // click-to-deselect, or box-select-that-selected-nothing all call beginUndoableChange() (blanket
+    // coverage is simpler than trying to enumerate every mutating code path) but must not each burn an
+    // undo slot for a no-op.
+    function commitUndoableChange() {
+        if (pendingUndoSnapshot === null)
+            return;
+        const before = pendingUndoSnapshot;
+        pendingUndoSnapshot = null;
+        const after = captureSnapshot();
+        if (JSON.stringify(before) === JSON.stringify(after))
+            return;
+        undoStack.push(before);
+        if (undoStack.length > MAX_UNDO_DEPTH)
+            undoStack.shift();
+        redoStack = [];
+    }
+
+    function performUndo() {
+        if (undoStack.length === 0)
+            return;
+        const current = captureSnapshot();
+        const previous = undoStack.pop();
+        redoStack.push(current);
+        restoreSnapshot(current, previous);
+    }
+
+    function performRedo() {
+        if (redoStack.length === 0)
+            return;
+        const current = captureSnapshot();
+        const next = redoStack.pop();
+        undoStack.push(current);
+        restoreSnapshot(current, next);
+    }
+
+    // Full node/edge/group state, keyed by guid/port-name rather than LiteGraph's own internal numeric ids
+    // (which aren't stable across a rebuild) — the same shape init()'s payload uses, so buildGraphFromData
+    // (factored out of init() below) can rebuild from either one.
+    function captureSnapshot() {
+        const nodes = [];
+        for (const node of graph._nodes) {
+            const guid = guidByNode.get(node);
+            if (!guid) continue;
+            nodes.push({
+                guid: guid,
+                typeName: liteTypeToTypeName.get(node.type),
+                x: node.pos[0], y: node.pos[1],
+                width: node._baseWidth, height: node.size[1],
+                title: node._displayTitle,
+                hasIdentityTitle: !!node._hasIdentityTitle,
+            });
+        }
+
+        const edges = [];
+        for (const linkId in graph.links) {
+            const link = graph.links[linkId];
+            if (!link) continue;
+            const fromNode = graph.getNodeById(link.origin_id);
+            const toNode = graph.getNodeById(link.target_id);
+            const fromGuid = guidByNode.get(fromNode);
+            const toGuid = guidByNode.get(toNode);
+            if (!fromGuid || !toGuid) continue;
+            edges.push({
+                fromNodeGuid: fromGuid,
+                fromPort: findPortName(outputSlotsByType, liteTypeToTypeName.get(fromNode.type), link.origin_slot),
+                toNodeGuid: toGuid,
+                toPort: findPortName(inputSlotsByType, liteTypeToTypeName.get(toNode.type), link.target_slot),
+            });
+        }
+
+        const groups = (graph._groups || []).map(group => ({
+            clientId: group._clientId || null,
+            title: group._displayTitle || "",
+            x: group.pos[0], y: group.pos[1], width: group.size[0], height: group.size[1],
+            color: group.color,
+            memberNodeGuids: [...(group._memberGuids || [])],
+        }));
+
+        return { nodes: nodes, edges: edges, groups: groups, newNodeGuids: [...newNodeGuids] };
+    }
+
+    function findPortName(slotMap, typeName, slotIndex) {
+        const slots = slotMap.get(typeName) || {};
+        return Object.keys(slots).find(k => slots[k] === slotIndex);
+    }
+
+    // Tears down and fully rebuilds the graph from a snapshot — simpler and safer than trying to diff/patch
+    // the live LiteGraph objects back to an earlier state in place, at the cost of losing object identity
+    // across an undo/redo (harmless here: nothing outside this module holds onto a raw LGraphNode/LGraphGroup
+    // reference across a tick). fromState is the state being LEFT (before this restore) — needed only to
+    // tell which not-yet-saved nodes this step is adding vs removing, so the server-side model (which
+    // learns about a new node immediately, see instantiateNodeFromMenu's OnNodeCreated call) can be kept in
+    // sync the same way; every other field here is purely client-side until 存檔, so no other server call is
+    // needed.
+    function restoreSnapshot(fromState, toState) {
+        graph.clear();
+        nodesByGuid = new Map();
+        guidByNode = new Map();
+
+        buildGraphFromData(toState.nodes, toState.edges, toState.groups);
+        newNodeGuids = new Set(toState.newNodeGuids);
+
+        const previouslyNew = new Set(fromState.newNodeGuids);
+        const nowNew = new Set(toState.newNodeGuids);
+        for (const guid of previouslyNew)
+            if (!nowNew.has(guid))
+                selfRef?.invokeMethodAsync("OnNodeUndoRemoved", guid);
+        for (const guid of nowNew)
+            if (!previouslyNew.has(guid)) {
+                const nodeDto = toState.nodes.find(n => n.guid === guid);
+                if (nodeDto)
+                    selfRef?.invokeMethodAsync("OnNodeCreated", guid, nodeDto.typeName, nodeDto.x, nodeDto.y);
+            }
+
+        canvas.deselectAllNodes();
+        canvas.setDirty(true, true);
     }
 
     function registerNodeTypes(nodeTypes) {
@@ -60,7 +267,9 @@ window.storyForgeGraph = (function () {
             }
             StoryForgeNode.title = typeDto.displayName;
 
-            LiteGraph.registerNodeType("storyforge/" + sanitize(typeDto.typeName), StoryForgeNode);
+            const liteType = "storyforge/" + sanitize(typeDto.typeName);
+            LiteGraph.registerNodeType(liteType, StoryForgeNode);
+            liteTypeToTypeName.set(liteType, typeDto.typeName);
         }
     }
 
@@ -197,23 +406,69 @@ window.storyForgeGraph = (function () {
             if (!this.graph || this.connecting_node)
                 return originalProcessMouseDown.call(this, e);
 
+            pendingRewireInfo = null;
+
+            // Blanket "before" snapshot for every left-button-ish gesture that could turn into a mutation
+            // (node/group drag or resize, our edge-rewire grab, our multi-node drag, a native port-to-port
+            // wire connect) — far simpler than hooking each one individually, and commitUndoableChange()
+            // (called from processMouseUp) silently no-ops when nothing actually changed, so a plain click
+            // or a box-select doesn't burn an undo slot. Node/group creation via a context-menu click and
+            // Delete-key removal aren't mouse-gesture pairs at all, so those get their own begin/commit
+            // wrapping at their own call sites instead (see instantiateNodeFromMenu, patchDeleteWithUndo,
+            // and the 新增群組 callback below).
+            beginUndoableChange();
+
             this.adjustMouseEvent(e);
             const point = [e.canvasX, e.canvasY];
             const isLeftButton = e.button === 0;
 
             // A click landing inside any node's box always belongs to that node (selecting/dragging it, or
             // one of its own port dots, which the original processMouseDown already handles) — only open
-            // canvas space between nodes is fair game for grabbing a wire by its curve.
-            if (this.graph.getNodeOnPos(point[0], point[1], this.visible_nodes)) {
-                // Node interaction (select/drag/port-wire-drag) is a left-button-only gesture — stock
-                // LiteGraph's own button branching doesn't actually exclude other buttons from reaching
-                // that same node hit-test code path, so a middle-click landing on a node was starting the
-                // exact same port/wire-drag interaction a left-click would.
-                if (!isLeftButton) {
-                    e.stopPropagation();
-                    e.preventDefault();
-                    return false;
+            // canvas space between nodes is fair game for grabbing a wire by its curve. Non-left buttons are
+            // left to native handling here too: stock LiteGraph already gates node select/drag/port-drag
+            // behind a left-button check internally, so a middle-click over a node falls through to its own
+            // dragging_canvas branch same as empty canvas — this must not be short-circuited, or middle-click
+            // panning breaks the moment the cursor is over a node.
+            //
+            // The trailing 5 is a hit-test margin in world units, matching LiteGraph's own native
+            // processMouseDown (it calls getNodeOnPos with the same margin internally). Without it here,
+            // this routing check was stricter than native's own, so a click within that margin — a near-miss
+            // any real mouse produces constantly, especially on small nodes at typical zoom — fell through
+            // to the empty-canvas branch below (forced into a ctrlKey box-select) instead of being treated as
+            // a node click. A plain click there (no real drag) finds nothing to select AND clears whatever
+            // was already selected via patchCaptureShiftOnMouseUp's own deselect-on-miss, i.e. exactly the
+            // "click a node, the inspector flashes and disappears" bug — masked by dragging because a real
+            // drag's larger rectangle is resolved via getBounding() overlap instead of this single point.
+            const nodeHit = this.graph.getNodeOnPos(point[0], point[1], this.visible_nodes, 5);
+            if (nodeHit) {
+                // LiteGraph's OWN native rewire gesture: clicking directly on an input dot that already
+                // has a link picks that link up and starts dragging its input end — same condition stock
+                // processMouseDown itself uses (allow_reconnect_links defaults true here) — falls straight
+                // through to originalProcessMouseDown below to actually do it; this only records which
+                // link is about to go loose so showConnectionMenu can tell "moving an old line" apart from
+                // "pulling a new one" at drop time.
+                if (isLeftButton && (this.allow_reconnect_links || e.shiftKey)) {
+                    const inputSlotIndex = this.isOverNodeInput(nodeHit, point[0], point[1]);
+                    const input = inputSlotIndex !== -1 ? nodeHit.inputs[inputSlotIndex] : null;
+                    const existingLink = input && input.link != null ? this.graph.links[input.link] : null;
+                    if (existingLink)
+                        pendingRewireInfo = { link: existingLink, looseNode: nodeHit, mouseDownPoint: point.slice() };
                 }
+
+                // Plain left-click on a node that's already part of a multi-selection: the original
+                // WinForms tool's own special case (ProcessGraphCanvas.OnMouseDown's
+                // _multiSelectedNodeGuids.Contains(node.Guid) -> StartMultiDrag) — drag the WHOLE
+                // selection together instead of stock LiteGraph's default (selectNode with no modifier
+                // always deselects everything else first, so only the clicked node would move). Ports and
+                // the resize handle keep their normal single-node meaning even on a multi-selected node —
+                // a shift/ctrl click keeps native's own add/remove-from-selection toggle behavior.
+                if (isLeftButton && !e.shiftKey && !e.ctrlKey && !e.metaKey &&
+                    this.selected_nodes[nodeHit.id] && Object.keys(this.selected_nodes).length > 1 &&
+                    !isOverResizeCorner(nodeHit, point[0], point[1]) &&
+                    this.isOverNodeInput(nodeHit, point[0], point[1]) === -1 &&
+                    this.isOverNodeOutput(nodeHit, point[0], point[1]) === -1)
+                    return beginMultiNodeDrag(this, e, nodeHit);
+
                 return originalProcessMouseDown.call(this, e);
             }
 
@@ -223,22 +478,106 @@ window.storyForgeGraph = (function () {
                 return originalProcessMouseDown.call(this, e);
 
             const hit = findNearestEdgeAtPoint(this, point, EDGE_CLICK_THRESHOLD_PX / this.ds.scale);
-            if (!hit)
+            if (hit) {
+                // The original processMouseDown's very first job (before any hit-testing) is re-pointing
+                // the move/up listeners from the canvas to the document — since a drag can legitimately
+                // leave the canvas element while still being tracked. Returning early without this meant
+                // our custom-started drag never received another mousemove/mouseup once bypassed here.
+                LiteGraph.pointerListenerRemove(this.canvas, "move", this._mousemove_callback);
+                LiteGraph.pointerListenerAdd(this.getCanvasWindow().document, "move", this._mousemove_callback, true);
+                LiteGraph.pointerListenerAdd(this.getCanvasWindow().document, "up", this._mouseup_callback, true);
+
+                beginRewireFromEdgeGrab(this, hit.link, hit.nearerToOrigin, point);
+                e.stopPropagation();
+                e.preventDefault();
+                return false;
+            }
+
+            // Plain empty-canvas left-drag: the original WinForms tool's box-select gesture
+            // (ProcessGraphCanvas's _pendingBoxSelectStartScreen) needs no modifier at all — Shift only
+            // makes it additive — and the tool only ever pans via middle-click drag, never a plain
+            // left-drag. Stock LiteGraph instead reserves box-select for ctrl+drag and treats a plain
+            // left-drag on empty space as canvas panning (allow_dragcanvas), which is what made this
+            // feature look entirely missing here. Forcing ctrlKey true reuses LiteGraph's own native
+            // box-select bookkeeping (dragging_rectangle, drawn in draw(), resolved in processMouseUp)
+            // instead of reimplementing it.
+            //
+            // A group only counts as "the user wants to drag it" when the point is over its title bar
+            // (groupTitleBarHeight-tall strip reserved along its top edge — see recomputeGroupBounds and
+            // drawFrozenLabels, which draw/measure the title in that same strip) — per explicit user
+            // feedback that grabbing anywhere in a group's body made it impossible to box-select nodes
+            // inside a group. Everywhere else in a group's box is treated as empty canvas. Native's own
+            // getGroupOnPos (called unconditionally inside originalProcessMouseDown, regardless of
+            // ctrlKey) is stubbed out for just that one nested call so it can't re-discover the group and
+            // start a drag/resize anyway — restored immediately after, since other call sites (e.g. the
+            // right-click "Edit Group" menu) still need the real one. This also fully removes group
+            // resizing as a side effect: the resize-corner hit test only ever runs when a group was
+            // grabbed in the first place, so a click on the corner (outside the title strip) now falls
+            // through to box-select same as any other non-title point — see patchGroupRendering for the
+            // matching removal of the drawn resize-handle triangle.
+            const groupHit = this.graph.getGroupOnPos(point[0], point[1]);
+            if (!groupHit)
+                return originalProcessMouseDown.call(this, forceCtrlKey(e));
+
+            if (isOverGroupTitleBar(groupHit, point[0], point[1]))
                 return originalProcessMouseDown.call(this, e);
 
-            // The original processMouseDown's very first job (before any hit-testing) is re-pointing the
-            // move/up listeners from the canvas to the document — since a drag can legitimately leave the
-            // canvas element while still being tracked. Returning early without this meant our custom-
-            // started drag never received another mousemove/mouseup at all once bypassed here.
-            LiteGraph.pointerListenerRemove(this.canvas, "move", this._mousemove_callback);
-            LiteGraph.pointerListenerAdd(this.getCanvasWindow().document, "move", this._mousemove_callback, true);
-            LiteGraph.pointerListenerAdd(this.getCanvasWindow().document, "up", this._mouseup_callback, true);
-
-            beginRewireFromEdgeGrab(this, hit.link, hit.nearerToOrigin);
-            e.stopPropagation();
-            e.preventDefault();
-            return false;
+            this.graph.getGroupOnPos = () => null;
+            try {
+                return originalProcessMouseDown.call(this, forceCtrlKey(e));
+            } finally {
+                delete this.graph.getGroupOnPos; // falls back to LGraph.prototype.getGroupOnPos
+            }
         };
+    }
+
+    function isOverGroupTitleBar(group, x, y) {
+        return x >= group.pos[0] && x <= group.pos[0] + group.size[0] &&
+            y >= group.pos[1] && y <= group.pos[1] + groupTitleBarHeight;
+    }
+
+    function forceCtrlKey(e) {
+        return new Proxy(e, {
+            get(target, prop) {
+                if (prop === "ctrlKey") return true;
+                const value = target[prop];
+                return typeof value === "function" ? value.bind(target) : value;
+            },
+        });
+    }
+
+    // Same rect test LiteGraph's own native resize-corner hit test uses (a 10x10 world-space box at the
+    // node's bottom-right corner) — kept in sync with it by inspection of the vendored source rather than
+    // calling into it directly, since it isn't exposed as its own method.
+    function isOverResizeCorner(node, x, y) {
+        if ((node.flags && node.flags.collapsed) || node.resizable === false) return false;
+        const rx = node.pos[0] + node.size[0] - 5;
+        const ry = node.pos[1] + node.size[1] - 5;
+        return rx < x && rx + 10 > x && ry < y && ry + 10 > y;
+    }
+
+    // Starts dragging the anchor node exactly the way LiteGraph's own native node-drag does (same document-
+    // level move/up listener re-pointing as beginRewireFromEdgeGrab, same node_dragged field) — the rest of
+    // the gesture (every selected node following node_dragged's delta each frame, position rounding and
+    // onNodeMoved at drop) is entirely LiteGraph's own already-working processMouseMove/processMouseUp
+    // machinery, since it drives itself off this.selected_nodes rather than node_dragged alone. Only
+    // group-membership bookkeeping (updateNodeGroupMembership, which onNodeMoved only ever runs for the one
+    // node LiteGraph calls it with) needs its own multi-node fan-out — see pendingMultiDragNodes.
+    function beginMultiNodeDrag(canvasInstance, e, anchorNode) {
+        LiteGraph.pointerListenerRemove(canvasInstance.canvas, "move", canvasInstance._mousemove_callback);
+        LiteGraph.pointerListenerAdd(canvasInstance.getCanvasWindow().document, "move", canvasInstance._mousemove_callback, true);
+        LiteGraph.pointerListenerAdd(canvasInstance.getCanvasWindow().document, "up", canvasInstance._mouseup_callback, true);
+
+        pendingMultiDragNodes = Object.values(canvasInstance.selected_nodes);
+        canvasInstance.graph.beforeChange();
+        canvasInstance.node_dragged = anchorNode;
+        canvasInstance.last_mouse[0] = e.clientX;
+        canvasInstance.last_mouse[1] = e.clientY;
+        canvasInstance.dirty_canvas = true;
+
+        e.stopPropagation();
+        e.preventDefault();
+        return false;
     }
 
     function findNearestEdgeAtPoint(canvasInstance, point, worldThreshold) {
@@ -299,11 +638,17 @@ window.storyForgeGraph = (function () {
     // state its native "grab an input's existing link" gesture sets up, so the rest of the gesture (drag
     // preview, drop-on-a-compatible-port reconnects, drop-elsewhere leaves it deleted) is LiteGraph's own
     // already-working machinery, not anything reimplemented here.
-    function beginRewireFromEdgeGrab(canvasInstance, link, nearerToOrigin) {
+    function beginRewireFromEdgeGrab(canvasInstance, link, nearerToOrigin, mouseDownPoint) {
         const graphRef = canvasInstance.graph;
         const originNode = graphRef.getNodeById(link.origin_id);
         const targetNode = graphRef.getNodeById(link.target_id);
         if (!originNode || !targetNode) return;
+
+        pendingRewireInfo = {
+            link: link,
+            looseNode: nearerToOrigin ? originNode : targetNode,
+            mouseDownPoint: mouseDownPoint.slice(),
+        };
 
         targetNode.disconnectInput(link.target_slot, link.id);
 
@@ -350,12 +695,14 @@ window.storyForgeGraph = (function () {
                 {
                     content: "新增群組",
                     callback: () => {
+                        beginUndoableChange();
                         const group = new LiteGraph.LGraphGroup(" ");
                         group._displayTitle = "新群組";
                         group.pos = [worldPos[0], worldPos[1]];
                         group.size = [200, 100];
                         this.graph.add(group);
                         this.setDirty(true, true);
+                        commitUndoableChange();
                     },
                 },
                 null,
@@ -369,6 +716,16 @@ window.storyForgeGraph = (function () {
         // the flat per-compatible-port list, exactly like the original's ShowWiringCreateNodeMenu.
         LGraphCanvas.prototype.showConnectionMenu = function (options) {
             const opts = options || {};
+
+            // Consumed once per gesture regardless of outcome — a stale flag must never leak into the
+            // NEXT unrelated wire drag.
+            const rewire = pendingRewireInfo;
+            pendingRewireInfo = null;
+            if (rewire && shouldSnapRewireBack(this, rewire, opts.e)) {
+                reconnectOriginalLink(this, rewire.link);
+                return false;
+            }
+
             const anchorIsOutput = !!(opts.nodeFrom && opts.slotFrom);
             if (!anchorIsOutput && !(opts.nodeTo && opts.slotTo)) {
                 console.warn("storyForgeGraph: showConnectionMenu called with no anchor");
@@ -388,6 +745,36 @@ window.storyForgeGraph = (function () {
             new LiteGraph.ContextMenu(items, { event: opts.e }, this.getCanvasWindow());
             return false;
         };
+    }
+
+    // Ported from the WinForms tool's own grace for a rewire drop (ProcessGraphCanvas.OnMouseUp's
+    // DragStartThreshold/IsNearNode checks): a rewire that barely moved from its mousedown point, or that
+    // ended back near the node the loose end came from, reads as "didn't really mean to move this" rather
+    // than "drop it here" — only a rewire dragged genuinely far from both should ever reach the add-node
+    // menu, same as a brand-new wire always does.
+    function shouldSnapRewireBack(canvasInstance, rewire, dropEvent) {
+        if (!dropEvent) return true;
+        const dropPoint = [dropEvent.canvasX, dropEvent.canvasY];
+        const scale = canvasInstance.ds.scale;
+        if (distanceBetween(rewire.mouseDownPoint, dropPoint) < REWIRE_DRAG_THRESHOLD_PX / scale)
+            return true;
+        return isNearNodeBox(rewire.looseNode, dropPoint, REWIRE_SNAPBACK_BUFFER_PX / scale);
+    }
+
+    function isNearNodeBox(node, point, buffer) {
+        return point[0] >= node.pos[0] - buffer && point[0] <= node.pos[0] + node.size[0] + buffer &&
+            point[1] >= node.pos[1] - buffer && point[1] <= node.pos[1] + node.size[1] + buffer;
+    }
+
+    // Recreates the exact same two endpoints the rewire detached — a fresh LLink object with a new id
+    // (LiteGraph has no "undo the detach" primitive), but edges round-trip through 存檔 purely by
+    // (fromNodeGuid, fromPort, toNodeGuid, toPort) — see exportGraph/captureSnapshot — so nothing is lost.
+    function reconnectOriginalLink(canvasInstance, link) {
+        const originNode = canvasInstance.graph.getNodeById(link.origin_id);
+        const targetNode = canvasInstance.graph.getNodeById(link.target_id);
+        if (originNode && targetNode)
+            originNode.connect(link.origin_slot, targetNode, link.target_slot);
+        canvasInstance.dirty_bgcanvas = canvasInstance.dirty_canvas = true;
     }
 
     // wireContext is null for a plain canvas right-click (one item per node type); non-null for a
@@ -435,6 +822,8 @@ window.storyForgeGraph = (function () {
             return null;
         }
 
+        beginUndoableChange();
+
         const typeDto = currentPayload.nodeTypes.find(t => t.typeName === typeName);
         node.pos = canvasInstance.convertEventToCanvasOffset(originEvent);
         const naturalSize = node.computeSize();
@@ -475,6 +864,7 @@ window.storyForgeGraph = (function () {
         if (!node) return;
         canvasInstance.selectNode(node);
         canvasInstance.setDirty(true, true);
+        commitUndoableChange();
     }
 
     // Connects the new node to the wire's anchor at exactly the port the user picked — precise port-index
@@ -498,6 +888,7 @@ window.storyForgeGraph = (function () {
 
         canvasInstance.selectNode(node);
         canvasInstance.setDirty(true, true);
+        commitUndoableChange();
     }
 
     // Stock LiteGraph opens its own "Properties" panel (title/mode/color widgets + a Delete button) on
@@ -510,14 +901,232 @@ window.storyForgeGraph = (function () {
     }
 
     // Stock LiteGraph's right-click-on-a-node menu (Inputs/Outputs/Properties/Title/Mode/Resize/Collapse/
-    // Pin/Colors/Shapes/Clone/Remove, all in English) is pure clutter here — none of it is relevant to this
-    // app, per explicit user feedback to just remove it outright rather than translate/curate it. Returning
-    // null (not an empty array — an empty array is still truthy, so `g&&new ContextMenu(g,...)` would still
-    // pop up a blank floating box) is what stock LiteGraph itself checks for to skip building the menu at
-    // all — confirmed by reading the vendored source's own `g&&new e.ContextMenu(g,c,f)` call site.
-    function patchDisableNodeContextMenu() {
-        LGraphCanvas.prototype.getNodeMenuOptions = function () {
-            return null;
+    // Pin/Colors/Shapes/Clone/Remove, all in English) was pure clutter here per earlier explicit user
+    // feedback, and got removed outright (getNodeMenuOptions returning null). This replaces it with our own
+    // app-specific menu: 開啟劇本檔/複製劇本名稱 (劇本 nodes only) plus 刪除/複製 (every node).
+    //
+    // Overriding processContextMenu itself, not just getNodeMenuOptions, because two of those four items
+    // need a live server read (whether the .md 劇本檔 actually exists on disk yet, the current playscriptId)
+    // that getNodeMenuOptions can't provide — LiteGraph calls it synchronously and paints the menu from
+    // whatever it returns immediately, with no way to await anything. processContextMenu is the entry point
+    // one level up (called directly from processMouseDown on a right-click), so overriding it gives an
+    // async foothold before the menu ever appears. A right-click on empty canvas or a slot (node is
+    // null/undefined) still falls through to the original — the empty-canvas case is already handled by the
+    // getCanvasMenuOptions patch above.
+    function patchNodeContextMenu() {
+        const originalProcessContextMenu = LGraphCanvas.prototype.processContextMenu;
+        LGraphCanvas.prototype.processContextMenu = function (node, event) {
+            if (!node)
+                return originalProcessContextMenu.call(this, node, event);
+
+            showNodeContextMenu(this, node, event);
+            return false;
+        };
+    }
+
+    // this.selected_nodes is already exactly right by the time this runs: LiteGraph's own (unpatched)
+    // right-click mousedown handling replaces the selection with just the clicked node unless it's already
+    // part of a multi-selection (or Shift/Ctrl/Cmd is held) — the same selected_nodes-driven scoping native
+    // LiteGraph's own onMenuNodeClone/onMenuNodeRemove use. 刪除/複製 act on that whole selection; 開啟劇本檔
+    // /複製劇本名稱 always act on the single right-clicked node specifically — "open/copy the name of THIS
+    // script" has no sensible multi-node meaning.
+    async function showNodeContextMenu(canvasInstance, node, event) {
+        const guid = guidByNode.get(node);
+        const typeName = liteTypeToTypeName.get(node.type);
+        const typeDto = currentPayload.nodeTypes.find(t => t.typeName === typeName);
+        const isPlayscriptNode = !!(typeDto && typeDto.identityFields.includes("playscriptId"));
+
+        let playscriptName = "";
+        let hasScriptFile = false;
+        if (isPlayscriptNode && guid) {
+            const info = await selfRef.invokeMethodAsync("GetNodeContextMenuInfo", guid);
+            playscriptName = (info && info.playscriptName) || "";
+            hasScriptFile = !!(info && info.hasScriptFile);
+        }
+
+        const items = [];
+        if (isPlayscriptNode) {
+            items.push({
+                content: "開啟劇本檔",
+                disabled: !hasScriptFile,
+                callback: () => selfRef.invokeMethodAsync("OpenScriptTableForGuid", guid),
+            });
+            items.push({
+                content: "複製劇本名稱",
+                disabled: !playscriptName,
+                callback: () => copyTextToClipboard(playscriptName),
+            });
+            items.push(null);
+        }
+        items.push({ content: "刪除", callback: () => canvasInstance.deleteSelectedNodes() });
+        items.push({ content: "複製", callback: () => duplicateSelectedNodes(canvasInstance) });
+
+        new LiteGraph.ContextMenu(items, { event: event }, canvasInstance.getCanvasWindow());
+    }
+
+    function copyTextToClipboard(text) {
+        if (!text || !navigator.clipboard || !navigator.clipboard.writeText)
+            return;
+        navigator.clipboard.writeText(text).catch(() => {});
+    }
+
+    // 複製 — clones every currently-selected node (see showNodeContextMenu's own comment on why that's
+    // already the right set to act on). Every field — including playscriptId itself, deliberately not
+    // cleared: a duplicate is allowed to temporarily share its source's script name, the user renames it
+    // afterward — and, for a 劇本 node, its memo/衝突/變化 content round-trip through
+    // GraphEditorState.DuplicateNode, since none of that lives in JS at all (fields/content are
+    // server-side-only state — see the module-level comment on server sync being explicit, not automatic).
+    // Connections to/from every duplicated node are recreated too: both links within the duplicated set and
+    // links out to untouched neighbors, EXCEPT into an external neighbor's single-link (non allowMultiple)
+    // input that's already occupied — recreating that one too would silently evict the original node's
+    // existing wire (see patchLiteGraphForMultiInputLinks's own note on exactly that failure mode), which
+    // would make 複製 a destructive action on an unrelated node. Skipping just that one connection is a far
+    // smaller surprise than quietly breaking someone else's link.
+    async function duplicateSelectedNodes(canvasInstance) {
+        const sourceNodes = Object.values(canvasInstance.selected_nodes || {});
+        if (sourceNodes.length === 0)
+            return;
+
+        beginUndoableChange();
+
+        // Snapshotted before any connect() calls below start mutating graph.links mid-iteration.
+        const originalLinks = Object.values(canvasInstance.graph.links).filter(Boolean);
+
+        const guidMap = new Map(); // source guid -> new duplicate guid
+        const createdNodes = [];
+        for (const sourceNode of sourceNodes) {
+            const sourceGuid = guidByNode.get(sourceNode);
+            const typeName = liteTypeToTypeName.get(sourceNode.type);
+            if (!sourceGuid || !typeName)
+                continue;
+
+            const liteType = "storyforge/" + sanitize(typeName);
+            const newNode = LiteGraph.createNode(liteType);
+            if (!newNode)
+                continue;
+
+            const newGuid = crypto.randomUUID();
+            newNode.pos = [sourceNode.pos[0] + 30, sourceNode.pos[1] + 30];
+            const naturalSize = newNode.computeSize();
+            newNode.size = [Math.max(sourceNode._baseWidth || 0, naturalSize[0]), naturalSize[1]];
+            newNode.title = " "; // see init()'s node loop for why not ""
+            newNode.onDrawTitleBox = function () {};
+            canvasInstance.graph.add(newNode);
+            nodesByGuid.set(newGuid, newNode);
+            guidByNode.set(newNode, newGuid);
+            newNodeGuids.add(newGuid);
+            guidMap.set(sourceGuid, newGuid);
+
+            const result = await selfRef.invokeMethodAsync(
+                "DuplicateNode", sourceGuid, newGuid, newNode.pos[0], newNode.pos[1]);
+            if (!result) continue;
+
+            newNode._displayTitle = result.title;
+            newNode._hasIdentityTitle = result.hasIdentityTitle;
+            newNode._baseWidth = newNode.size[0];
+
+            currentPayload.nodes.push({
+                guid: newGuid, typeName: typeName, title: result.title,
+                x: newNode.pos[0], y: newNode.pos[1], width: newNode.size[0], height: newNode.size[1],
+                fields: result.fields,
+            });
+
+            createdNodes.push(newNode);
+        }
+
+        for (const link of originalLinks) {
+            const fromNode = canvasInstance.graph.getNodeById(link.origin_id);
+            const toNode = canvasInstance.graph.getNodeById(link.target_id);
+            const fromDupGuid = guidMap.get(guidByNode.get(fromNode));
+            const toDupGuid = guidMap.get(guidByNode.get(toNode));
+            if (!fromDupGuid && !toDupGuid)
+                continue;
+
+            const newFromNode = fromDupGuid ? nodesByGuid.get(fromDupGuid) : fromNode;
+            const newToNode = toDupGuid ? nodesByGuid.get(toDupGuid) : toNode;
+            if (!newFromNode || !newToNode)
+                continue;
+
+            const targetInput = newToNode.inputs && newToNode.inputs[link.target_slot];
+            if (!toDupGuid && targetInput && !targetInput.allowMultiple && targetInput.link != null)
+                continue; // would silently steal an untouched neighbor's existing single-link wire
+
+            newFromNode.connect(link.origin_slot, newToNode, link.target_slot);
+        }
+
+        if (createdNodes.length > 0)
+            canvasInstance.selectNodes(createdNodes);
+        canvasInstance.setDirty(true, true);
+        commitUndoableChange();
+    }
+
+    // Delete key (native processKey, gated on the canvas having focus and the event not targeting a text
+    // input — see this component's own tabindex="0" comment) isn't a mousedown/mouseup pair, so it needs
+    // its own begin/commit wrapping rather than relying on the blanket coverage in patchEdgeBodyRewiring.
+    function patchDeleteWithUndo() {
+        const originalDeleteSelectedNodes = LGraphCanvas.prototype.deleteSelectedNodes;
+        LGraphCanvas.prototype.deleteSelectedNodes = function () {
+            beginUndoableChange();
+            originalDeleteSelectedNodes.call(this);
+            commitUndoableChange();
+        };
+    }
+
+    // Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z as a Redo alias) — stock LiteGraph's own processKey has no undo/redo
+    // at all (only Ctrl+A select-all, Ctrl+C/V clipboard, Delete/Backspace), so "z"/"y" are free to claim.
+    // Guards against an editable target the same way native's own Delete-key handling does, so this doesn't
+    // fire while the user is typing in the inspector sidebar's text inputs.
+    function patchUndoRedoKeys() {
+        const originalProcessKey = LGraphCanvas.prototype.processKey;
+        LGraphCanvas.prototype.processKey = function (e) {
+            const targetName = e.target && e.target.localName;
+            const isEditableTarget = targetName === "input" || targetName === "textarea";
+            if (!isEditableTarget && e.type === "keydown" && (e.ctrlKey || e.metaKey)) {
+                const key = (e.key || "").toLowerCase();
+                if (key === "z" && !e.shiftKey) {
+                    performUndo();
+                    e.preventDefault();
+                    return false;
+                }
+                if (key === "y" || (key === "z" && e.shiftKey)) {
+                    performRedo();
+                    e.preventDefault();
+                    return false;
+                }
+            }
+            return originalProcessKey.call(this, e);
+        };
+    }
+
+    // Native drawGroups (LGraphCanvas.prototype) always draws a resize-handle triangle at each group's
+    // bottom-right corner, regardless of whether resizing is actually reachable — misleading now that
+    // dragging that corner no longer resizes anything (patchEdgeBodyRewiring restricts group-drag/resize
+    // to the title bar only, and the corner falls outside it), so it's dropped here. Mirrors native's own
+    // drawGroups exactly (same fill/stroke/title-text steps, from the vendored litegraph.min.js source)
+    // minus the triangle draw call — there's no per-group flag to suppress just that piece.
+    function patchGroupRendering() {
+        LGraphCanvas.prototype.drawGroups = function (_unused, ctx) {
+            if (!this.graph) return;
+            const groups = this.graph._groups;
+            ctx.save();
+            ctx.globalAlpha = 0.5 * this.editor_alpha;
+            for (const group of groups) {
+                if (!LiteGraph.overlapBounding(this.visible_area, group._bounding)) continue;
+                ctx.fillStyle = group.color || "#335";
+                ctx.strokeStyle = group.color || "#335";
+                const pos = group._pos, size = group._size;
+                ctx.globalAlpha = 0.25 * this.editor_alpha;
+                ctx.beginPath();
+                ctx.rect(pos[0] + 0.5, pos[1] + 0.5, size[0], size[1]);
+                ctx.fill();
+                ctx.globalAlpha = this.editor_alpha;
+                ctx.stroke();
+                const fontSize = group.font_size || LiteGraph.DEFAULT_GROUP_FONT_SIZE;
+                ctx.font = fontSize + "px Arial";
+                ctx.textAlign = "left";
+                ctx.fillText(group.title, pos[0] + 4, pos[1] + fontSize);
+            }
+            ctx.restore();
         };
     }
 
@@ -545,66 +1154,15 @@ window.storyForgeGraph = (function () {
         ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     }
 
-    function init(canvasElementId, payload, dotNetRef) {
-        currentPayload = payload;
-        selfRef = dotNetRef;
-        if (payload.settings) {
-            frozenNodeFontPx = payload.settings.nodeFrozenTextSize;
-            maxNodeFontPx = payload.settings.nodeMaxTextSize;
-            frozenGroupFontPx = payload.settings.groupFrozenTextSize;
-            maxGroupFontPx = payload.settings.groupMaxTextSize;
-            groupPadding = payload.settings.groupPadding;
-            groupTitleBarHeight = payload.settings.groupTitleBarHeight;
-        }
-        graph = new LGraph();
-        const canvasEl = document.getElementById(canvasElementId);
-        canvas = new LGraphCanvas("#" + canvasElementId, graph);
-        canvas.allow_searchbox = false;
-        canvas.render_canvas_border = false;
-        canvas.onDrawOverlay = drawFrozenLabels;
-
-        // Single-selection only for now (the inspector sidebar shows one node's fields at a time) — with
-        // more than one selected, or none, there's nothing for it to show.
-        canvas.onSelectionChange = function (selectedNodes) {
-            const ids = Object.keys(selectedNodes || {});
-            const guid = ids.length === 1 ? guidByNode.get(selectedNodes[ids[0]]) : null;
-            dotNetRef.invokeMethodAsync("OnNodeSelectionChanged", guid || null);
-        };
-
-        // Fires once when a node drag ends (not continuously during it — see updateNodeGroupMembership's
-        // own comment for why that's an acceptable simplification of the original WinForms tool's
-        // per-frame UpdateNodeDragLive). Ported from GraphDocumentModel's own group-membership rules
-        // (UpdateNodeDragLive/RemoveNodeFromCurrentGroup/FindJoinableGroup/RecomputeGroupBounds) since our
-        // canvas interaction is entirely client-side — those C# methods are otherwise never reached at all
-        // outside 存檔 time.
-        canvas.onNodeMoved = function (node) {
-            updateNodeGroupMembership(node, lastMouseUpShiftKey);
-            canvas.setDirty(true, true);
-        };
-
-        // Re-sync the backing-store resolution whenever the canvas element's own box size changes — not
-        // just on a browser window resize (which is what a plain "resize" listener would catch), but also
-        // when a sibling appearing/disappearing (the inspector sidebar) squeezes it via flex layout with no
-        // window resize involved at all. Without this, the CSS box shrinks immediately but the backing
-        // store doesn't, so the browser stretches the old raster into the new (narrower) box for one frame
-        // — the "canvas squishes" flash this fixes.
-        canvasResizeObserver?.disconnect();
-        canvasResizeObserver = new ResizeObserver(() => {
-            fixCanvasResolution(canvasEl);
-            canvas.draw(true, true);
-        });
-        canvasResizeObserver.observe(canvasEl);
-
-        nodesByGuid = new Map();
-        guidByNode = new Map();
-        outputSlotsByType = new Map();
-        inputSlotsByType = new Map();
-        newNodeGuids = new Set();
-        initialNodeGuids = new Set(payload.nodes.map(n => n.guid));
-
-        registerNodeTypes(payload.nodeTypes);
-
-        for (const groupDto of payload.groups) {
+    // Shared node/edge/group construction, factored out of init() so restoreSnapshot (undo/redo) can rebuild
+    // the graph from a snapshot exactly the same way init() builds it from the server payload — the two
+    // shapes line up field-for-field (guid/typeName/x/y/width/height/title/hasIdentityTitle for nodes,
+    // fromNodeGuid/fromPort/toNodeGuid/toPort for edges, clientId/title/x/y/width/height/color/
+    // memberNodeGuids for groups) by design. Assumes graph/nodesByGuid/guidByNode have already been reset by
+    // the caller and node TYPES are already registered (registerNodeTypes only ever needs to run once, at
+    // the real init() — a snapshot never contains a type the server payload didn't already register).
+    function buildGraphFromData(nodeDtos, edgeDtos, groupDtos) {
+        for (const groupDto of groupDtos) {
             // " " not "" — an empty title makes LiteGraph fall back to drawing a default/type label of
             // its own (that's what the ghostly second line of text behind our own title actually was, not
             // a background-canvas caching issue as first suspected). A space is falsy-safe but invisible.
@@ -617,13 +1175,13 @@ window.storyForgeGraph = (function () {
             // (GraphEditorState.ApplyAndSave looks groups up by this exact id). _memberGuids is this
             // group's own membership set — see updateNodeGroupMembership/recomputeGroupBounds below; a
             // plain Set of guid strings rather than direct node references so it stays valid across a node
-            // being recreated (e.g. by undo, once that exists client-side) without needing to be rebuilt.
+            // being recreated (e.g. by undo) without needing to be rebuilt.
             group._clientId = groupDto.clientId;
             group._memberGuids = new Set(groupDto.memberNodeGuids || []);
             graph.add(group);
         }
 
-        for (const nodeDto of payload.nodes) {
+        for (const nodeDto of nodeDtos) {
             const liteType = "storyforge/" + sanitize(nodeDto.typeName);
             const node = LiteGraph.createNode(liteType);
             if (!node) {
@@ -662,8 +1220,8 @@ window.storyForgeGraph = (function () {
             guidByNode.set(node, nodeDto.guid);
         }
 
-        const nodeTypeByGuid = new Map(payload.nodes.map(n => [n.guid, n.typeName]));
-        for (const edgeDto of payload.edges) {
+        const nodeTypeByGuid = new Map(nodeDtos.map(n => [n.guid, n.typeName]));
+        for (const edgeDto of edgeDtos) {
             const fromNode = nodesByGuid.get(edgeDto.fromNodeGuid);
             const toNode = nodesByGuid.get(edgeDto.toNodeGuid);
             if (!fromNode || !toNode) {
@@ -680,6 +1238,90 @@ window.storyForgeGraph = (function () {
 
             fromNode.connect(outputSlot, toNode, inputSlot);
         }
+    }
+
+    function init(canvasElementId, payload, dotNetRef) {
+        currentPayload = payload;
+        selfRef = dotNetRef;
+        if (payload.settings) {
+            frozenNodeFontPx = payload.settings.nodeFrozenTextSize;
+            maxNodeFontPx = payload.settings.nodeMaxTextSize;
+            frozenGroupFontPx = payload.settings.groupFrozenTextSize;
+            maxGroupFontPx = payload.settings.groupMaxTextSize;
+            groupPadding = payload.settings.groupPadding;
+            groupTitleBarHeight = payload.settings.groupTitleBarHeight;
+            searchMinZoom = payload.settings.searchMinZoom;
+        }
+        graph = new LGraph();
+        const canvasEl = document.getElementById(canvasElementId);
+        canvas = new LGraphCanvas("#" + canvasElementId, graph);
+        canvas.allow_searchbox = false;
+        canvas.render_canvas_border = false;
+        canvas.onDrawOverlay = drawFrozenLabels;
+
+        // Single-selection only for now (the inspector sidebar shows one node's fields at a time) — with
+        // more than one selected, or none, there's nothing for it to show.
+        //
+        // Debounced via setTimeout(0) rather than dispatched immediately: LiteGraph's own selectNodes()
+        // unconditionally calls deselectAllNodes() first — even for a plain click on a node with nothing
+        // previously selected — so a single click fires this callback twice synchronously (once with an
+        // empty selection, then again with the real one). Without the debounce each call was its own
+        // Blazor invokeMethodAsync round trip, so the sidebar visibly disappeared and reappeared (a flash
+        // on a plain click; a drag masked it because onNodeMoved's later setDirty repaint happened to land
+        // after both had already resolved). Collapsing same-tick calls to just the last one sends a single
+        // net update instead.
+        let pendingSelectionChange = null;
+        canvas.onSelectionChange = function (selectedNodes) {
+            clearTimeout(pendingSelectionChange);
+            pendingSelectionChange = setTimeout(() => {
+                const ids = Object.keys(selectedNodes || {});
+                const guid = ids.length === 1 ? guidByNode.get(selectedNodes[ids[0]]) : null;
+                dotNetRef.invokeMethodAsync("OnNodeSelectionChanged", guid || null);
+            }, 0);
+        };
+
+        // Fires once when a node drag ends (not continuously during it — see updateNodeGroupMembership's
+        // own comment for why that's an acceptable simplification of the original WinForms tool's
+        // per-frame UpdateNodeDragLive). Ported from GraphDocumentModel's own group-membership rules
+        // (UpdateNodeDragLive/RemoveNodeFromCurrentGroup/FindJoinableGroup/RecomputeGroupBounds) since our
+        // canvas interaction is entirely client-side — those C# methods are otherwise never reached at all
+        // outside 存檔 time.
+        canvas.onNodeMoved = function (node) {
+            if (pendingMultiDragNodes && pendingMultiDragNodes.length > 1) {
+                for (const draggedNode of pendingMultiDragNodes)
+                    updateNodeGroupMembership(draggedNode, lastMouseUpShiftKey);
+            } else {
+                updateNodeGroupMembership(node, lastMouseUpShiftKey);
+            }
+            pendingMultiDragNodes = null;
+            canvas.setDirty(true, true);
+        };
+
+        // Re-sync the backing-store resolution whenever the canvas element's own box size changes — not
+        // just on a browser window resize (which is what a plain "resize" listener would catch), but also
+        // when a sibling appearing/disappearing (the inspector sidebar) squeezes it via flex layout with no
+        // window resize involved at all. Without this, the CSS box shrinks immediately but the backing
+        // store doesn't, so the browser stretches the old raster into the new (narrower) box for one frame
+        // — the "canvas squishes" flash this fixes.
+        canvasResizeObserver?.disconnect();
+        canvasResizeObserver = new ResizeObserver(() => {
+            fixCanvasResolution(canvasEl);
+            canvas.draw(true, true);
+        });
+        canvasResizeObserver.observe(canvasEl);
+
+        nodesByGuid = new Map();
+        guidByNode = new Map();
+        outputSlotsByType = new Map();
+        inputSlotsByType = new Map();
+        newNodeGuids = new Set();
+        initialNodeGuids = new Set(payload.nodes.map(n => n.guid));
+        lastSearchQuery = null;
+        lastSearchMatchGuids = [];
+        lastSearchMatchIndex = -1;
+
+        registerNodeTypes(payload.nodeTypes);
+        buildGraphFromData(payload.nodes, payload.edges, payload.groups);
 
         // Right after Blazor inserts the <canvas> into the DOM, its flex-computed layout box isn't
         // necessarily settled yet — clientWidth/clientHeight (which fixCanvasResolution and fitView both
@@ -687,7 +1329,7 @@ window.storyForgeGraph = (function () {
         // number of frames is enough.
         waitForLayout(canvasEl, () => {
             fixCanvasResolution(canvasEl);
-            fitView();
+            restoreViewportOrFitView();
             canvas.draw(true, true);
         });
     }
@@ -788,9 +1430,54 @@ window.storyForgeGraph = (function () {
         requestAnimationFrame(() => waitForLayout(canvasEl, callback, attemptsLeft - 1));
     }
 
+    // Remembers the user's own pan/zoom across a reload (F5, 讀取, a Blazor circuit reconnect) — without
+    // this, every load fell through straight to fitView()'s "fit everything" framing, which for a graph
+    // this size (hundreds of nodes spread wide) computes a very small scale: indistinguishable from having
+    // zoomed all the way out, every single time, even mid-session. Client-side only (localStorage, keyed
+    // per browser) since the viewport is a pure UI concern with nothing to do with the saved graph itself.
+    const VIEWPORT_STORAGE_KEY = "storyforge-graph-viewport";
+
+    function saveViewport() {
+        if (!canvas) return;
+        try {
+            localStorage.setItem(VIEWPORT_STORAGE_KEY, JSON.stringify({
+                scale: canvas.ds.scale,
+                offsetX: canvas.ds.offset[0],
+                offsetY: canvas.ds.offset[1],
+            }));
+        } catch { /* localStorage unavailable (private mode, quota) — losing the remembered viewport is harmless */ }
+    }
+
+    function loadSavedViewport() {
+        try {
+            const raw = localStorage.getItem(VIEWPORT_STORAGE_KEY);
+            if (!raw) return null;
+            const v = JSON.parse(raw);
+            if (typeof v.scale !== "number" || !isFinite(v.scale) || v.scale <= 0) return null;
+            if (typeof v.offsetX !== "number" || typeof v.offsetY !== "number") return null;
+            return v;
+        } catch {
+            return null;
+        }
+    }
+
+    // fitView() still establishes the zoom-out floor (ds.min_scale) and a sane default from the graph's
+    // own bounds — only the resulting scale/offset are then overridden by whatever was last saved, so a
+    // saved viewport from before nodes moved/were added still gets a floor consistent with today's graph.
+    function restoreViewportOrFitView() {
+        fitView();
+        const saved = loadSavedViewport();
+        if (saved) {
+            canvas.ds.scale = Math.max(saved.scale, canvas.ds.min_scale);
+            canvas.ds.offset[0] = saved.offsetX;
+            canvas.ds.offset[1] = saved.offsetY;
+        }
+    }
+
     // The graph's saved node positions come from the old WinForms canvas's own coordinate space, so a
     // freshly-opened editor needs to frame them itself rather than starting at LiteGraph's default
-    // origin/zoom (which for a graph this size shows nothing but empty grid).
+    // origin/zoom (which for a graph this size shows nothing but empty grid). Also the explicit fallback/
+    // reset used by restoreViewportOrFitView (no saved viewport yet) and the 縮放至全部 button.
     function fitView() {
         if (graph._nodes.length === 0) return;
 
@@ -815,8 +1502,64 @@ window.storyForgeGraph = (function () {
         const scale = Math.min(cssWidth / boundsWidth, cssHeight / boundsHeight) * 0.9;
 
         canvas.ds.scale = Math.min(scale, 1);
+        // LiteGraph's own zoom-out floor (ds.min_scale, default 0.1) has no relation to this graph's
+        // "fit everything" scale — for a graph big enough that fitting it needs a smaller scale than
+        // that floor, the very next wheel tick doesn't nudge the scale, it clamps straight up to 0.1
+        // (changeScale snaps anything below min_scale to it), a jarring multi-x jump instead of the
+        // usual ~5% step. Let the floor track fit-all instead (with a little headroom to still zoom
+        // out slightly further than fit), so scrolling after 縮放至全部 always steps gradually.
+        canvas.ds.min_scale = Math.min(0.1, canvas.ds.scale * 0.5);
         canvas.ds.offset[0] = -minX + (cssWidth / canvas.ds.scale - boundsWidth) / 2;
         canvas.ds.offset[1] = -minY + (cssHeight / canvas.ds.scale - boundsHeight) / 2;
+    }
+
+    // query is a raw user string (may be empty/whitespace-only while they're still typing). Returns false
+    // when nothing matched (a bad query, or no nodes at all) so the caller can show a "not found" status.
+    function searchNode(query) {
+        if (!graph || typeof query !== "string" || !query.trim())
+            return false;
+
+        const trimmed = query.trim();
+        if (trimmed !== lastSearchQuery) {
+            lastSearchQuery = trimmed;
+            const lowerQuery = trimmed.toLowerCase();
+            lastSearchMatchGuids = (currentPayload?.nodes || [])
+                .filter(n => n.hasIdentityTitle && n.title && n.title.toLowerCase().includes(lowerQuery)
+                    && nodesByGuid.has(n.guid))
+                .map(n => n.guid);
+            lastSearchMatchIndex = -1;
+        }
+
+        if (lastSearchMatchGuids.length === 0)
+            return false;
+
+        lastSearchMatchIndex = (lastSearchMatchIndex + 1) % lastSearchMatchGuids.length;
+        const node = nodesByGuid.get(lastSearchMatchGuids[lastSearchMatchIndex]);
+        if (!node) return false;
+
+        focusOnNode(node);
+        return true;
+    }
+
+    // Pans so the node's center lands at the canvas center, and selects it (which drives the inspector
+    // sidebar open via the normal onSelectionChange path, same as any other click-to-select) — matching
+    // ProcessGraphCanvas.FocusOnNode, except zoom is only ever raised to searchMinZoom, never lowered: a
+    // match found while already zoomed in close enough stays at that zoom instead of snapping back out.
+    function focusOnNode(node) {
+        const canvasEl = canvas.canvas;
+        const cssWidth = canvasEl.clientWidth;
+        const cssHeight = canvasEl.clientHeight;
+
+        if (canvas.ds.scale < searchMinZoom)
+            canvas.ds.scale = searchMinZoom;
+
+        const centerX = node.pos[0] + node.size[0] / 2;
+        const centerY = node.pos[1] + node.size[1] / 2;
+        canvas.ds.offset[0] = cssWidth / (2 * canvas.ds.scale) - centerX;
+        canvas.ds.offset[1] = cssHeight / (2 * canvas.ds.scale) - centerY;
+
+        canvas.selectNode(node);
+        canvas.setDirty(true, true);
     }
 
     // The only title renderer for both nodes and groups (their native LiteGraph titles are blanked at
@@ -857,7 +1600,11 @@ window.storyForgeGraph = (function () {
         const titleHeight = LiteGraph.NODE_TITLE_HEIGHT || 30;
 
         ctx.save();
-        ctx.textBaseline = "middle";
+        // "top" (not "middle") so both titles pivot from their box's top-left corner as fontPx changes —
+        // the anchor point (screenX, screenY) below is then a pure affine transform of a fixed world point,
+        // never offset by fontPx itself, so a node's and a group's title always grow down-and-right from
+        // the same corner instead of drifting toward each other when their boxes sit close together.
+        ctx.textBaseline = "top";
 
         ctx.fillStyle = "#e0e0e0";
         for (const group of graph._groups || []) {
@@ -865,7 +1612,7 @@ window.storyForgeGraph = (function () {
             const fontPx = Math.min(maxGroupFontPx, Math.max(frozenGroupFontPx, NATURAL_GROUP_WORLD_SIZE * scale));
             if (group.size[0] * scale < MIN_BOX_SCREEN_PX) continue; // too small on screen to matter
             const screenX = (group.pos[0] + offset[0]) * scale + 6;
-            const screenY = (group.pos[1] + offset[1]) * scale + fontPx;
+            const screenY = (group.pos[1] + offset[1]) * scale + 4;
             drawText(ctx, group._displayTitle, screenX, screenY, fontPx);
         }
 
@@ -894,7 +1641,7 @@ window.storyForgeGraph = (function () {
             node.size[0] = Math.max(node._baseWidth, neededWorldWidth);
 
             const screenX = (node.pos[0] + offset[0]) * scale + 4;
-            const screenY = (node.pos[1] - titleHeight / 2 + offset[1]) * scale;
+            const screenY = (node.pos[1] - titleHeight + offset[1]) * scale + 4;
             drawText(ctx, node._displayTitle, screenX, screenY, fontPx);
         }
 
@@ -981,6 +1728,7 @@ window.storyForgeGraph = (function () {
 
     function fitViewAndRedraw() {
         fitView();
+        saveViewport();
         canvas.draw(true, true);
     }
 
@@ -996,11 +1744,45 @@ window.storyForgeGraph = (function () {
         if (canvas) canvas.draw(true, true);
     }
 
+    // Called from FlowGraphPanel's OnFieldChanged right after a sidebar identity-field edit
+    // (GraphEditorState.UpdateNodeField/GetNodeTitleInfo) — the counterpart to the "title only updates on
+    // next reload" gap the server-side model otherwise accepts for a plain field edit: this pushes the
+    // freshly recomputed title straight to the canvas node instead of leaving it stale until the next
+    // LoadGraph. _baseWidth is recomputed the same way buildGraphFromData/duplicateSelectedNodes do it for
+    // a node's initial size — drawFrozenLabels' own per-frame widening then takes over from here at
+    // whatever the current zoom needs.
+    function updateNodeTitle(guid, title, hasIdentityTitle) {
+        const node = nodesByGuid.get(guid);
+        if (!node) return;
+
+        node._displayTitle = title;
+        node._hasIdentityTitle = !!hasIdentityTitle;
+
+        const naturalSize = node.computeSize();
+        canvas.ctx.font = NATURAL_NODE_WORLD_SIZE + "px sans-serif";
+        const titleWidth = canvas.ctx.measureText(title).width + 8;
+        node.size[0] = Math.max(naturalSize[0], titleWidth);
+        node._baseWidth = node.size[0];
+
+        // Keeps currentPayload's own node list from going stale relative to the live model for this one
+        // field — read by exportGraph's newNodes lookup (a not-yet-saved node) and duplicateSelectedNodes'
+        // own title-width fallback, neither of which otherwise learns about this edit.
+        const nodeDto = currentPayload.nodes.find(n => n.guid === guid);
+        if (nodeDto) {
+            nodeDto.title = title;
+            nodeDto.hasIdentityTitle = !!hasIdentityTitle;
+        }
+
+        canvas.setDirty(true, true);
+    }
+
     return {
         init: init,
         exportGraph: exportGraph,
         fitView: fitViewAndRedraw,
         updateSettings: updateSettings,
+        updateNodeTitle: updateNodeTitle,
+        searchNode: searchNode,
         _debug: {
             getGraph: () => graph, getCanvas: () => canvas, guidByNode: () => guidByNode,
             lastMouseUpShiftKey: () => lastMouseUpShiftKey,

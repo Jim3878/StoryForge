@@ -46,15 +46,12 @@ public sealed class AppSettings
     // preview line to it as visual feedback that a connection would land there if released now.
     public float WireSnapDistance { get; set; } = 40f;
 
-    // "匯出指定章節AI參考資料" — where each chapter's exported JSON goes (one subfolder per chapter). The
-    // character roster itself is no longer here — it's the hand-curated 角色卡 list (CharacterCardSettings,
-    // tracked in the Unity project) since a portrait-folder scan can't reliably tell a real character apart
-    // from a non-character portrait (props/effects), and a real character doesn't always have portrait art.
-    public string AiReferenceExportFolder { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\劇本\AI流程\";
-
-    // Off during a test run so the AI can't peek at already-written content via the link and just parrot
-    // it back instead of genuinely generating an outline. Nodes without a link are unaffected either way.
-    public bool AiReferenceIncludeContentLinks { get; set; } = true;
+    // Root of the standalone external folder that IS the real save location for the flow graph
+    // (session.json/connections.json), CharacterCardSettings, and StoryOutlineSettings — not a copy or an
+    // export, the one place those are read from and written to. Independent of both the Unity project and
+    // %LocalAppData%, specifically so an external AI tool (a Codex/Claude project pointed at this path) can
+    // read and edit the same files directly, with nothing to import back afterward.
+    public string ExternalDataFolder { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\AI劇本\";
 
     // ProcessGraphPanel's inspector sidebar — remembered so a user-dragged size doesn't reset every time
     // the tool reopens or a different node is selected.

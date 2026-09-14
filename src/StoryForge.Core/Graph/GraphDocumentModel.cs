@@ -112,6 +112,7 @@ public sealed class GraphDocumentModel
     // Serialized fingerprint of the state as of the last load or local session save — HasUnsavedChanges
     // just compares the current state against this, rather than tracking dirtiness on every mutation.
     private string? _lastCleanSessionJson;
+    private string? _lastCleanConnectionsJson;
 
     private GraphDocumentModel(ProcessNodeSchemaDocument schema, AppSettings settings)
     {
@@ -197,7 +198,8 @@ public sealed class GraphDocumentModel
     // fields verbatim rather than re-deriving anything, since it's meant to reproduce exactly the state
     // that was saved.
     public static GraphDocumentModel LoadFromSession(
-        GraphSessionDocument session, ProcessNodeSchemaDocument schema, AppSettings settings)
+        GraphSessionDocument session, GraphConnectionsDocument connections, ProcessNodeSchemaDocument schema,
+        AppSettings settings)
     {
         var model = new GraphDocumentModel(schema, settings)
         {
@@ -231,7 +233,7 @@ public sealed class GraphDocumentModel
             });
         }
 
-        foreach (var edge in session.Edges)
+        foreach (var edge in connections.Edges)
         {
             model.Edges.Add(new GraphEdgeVm
             {
@@ -296,17 +298,6 @@ public sealed class GraphDocumentModel
                 BaselineX = n.BaselineX,
                 BaselineY = n.BaselineY,
             }).ToList(),
-            Edges = Edges.Select(e => new GraphSessionEdge
-            {
-                FromNodeGuid = e.FromNodeGuid,
-                FromPort = e.FromPort,
-                FromPortId = e.FromPortId,
-                ToNodeGuid = e.ToNodeGuid,
-                ToPort = e.ToPort,
-                ToPortId = e.ToPortId,
-                IsNew = e.IsNew,
-                IsMarkedForDeletion = e.IsMarkedForDeletion,
-            }).ToList(),
             Groups = Groups.Select(g => new GraphSessionGroup
             {
                 ClientId = g.ClientId,
@@ -329,16 +320,41 @@ public sealed class GraphDocumentModel
         };
     }
 
+    // Sibling of CreateSessionDocument — see GraphConnectionsDocument's own comment for why edges are
+    // serialized into their own document/file instead of being part of the one above.
+    public GraphConnectionsDocument CreateConnectionsDocument()
+    {
+        return new GraphConnectionsDocument
+        {
+            SavedAtUtc = DateTime.UtcNow,
+            Edges = Edges.Select(e => new GraphSessionEdge
+            {
+                FromNodeGuid = e.FromNodeGuid,
+                FromPort = e.FromPort,
+                FromPortId = e.FromPortId,
+                ToNodeGuid = e.ToNodeGuid,
+                ToPort = e.ToPort,
+                ToPortId = e.ToPortId,
+                IsNew = e.IsNew,
+                IsMarkedForDeletion = e.IsMarkedForDeletion,
+            }).ToList(),
+        };
+    }
+
     // Cheap dirty-check: re-serializes the current state and compares it against the fingerprint captured
     // at the last load or local save, rather than tracking dirtiness through every individual mutation.
+    // Checked against both documents now that edges live apart from nodes/groups — an edge-only change
+    // (e.g. a rewired wire, no node moved) must still count as unsaved.
     public bool HasUnsavedChanges()
     {
-        return SerializeForFingerprint(CreateSessionDocument()) != _lastCleanSessionJson;
+        return SerializeForFingerprint(CreateSessionDocument()) != _lastCleanSessionJson ||
+               SerializeForFingerprint(CreateConnectionsDocument()) != _lastCleanConnectionsJson;
     }
 
     public void MarkClean()
     {
         _lastCleanSessionJson = SerializeForFingerprint(CreateSessionDocument());
+        _lastCleanConnectionsJson = SerializeForFingerprint(CreateConnectionsDocument());
     }
 
     private static string SerializeForFingerprint(GraphSessionDocument document)
@@ -352,8 +368,18 @@ public sealed class GraphDocumentModel
             GraphName = document.GraphName,
             BaseYamlHash = document.BaseYamlHash,
             Nodes = document.Nodes,
-            Edges = document.Edges,
             Groups = document.Groups,
+        };
+        return JsonConvert.SerializeObject(normalized);
+    }
+
+    private static string SerializeForFingerprint(GraphConnectionsDocument document)
+    {
+        var normalized = new GraphConnectionsDocument
+        {
+            Version = document.Version,
+            SavedAtUtc = default,
+            Edges = document.Edges,
         };
         return JsonConvert.SerializeObject(normalized);
     }
@@ -442,6 +468,16 @@ public sealed class GraphDocumentModel
         var node = FindNode(guid);
         if (node == null)
             return;
+
+        // The node is actually being removed here (either purged immediately, IsNew, or marked and
+        // excluded from the next persisted session) — its content files (if any) would otherwise become
+        // orphans, permanently occupying their plain-name path for whichever unrelated node types that
+        // name next (see NodeContentStore.ResolveBasePath's own collision-suffix comment).
+        if (node.TypeName == NodeContentStore.PlayscriptProcessNodeTypeName && !string.IsNullOrEmpty(node.IdentityValue))
+        {
+            NodeContentStore.DeleteFile(Settings.ExternalDataFolder, node.IdentityValue!, node.Guid);
+            NodeScriptTableStore.DeleteFile(Settings.ExternalDataFolder, node.IdentityValue!, node.Guid);
+        }
 
         var affectedGroups = Groups.Where(g => g.MemberNodeGuids.Contains(guid)).ToList();
         foreach (var group in affectedGroups)
