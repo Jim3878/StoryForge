@@ -662,6 +662,11 @@ public sealed class GraphEditorState
     // than one of the narrow projections below — null before LoadGraph() has ever run.
     public GraphDocumentModel? GetModel() => _model;
 
+    // Reflects node identity/memo edits already round-tripped server-side (UpdateNodeField writes straight
+    // into the model) and any canvas edit already applied via ApplyAndSave — but NOT a canvas-only edit
+    // (drag/rewire) the user hasn't hit 存檔 for yet, since that never reaches the server until exported.
+    public bool HasUnsavedChanges() => _model?.HasUnsavedChanges() ?? false;
+
     // Live Group titles — used by StoryOutlineState purely as soft chapter-combo suggestions (never a
     // hard requirement; any string can still be typed), mirroring the original tool's own loose coupling
     // between the two panels (StoryOutlinePanel.SetGraphModelProvider reading ProcessGraphPanel's model).

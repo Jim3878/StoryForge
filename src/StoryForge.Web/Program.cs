@@ -3,6 +3,7 @@ using StoryForge.Core;
 using StoryForge.Core.Graph;
 using StoryForge.Web.Components;
 using StoryForge.Web.GraphEditor;
+using StoryForge.Web.UpdateCheck;
 
 // Must run before AppSettings.LoadOrDefault() below ever executes — see LegacyToolMigration's own comment
 // for why this has to happen inside the real app process rather than via an external tool.
@@ -23,6 +24,9 @@ builder.Services.AddScoped<StoryForge.Web.CharacterCard.CharacterCardState>();
 builder.Services.AddScoped<StoryForge.Web.StoryOutline.StoryOutlineState>();
 builder.Services.AddScoped<StoryForge.Web.Pipeline.PipelineStatusState>();
 builder.Services.AddScoped<StoryForge.Web.ReloadCoordinator>();
+// Singleton, not scoped — see UpdateCheckService's own comment: one GitHub check result shared by the
+// whole process, not one per browser tab/circuit.
+builder.Services.AddSingleton<UpdateCheckService>();
 
 // DetailedErrors surfaces the real reason in the browser console/reconnect UI instead of a bare
 // "connection closed", and CircuitDiagnosticsHandler below logs every open/close/error to a plain file so

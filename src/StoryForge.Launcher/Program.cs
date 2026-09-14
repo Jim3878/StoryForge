@@ -1,6 +1,13 @@
 using System.Diagnostics;
+using System.IO.Compression;
+using System.Text.Json;
 
 namespace StoryForge.Launcher;
+
+// Written by StoryForge.Web's UpdateDialog.razor to %LocalAppData%\StoryForge\update-request.json when the
+// user confirms the "請更新" button — see this file's own ApplyUpdateAndRestart for why the actual
+// download/swap/restart has to happen here rather than in the (about to be killed) web process.
+internal sealed record UpdateRequest(string Tag, string ZipUrl);
 
 // One-click daily-use launcher: builds/starts StoryForge.Web (Release, not the Debug build `dotnet watch`
 // uses during active development), waits for it to come up, opens it in a dedicated app-mode Chrome window
@@ -30,6 +37,10 @@ internal static class Program
 
     private static void Run()
     {
+        // Reaching this line at all means the last self-update (if any) already started successfully, so a
+        // leftover backup from it is safe to discard — see ApplyUpdateAndRestart/SpawnLauncherSelfUpdateHelper.
+        CleanupStaleLauncherBackup();
+
         var webExePath = ResolveOrBuildWebExePath();
         if (webExePath == null)
         {
@@ -62,8 +73,190 @@ internal static class Program
         if (chrome != null)
             TagWindowWhenReady(chrome, TimeSpan.FromSeconds(5));
 
-        chrome?.WaitForExit();
+        var updateRequest = WaitForChromeExitOrUpdateRequest(chrome);
         KillIfRunning(server);
+
+        if (updateRequest != null)
+            ApplyUpdateAndRestart(updateRequest);
+    }
+
+    // Polls instead of blocking on chrome.WaitForExit() so a "請更新" click (which writes update-request.json
+    // from the still-open browser tab) can interrupt the normal "wait for the window to close" flow — same
+    // polling style as WaitForServerReady/TagWindowWhenReady above, not async/await, to match this file's
+    // existing fully-synchronous shape.
+    private static UpdateRequest? WaitForChromeExitOrUpdateRequest(Process? chrome)
+    {
+        while (true)
+        {
+            if (chrome == null || chrome.HasExited)
+                return null;
+
+            if (TryReadAndConsumeUpdateRequest(out var request))
+            {
+                KillIfRunning(chrome);
+                return request;
+            }
+
+            chrome.WaitForExit(1000);
+        }
+    }
+
+    private static bool TryReadAndConsumeUpdateRequest(out UpdateRequest? request)
+    {
+        request = null;
+        var path = UpdateRequestPath;
+        if (!File.Exists(path))
+            return false;
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            request = JsonSerializer.Deserialize<UpdateRequest>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+        catch (Exception e)
+        {
+            LogError(e);
+        }
+        finally
+        {
+            // Consume it either way — a malformed request should be discarded, not re-read forever.
+            try { File.Delete(path); } catch { /* best-effort */ }
+        }
+
+        return request != null;
+    }
+
+    private static string UpdateRequestPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StoryForge", "update-request.json");
+
+    // Downloads the release zip, applies the StoryForge.Web half directly (its process is already dead, so
+    // its files aren't locked), then hands the StoryForge.Launcher half off to a detached helper script —
+    // this process's own currently-executing files can't be overwritten by itself while it's still running.
+    private static void ApplyUpdateAndRestart(UpdateRequest request)
+    {
+        try
+        {
+            var storyForgeDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StoryForge");
+            var downloadDir = Path.Combine(storyForgeDir, "update-download");
+            var stagingDir = Path.Combine(storyForgeDir, "update-staging", SanitizeForPath(request.Tag));
+            Directory.CreateDirectory(downloadDir);
+            if (Directory.Exists(stagingDir))
+                Directory.Delete(stagingDir, recursive: true);
+
+            var zipPath = Path.Combine(downloadDir, $"{SanitizeForPath(request.Tag)}.zip");
+            DownloadFile(request.ZipUrl, zipPath);
+            ZipFile.ExtractToDirectory(zipPath, stagingDir, overwriteFiles: true);
+
+            // AppContext.BaseDirectory is .../src/StoryForge.Launcher/bin/Release/net8.0/ — the release zip
+            // (built by .github/workflows/release.yml) mirrors this same relative layout under src/, so both
+            // halves land exactly where ResolveOrBuildWebExePath already expects them, with no path changes.
+            var launcherDir = AppContext.BaseDirectory;
+            var webProjectDir = Path.GetFullPath(Path.Combine(launcherDir, "..", "..", "..", "..", "StoryForge.Web"));
+            var webPublishDir = Path.Combine(webProjectDir, "bin", "Release", "net8.0", "publish");
+
+            var stagedWebDir = Path.Combine(stagingDir, "src", "StoryForge.Web", "bin", "Release", "net8.0", "publish");
+            var stagedLauncherDir = Path.Combine(stagingDir, "src", "StoryForge.Launcher", "bin", "Release", "net8.0");
+
+            CopyDirectoryOverwrite(stagedWebDir, webPublishDir);
+            SpawnLauncherSelfUpdateHelper(launcherDir, stagedLauncherDir);
+        }
+        catch (Exception e)
+        {
+            LogError(e);
+        }
+    }
+
+    private static string SanitizeForPath(string value) =>
+        string.Concat(value.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+
+    private static void DownloadFile(string url, string destinationPath)
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("StoryForge-Launcher");
+
+        using var response = client.GetAsync(url).GetAwaiter().GetResult();
+        response.EnsureSuccessStatusCode();
+
+        using var fileStream = File.Create(destinationPath);
+        response.Content.CopyToAsync(fileStream).GetAwaiter().GetResult();
+    }
+
+    private static void CopyDirectoryOverwrite(string sourceDir, string destinationDir)
+    {
+        if (!Directory.Exists(sourceDir))
+            throw new DirectoryNotFoundException($"更新包裡找不到預期的資料夾：{sourceDir}");
+
+        Directory.CreateDirectory(destinationDir);
+        foreach (var file in Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(sourceDir, file);
+            var target = Path.Combine(destinationDir, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(file, target, overwrite: true);
+        }
+    }
+
+    // The Launcher can't overwrite its own currently-loaded exe/dll files, so this writes a small detached
+    // batch script that: waits for this exact process to actually exit (polling `tasklist`, not just firing
+    // immediately — Process.Kill/exit isn't instantaneous), renames the current Launcher folder to `-old`
+    // (the one-generation rollback safety net — see CleanupStaleLauncherBackup, which clears it on the next
+    // successful normal startup), copies the staged new build into place, and relaunches. A plain detached
+    // child process already survives this one exiting on Windows, so no Job Object plumbing is needed.
+    private static void SpawnLauncherSelfUpdateHelper(string currentLauncherDir, string stagedLauncherDir)
+    {
+        var storyForgeDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StoryForge");
+        Directory.CreateDirectory(storyForgeDir);
+        var helperPath = Path.Combine(storyForgeDir, "apply-launcher-update.bat");
+
+        var normalizedLauncherDir = currentLauncherDir.TrimEnd(Path.DirectorySeparatorChar);
+        var backupDir = Path.Combine(Path.GetDirectoryName(normalizedLauncherDir)!, "net8.0-old");
+        var pid = Environment.ProcessId;
+        var launcherExe = Path.Combine(currentLauncherDir, "StoryForge.Launcher.exe");
+
+        var script = $"""
+            @echo off
+            :waitloop
+            tasklist /fi "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
+            if not errorlevel 1 (
+                timeout /t 1 /nobreak >nul
+                goto waitloop
+            )
+
+            if exist "{backupDir}" rmdir /s /q "{backupDir}"
+            mkdir "{backupDir}"
+            xcopy "{currentLauncherDir}*" "{backupDir}\" /e /i /y >nul
+            xcopy "{stagedLauncherDir}\*" "{currentLauncherDir}" /e /i /y >nul
+            start "" "{launcherExe}"
+            del "%~f0"
+
+            """;
+        File.WriteAllText(helperPath, script);
+
+        Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{helperPath}\"")
+        {
+            UseShellExecute = true,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+        });
+
+        Environment.Exit(0);
+    }
+
+    private static void CleanupStaleLauncherBackup()
+    {
+        try
+        {
+            var launcherDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+            var backupDir = Path.Combine(Path.GetDirectoryName(launcherDir)!, "net8.0-old");
+            if (Directory.Exists(backupDir))
+                Directory.Delete(backupDir, recursive: true);
+        }
+        catch (Exception e)
+        {
+            LogError(e);
+        }
     }
 
     // Re-stamps both shortcuts every launch (cheap — just overwrites two small .lnk files) so a pin made

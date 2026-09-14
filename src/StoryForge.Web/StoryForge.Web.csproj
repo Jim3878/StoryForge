@@ -9,10 +9,18 @@
          reading a source file's own last-write time, which says nothing about whether the running process
          was actually rebuilt from it. -->
     <SourceRevisionId>build-$([System.DateTime]::Now.ToString(yyyyMMdd-HHmmss))</SourceRevisionId>
+    <!-- Overridden per-build by the release workflow via -p:Version=X.Y.Z (from the GitHub Release tag), so
+         the shipped AssemblyInformationalVersion carries a real semantic version the update checker can
+         compare against release tags. Local/dev builds keep this placeholder. -->
+    <Version>0.0.0-dev</Version>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\StoryForge.Core\StoryForge.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Markdig" Version="0.37.0" />
   </ItemGroup>
 
 </Project>

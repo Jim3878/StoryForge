@@ -3,8 +3,10 @@
 @using System.Reflection
 @using StoryForge.Web.Components
 @using StoryForge.Web.GraphEditor
+@using StoryForge.Web.UpdateCheck
 @inject GraphEditorState GraphState
 @inject ReloadCoordinator ReloadCoordinator
+@inject UpdateCheckService UpdateCheck
 @inject IJSRuntime JS
 
 @* The global chrome every page sits under — 工具列 in the "工具列 / 分頁 / 分頁工具列" hierarchy the old
@@ -28,6 +30,10 @@
     </span>
     <button class="app-menubar-item" @onclick="() => _settingsDialog?.Open()">設定</button>
     <span class="app-menubar-status">@_fileStatus</span>
+    @if (_pendingUpdate != null)
+    {
+        <button class="app-menubar-update" @onclick="() => _updateDialog?.Open(_pendingUpdate)">請更新 @_pendingUpdate.Tag</button>
+    }
     <span class="app-menubar-version">@BuildVersion</span>
 </div>
 <div class="app-content">
@@ -35,6 +41,7 @@
 </div>
 
 <SettingsDialog @ref="_settingsDialog" />
+<UpdateDialog @ref="_updateDialog" />
 
 <div id="blazor-error-ui">
     An unhandled error has occurred.
@@ -56,6 +63,15 @@
     .app-menubar-item { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 3px 10px; border-radius: 3px; cursor: pointer; }
     .app-menubar-item:hover { background: #333; }
     .app-menubar-status { margin-left: auto; opacity: 0.8; font-size: 12px; }
+    .app-menubar-update {
+        background: #4a7a2a; color: #fff; border: 1px solid #6a9a3a; padding: 3px 10px; border-radius: 3px;
+        cursor: pointer; font-weight: bold; animation: app-menubar-update-pulse 1.6s ease-in-out infinite;
+    }
+    .app-menubar-update:hover { background: #5a9a35; }
+    @@keyframes app-menubar-update-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(122, 200, 70, 0.55); }
+        50% { box-shadow: 0 0 0 5px rgba(122, 200, 70, 0); }
+    }
     .app-menubar-version { opacity: 0.5; font-size: 11px; font-family: monospace; margin-left: 12px; }
 
     /* Every page's own root container (e.g. Home.razor's .graph-page) should fill exactly this box —
@@ -67,6 +83,8 @@
 
 @code {
     private SettingsDialog? _settingsDialog;
+    private UpdateDialog? _updateDialog;
+    private UpdateInfo? _pendingUpdate;
     private string _fileStatus = string.Empty;
     private DotNetObjectReference<MainLayout>? _selfRef;
 
@@ -76,6 +94,12 @@
         {
             _selfRef = DotNetObjectReference.Create(this);
             await JS.InvokeVoidAsync("storyForgeUi.bindSaveShortcut", _selfRef);
+
+            // Once per app process (UpdateCheckService caches the result), not once per tab — see its own
+            // comment. No background polling: if nothing's found now, the button just never appears this run.
+            _pendingUpdate = await UpdateCheck.CheckOnceAsync();
+            if (_pendingUpdate != null)
+                StateHasChanged();
         }
     }
 

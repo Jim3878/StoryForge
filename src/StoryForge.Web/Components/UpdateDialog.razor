@@ -1,0 +1,103 @@
+@* True blocking modal (backdrop, blocks interaction) — unlike SettingsDialog.razor, which is deliberately
+   non-modal. That distinction is intentional here: this dialog is presenting a decision with real
+   consequences (the app is about to restart and any unsaved flow-graph edit will be lost), not an
+   always-editable panel, so it shouldn't be dismissible by clicking past it. *@
+@using Markdig
+@using StoryForge.Web.GraphEditor
+@using StoryForge.Web.UpdateCheck
+@inject GraphEditorState GraphState
+@inject IJSRuntime JS
+
+@if (_info != null)
+{
+    <div class="update-dialog-backdrop">
+        <div class="update-dialog">
+            @if (!_isUpdating)
+            {
+                <div class="update-dialog-header">有新版本可用：@_info.Tag</div>
+                <div class="update-dialog-body">
+                    <div class="update-dialog-notes">@NotesHtml</div>
+                    <p class="update-dialog-warning">
+                        ⚠ 更新會關閉並重新啟動整個應用程式，<strong>尚未按下「存檔」的流程圖編輯內容將會遺失</strong>。
+                        建議先切換到流程圖分頁按「存檔」，再回來按下方按鈕更新。
+                        @if (GraphState.HasUnsavedChanges())
+                        {
+                            <strong class="update-dialog-warning-strong">目前偵測到有尚未存檔的變更。</strong>
+                        }
+                    </p>
+                </div>
+                <div class="update-dialog-footer">
+                    <button class="update-dialog-cancel" @onclick="Cancel">取消</button>
+                    <button class="update-dialog-confirm" @onclick="Confirm">更新並重啟</button>
+                </div>
+            }
+            else
+            {
+                <div class="update-dialog-body update-dialog-updating">
+                    <p>更新中，請稍候…</p>
+                    <p class="update-dialog-hint">應用程式即將關閉並自動重新啟動，這個頁面會在新版本就緒後自動重新整理。</p>
+                </div>
+            }
+        </div>
+    </div>
+}
+
+<style>
+    .update-dialog-backdrop { position: fixed; inset: 0; z-index: 2000; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; }
+    .update-dialog { width: 480px; max-width: 90vw; max-height: 85vh; overflow: auto; background: #1e1e1e; color: #ddd; border: 1px solid #444; border-radius: 4px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); font-family: sans-serif; }
+    .update-dialog-header { padding: 12px 16px; background: #2a2a2a; border-bottom: 1px solid #444; font-weight: bold; font-size: 15px; }
+    .update-dialog-body { padding: 16px; }
+    .update-dialog-notes { font-size: 13px; line-height: 1.6; }
+    .update-dialog-notes :first-child { margin-top: 0; }
+    .update-dialog-warning { margin: 14px 0 0; padding: 10px 12px; background: #3a2a10; border: 1px solid #6a4a1a; border-radius: 3px; font-size: 12px; line-height: 1.6; }
+    .update-dialog-warning-strong { display: block; margin-top: 6px; color: #ffb347; }
+    .update-dialog-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 16px; border-top: 1px solid #444; }
+    .update-dialog-footer button { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 5px 14px; border-radius: 3px; cursor: pointer; }
+    .update-dialog-footer button:hover { background: #333; }
+    .update-dialog-confirm { background: #2d5a2d !important; border-color: #3a7a3a !important; }
+    .update-dialog-confirm:hover { background: #357035 !important; }
+    .update-dialog-updating { text-align: center; }
+    .update-dialog-hint { opacity: 0.7; font-size: 12px; }
+</style>
+
+@code {
+    private UpdateInfo? _info;
+    private bool _isUpdating;
+
+    private MarkupString NotesHtml =>
+        new(string.IsNullOrWhiteSpace(_info?.NotesMarkdown) ? "<em>(這個版本沒有附上說明)</em>" : Markdown.ToHtml(_info.NotesMarkdown));
+
+    public void Open(UpdateInfo info)
+    {
+        _info = info;
+        _isUpdating = false;
+        StateHasChanged();
+    }
+
+    private void Cancel()
+    {
+        _info = null;
+    }
+
+    // Writes the same signal file StoryForge.Launcher polls for (see its Program.cs) — Launcher, not this
+    // page, does the actual download/swap/restart, since a running process can never safely overwrite its
+    // own files. This page can only ask and then wait.
+    private async Task Confirm()
+    {
+        if (_info == null)
+            return;
+
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var storyForgeDir = Path.Combine(localAppData, "StoryForge");
+        Directory.CreateDirectory(storyForgeDir);
+
+        var request = new { tag = _info.Tag, zipUrl = _info.ZipDownloadUrl };
+        var json = Newtonsoft.Json.JsonConvert.SerializeObject(request);
+        await File.WriteAllTextAsync(Path.Combine(storyForgeDir, "update-request.json"), json);
+
+        _isUpdating = true;
+        StateHasChanged();
+
+        await JS.InvokeVoidAsync("storyForgeUpdate.waitAndReload");
+    }
+}

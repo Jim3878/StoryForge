@@ -6,6 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ApplicationIcon>app-icon.ico</ApplicationIcon>
+    <!-- Overridden per-build by the release workflow via -p:Version=X.Y.Z (from the GitHub Release tag) —
+         used to name the rollback backup folder when this Launcher replaces its own binaries. -->
+    <Version>0.0.0-dev</Version>
   </PropertyGroup>
 
 </Project>

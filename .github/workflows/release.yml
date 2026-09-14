@@ -1,0 +1,62 @@
+name: Release build
+
+# Fires when a Release is manually published (`gh release create` / the web UI) — not on a bare tag push.
+# Release notes are hand-written first (shown verbatim in StoryForge.Web's update prompt), so the release
+# itself is the trigger, and this workflow's only job is to attach the build it needs.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-attach:
+    # StoryForge.Web is ASP.NET/Blazor Server and StoryForge.Launcher is a Windows Forms/WinExe app with
+    # Win32 P/Invoke (AppUserModelId.cs) — both are Windows-only, so a Windows runner is required, not just
+    # convenient.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Derive version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          $version = $tag.TrimStart("v", "V")
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      # Mirrors publish.bat's two build steps, plus the version override so the shipped binaries'
+      # AssemblyInformationalVersion is a real semantic version the update checker can compare against tags.
+      - name: Publish StoryForge.Web
+        run: dotnet publish src/StoryForge.Web/StoryForge.Web.csproj -c Release -p:Version=${{ steps.version.outputs.version }} -o src/StoryForge.Web/bin/Release/net8.0/publish
+
+      - name: Build StoryForge.Launcher
+        run: dotnet build src/StoryForge.Launcher/StoryForge.Launcher.csproj -c Release -p:Version=${{ steps.version.outputs.version }}
+
+      # Zipped with the same src/StoryForge.Web/bin/Release/net8.0/publish and
+      # src/StoryForge.Launcher/bin/Release/net8.0 relative paths the installed app already uses —
+      # StoryForge.Launcher's self-update logic (ApplyUpdateAndRestart in Program.cs) extracts this zip
+      # and expects to find exactly this layout, so it can copy straight into place with no path remapping.
+      - name: Stage release zip
+        shell: pwsh
+        run: |
+          $staging = "release-staging"
+          New-Item -ItemType Directory -Force -Path "$staging/src/StoryForge.Web/bin/Release/net8.0/publish" | Out-Null
+          Copy-Item -Recurse -Force "src/StoryForge.Web/bin/Release/net8.0/publish/*" "$staging/src/StoryForge.Web/bin/Release/net8.0/publish/"
+          New-Item -ItemType Directory -Force -Path "$staging/src/StoryForge.Launcher/bin/Release/net8.0" | Out-Null
+          Copy-Item -Recurse -Force "src/StoryForge.Launcher/bin/Release/net8.0/*" "$staging/src/StoryForge.Launcher/bin/Release/net8.0/"
+          Compress-Archive -Path "$staging/*" -DestinationPath "StoryForge-Release.zip" -Force
+
+      # Fixed asset name (not versioned per-release) — UpdateCheckService.cs looks for this exact filename
+      # on the release it already fetched, so it never has to guess/parse a version into a filename.
+      - name: Attach zip to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "StoryForge-Release.zip" --clobber
