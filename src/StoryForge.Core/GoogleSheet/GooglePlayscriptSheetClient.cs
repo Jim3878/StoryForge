@@ -335,6 +335,59 @@ public static class GooglePlayscriptSheetClient
     {
         return string.Equals(value?.Trim(), PlayscriptNameHeader, StringComparison.Ordinal);
     }
+
+    // "上傳補完到Sheet" — one call per playscript (never batched; see PipelineStatusState's upload queue),
+    // handled by a single new Apps Script action ("uploadPlayscriptComplete") that does whatever subset of
+    // three steps is actually needed for this row: add it to the index if missing, create its own dedicated
+    // spreadsheet from the template if it doesn't have one yet, and overwrite that spreadsheet's dialogue
+    // rows with `rows` if the caller has local content for it. `rows` is null when there's no local .md file
+    // for this playscript — the index/sheet-creation steps still happen, content overwrite just doesn't.
+    public static async Task<GooglePlayscriptUploadCompleteResponse> UploadPlayscriptCompleteAsync(
+        string chapterKey, string sheetName, string playscriptName, IReadOnlyList<string[]>? rows)
+    {
+        var request = new GooglePlayscriptUploadCompleteRequest(chapterKey, sheetName, playscriptName, rows);
+        var json = JsonConvert.SerializeObject(request);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var response = await HttpClient.PostAsync(AppsScriptUrl, content);
+        var responseText = await response.Content.ReadAsStringAsync();
+        return ParseUploadCompleteResponse(responseText);
+    }
+
+    // Same Apps Script /exec response-loss quirk ValidateUploadResponse already guards against (see its own
+    // comment) — an HTML error page here means "can't tell what happened", not "nothing happened", so it's
+    // reported back as an unconfirmed success with no spreadsheetId rather than a thrown exception. A real
+    // {"errors":[...]} still throws.
+    private static GooglePlayscriptUploadCompleteResponse ParseUploadCompleteResponse(string? response)
+    {
+        var trimmed = response?.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+            return new GooglePlayscriptUploadCompleteResponse { Success = true };
+
+        if (trimmed.StartsWith("<!DOCTYPE html", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("<html", StringComparison.OrdinalIgnoreCase))
+        {
+            return new GooglePlayscriptUploadCompleteResponse
+            {
+                Success = true,
+                Message = "Apps Script 回應遺失（已知的 /exec 回應遺失問題），寫入通常已成功，但無法確認細節",
+            };
+        }
+
+        GooglePlayscriptUploadCompleteResponse? parsed;
+        try
+        {
+            parsed = JsonConvert.DeserializeObject<GooglePlayscriptUploadCompleteResponse>(trimmed);
+        }
+        catch (JsonException e)
+        {
+            throw new InvalidOperationException($"Apps Script 回應格式異常：{trimmed}", e);
+        }
+
+        if (parsed?.Errors is { Count: > 0 })
+            throw new InvalidOperationException(string.Join("\n", parsed.Errors));
+
+        return parsed ?? new GooglePlayscriptUploadCompleteResponse { Success = true };
+    }
 }
 
 // Message is written straight into the "無法下載" summary shown to the user, so it's always plain,
@@ -427,6 +480,73 @@ public sealed class GooglePlayscriptUploadResponse
 
     [JsonProperty("result")]
     public string? Result { get; set; }
+
+    [JsonProperty("message")]
+    public string? Message { get; set; }
+
+    [JsonProperty("errors")]
+    public List<string>? Errors { get; set; }
+}
+
+// One playscript's "上傳補完到Sheet" request. `Rows` is omitted (null) rather than an empty list when there's
+// no local .md content, so the Apps Script side can tell "nothing to upload" apart from "upload an empty
+// table" — the former skips the content-overwrite step entirely, the latter would wipe the remote sheet.
+public sealed class GooglePlayscriptUploadCompleteRequest
+{
+    public GooglePlayscriptUploadCompleteRequest(
+        string chapterKey, string sheetName, string playscriptName, IReadOnlyList<string[]>? rows)
+    {
+        ChapterKey = chapterKey;
+        SheetName = sheetName;
+        PlayscriptName = playscriptName;
+        Rows = rows is { Count: > 0 } ? rows : null;
+    }
+
+    [JsonProperty("action")]
+    public string Action { get; } = "uploadPlayscriptComplete";
+
+    [JsonProperty("chapterKey")]
+    public string ChapterKey { get; }
+
+    // Which index tab this playscript belongs on — same resolution BuildUploadRows already does for the
+    // append-only flow, reused here since a brand-new spreadsheet is filed under a Drive folder named after
+    // this same tab.
+    [JsonProperty("sheetName")]
+    public string SheetName { get; }
+
+    [JsonProperty("playscriptName")]
+    public string PlayscriptName { get; }
+
+    // Column order matches NodeScriptTableStore.Headers exactly: 名字,表情,配音情緒,台詞,功能,備註,參數.
+    [JsonProperty("headers")]
+    public List<string> Headers { get; } = new() { "名字", "表情", "配音情緒", "台詞", "功能", "備註", "參數" };
+
+    [JsonProperty("rows")]
+    public IReadOnlyList<string[]>? Rows { get; }
+}
+
+public sealed class GooglePlayscriptUploadCompleteResponse
+{
+    [JsonProperty("success")]
+    public bool? Success { get; set; }
+
+    // Present whenever the row has (or now has) its own dedicated spreadsheet, whether that spreadsheet was
+    // just created by this call or already existed beforehand — the caller uses this alone to decide whether
+    // to update its in-memory index-entry cache, without needing to also check CreatedSheet.
+    [JsonProperty("spreadsheetId")]
+    public string? SpreadsheetId { get; set; }
+
+    [JsonProperty("link")]
+    public string? Link { get; set; }
+
+    [JsonProperty("createdIndexRow")]
+    public bool? CreatedIndexRow { get; set; }
+
+    [JsonProperty("createdSheet")]
+    public bool? CreatedSheet { get; set; }
+
+    [JsonProperty("wroteContent")]
+    public bool? WroteContent { get; set; }
 
     [JsonProperty("message")]
     public string? Message { get; set; }

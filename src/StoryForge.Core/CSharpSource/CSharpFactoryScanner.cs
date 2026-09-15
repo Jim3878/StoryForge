@@ -35,4 +35,24 @@ public static class CSharpFactoryScanner
 
         return result;
     }
+
+    // Single-file version of the same GetPlayscriptName() extraction ScanFolderEntries does over a whole
+    // folder — used to tell "regenerating my own already-exported file" apart from "a DIFFERENT playscript's
+    // name happens to collide onto the same output path" (see PlayscriptNameParser.Parse's ClassName, which
+    // drops a filename's last "_"-segment: two playscripts sharing everything up to that segment produce the
+    // identical class name/file). Returns null for a file with no matching GetPlayscriptName() at all (not
+    // one of this generator's outputs, or a format this regex doesn't recognize) — callers should treat that
+    // as "can't tell", not as "no collision".
+    public static string? TryReadPlayscriptName(string filePath)
+    {
+        if (!File.Exists(filePath))
+            return null;
+
+        var match = GetPlayscriptNameReturnPattern.Match(File.ReadAllText(filePath));
+        if (!match.Success)
+            return null;
+
+        var playscript = PlayscriptNaming.Normalize(Regex.Unescape(match.Groups[1].Value));
+        return string.IsNullOrEmpty(playscript) ? null : playscript;
+    }
 }

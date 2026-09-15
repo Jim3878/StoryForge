@@ -11,8 +11,13 @@
     <SourceRevisionId>build-$([System.DateTime]::Now.ToString(yyyyMMdd-HHmmss))</SourceRevisionId>
     <!-- Overridden per-build by the release workflow via -p:Version=X.Y.Z (from the GitHub Release tag), so
          the shipped AssemblyInformationalVersion carries a real semantic version the update checker can
-         compare against release tags. Local/dev builds keep this placeholder. -->
-    <Version>0.0.0-dev</Version>
+         compare against release tags. Local/dev builds keep this literal string — NOT a placeholder like
+         "0.0.0-dev": UpdateCheckService.IsNewer strips the "-dev" suffix before comparing, so a local build
+         must number itself ahead of the latest actually-tagged release or it permanently (mis)reports itself
+         as needing an update it's actually already ahead of. Bump this by hand to the next expected version
+         right after each real release is tagged (the same "-dev"/"-SNAPSHOT" convention many projects use for
+         their unreleased working version) — currently ahead of the latest tag, v1.0.0. -->
+    <Version>1.1.0-dev</Version>
   </PropertyGroup>
 
   <ItemGroup>

@@ -32,6 +32,13 @@ public sealed class ParsedPlayscriptName
     public string NamespaceName { get; }
     public string OutputFolderName { get; }
     public bool ShouldEndRpgRoleWithoutFinish { get; }
+
+    // H場景 naming convention — every real H-scene script's ScriptId observed so far (H1/H2/HN10/...) starts
+    // with a literal capital "H", with zero non-H-scene counter-examples across the whole PlayscriptFactory
+    // output folder. Drives GenerateCode's choice of StartVideoAndFadeOn()/EndVideoAndFadeOff() in place of
+    // the normal StartRpgRole()/EndRpgRole() wrapper — the dialogue body itself (RpgRole calls included)
+    // stays exactly the same as any other script; only the start/end wrapper differs.
+    public bool IsHScene => ScriptId.StartsWith("H", StringComparison.Ordinal);
 }
 
 public static class PlayscriptNameParser

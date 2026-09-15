@@ -67,6 +67,22 @@
                     <input type="text" @bind="_externalDataFolder" />
                 </label>
             </div>
+
+            <h3>LDtk</h3>
+            <p class="settings-hint">
+                「劇本管線狀態」右鍵選單「定位到LDtk」用來啟動LDtk的路徑。工作目錄留空代表直接執行「LDtk執行檔路徑」本身
+                （例如真正封裝好的LDtk.exe）；填了工作目錄則會多帶一個「.」參數啟動（目前用來從原始碼跑Electron開發版）。
+            </p>
+            <div class="settings-grid settings-grid-1col">
+                <label>
+                    <span>LDtk執行檔路徑</span>
+                    <input type="text" @bind="_ldtkExecutablePath" />
+                </label>
+                <label>
+                    <span>工作目錄（開發版才需要，封裝版留空）</span>
+                    <input type="text" @bind="_ldtkWorkingDirectory" />
+                </label>
+            </div>
         </div>
         <div class="settings-dialog-footer">
             <span class="settings-status">@_statusMessage</span>
@@ -108,6 +124,8 @@
     private float _portraitTopCutPercent;
     private float _portraitBottomCutPercent;
     private string _externalDataFolder = string.Empty;
+    private string _ldtkExecutablePath = string.Empty;
+    private string _ldtkWorkingDirectory = string.Empty;
 
     // Called from the toolbar's 設定 button — snapshots current values into local scratch fields (rather
     // than binding the inputs straight to AppSettingsStore) so 取消 has something to discard back to.
@@ -120,6 +138,8 @@
         _portraitTopCutPercent = AppSettingsStore.PortraitTopCutPercent;
         _portraitBottomCutPercent = AppSettingsStore.PortraitBottomCutPercent;
         _externalDataFolder = AppSettingsStore.ExternalDataFolder;
+        _ldtkExecutablePath = AppSettingsStore.LdtkExecutablePath;
+        _ldtkWorkingDirectory = AppSettingsStore.LdtkWorkingDirectory;
         _statusMessage = string.Empty;
         _isOpen = true;
         StateHasChanged();
@@ -142,6 +162,8 @@
         AppSettingsStore.PortraitTopCutPercent = _portraitTopCutPercent;
         AppSettingsStore.PortraitBottomCutPercent = _portraitBottomCutPercent;
         AppSettingsStore.ExternalDataFolder = _externalDataFolder;
+        AppSettingsStore.LdtkExecutablePath = _ldtkExecutablePath;
+        AppSettingsStore.LdtkWorkingDirectory = _ldtkWorkingDirectory;
         AppSettingsStore.Save();
 
         await JS.InvokeVoidAsync("storyForgeGraph.updateSettings", new

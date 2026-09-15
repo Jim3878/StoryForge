@@ -37,6 +37,14 @@ public static class NodeScriptTableStore
     public static bool HasFileAt(string dataFolder, string playscriptName, string? guid) =>
         File.Exists(ResolvePath(dataFolder, playscriptName, guid));
 
+    // True only when a local .md exists AND actually has real dialogue rows in it — a blank template
+    // (SyncAll/WriteTemplateAtPlainPath's single placeholder row, all cells empty) reads back as zero rows
+    // via ReadRows, so it counts the same as "no file" here. Used by the "下載Sheet劇本" conflict check so a
+    // blank template 建立劇本檔 already created ahead of time never blocks a download that would otherwise
+    // write real content straight through with no prompt.
+    public static bool HasContentAt(string dataFolder, string playscriptName, string? guid) =>
+        ReadRows(dataFolder, playscriptName, guid).Count > 0;
+
     // Unconditionally (re)writes a blank template at the PLAIN path, overwriting whatever is already
     // there — the .md counterpart to NodeContentStore.WriteAtPlainPath, used by the same 建立劇本檔
     // overwrite-confirmation flow once the user has agreed to take over a name an orphaned file occupied.
@@ -72,6 +80,69 @@ public static class NodeScriptTableStore
 
         File.WriteAllText(path, BuildContent(playscriptName, rows));
     }
+
+    // Reverse of WriteContent/BuildContent — parses a local .md 劇本檔 back into row data, for the
+    // "上傳補完到Sheet" flow to push local edits up to the playscript's own remote spreadsheet. A row that's
+    // entirely blank after unescaping (the single placeholder row a blank template is written with) is
+    // dropped, matching how DownloadScriptTableAsync itself never returns a blank row either. Returns an
+    // empty list rather than throwing if the file doesn't exist — callers are expected to check
+    // HasFile/HasFileAt first when "no local content" is a meaningful, non-error outcome for them.
+    public static List<string[]> ReadRows(string dataFolder, string playscriptName, string? guid)
+    {
+        var path = ResolvePath(dataFolder, playscriptName, guid);
+        if (!File.Exists(path))
+            return new List<string[]>();
+
+        var rows = new List<string[]>();
+        var pastDivider = false;
+        foreach (var line in File.ReadAllLines(path))
+        {
+            if (!pastDivider)
+            {
+                if (IsDividerRow(line))
+                    pastDivider = true;
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            var cells = ParseRowCells(line);
+            if (cells.All(string.IsNullOrEmpty))
+                continue;
+
+            rows.Add(cells);
+        }
+
+        return rows;
+    }
+
+    // Splits a table row line on "|" boundaries that aren't part of an escaped "\|", then drops the empty
+    // leading/trailing segments the format's leading/trailing pipe always produces (see BuildContent).
+    private static string[] ParseRowCells(string line)
+    {
+        var parts = CellSplitPattern.Split(line.Trim());
+        return parts.Skip(1).Take(parts.Length - 2).Select(UnescapeCell).ToArray();
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex CellSplitPattern =
+        new(@"(?<!\\)\|", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // Matches a Markdown table divider row in ANY spacing/alignment variant — not just the compact
+    // "|---|---|" this class itself writes (BuildDocument), but also a padded/aligned form like
+    // "| ---------- | ---- | ... |" that a Markdown formatter (an editor's format-on-save, an AI tool
+    // reflowing the table for readability) can rewrite it into. This file's whole premise is that a human
+    // or AI is freely editing its table body, so the divider row cannot be assumed to stay byte-identical
+    // to what this class originally wrote it as. A too-strict check here doesn't error — it just never
+    // finds "past the divider", so ReadRows silently returns zero rows for a file that visibly has content.
+    private static readonly System.Text.RegularExpressions.Regex DividerRowPattern =
+        new(@"^\|(\s*:?-+:?\s*\|)+$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static bool IsDividerRow(string line) => DividerRowPattern.IsMatch(line.Trim());
+
+    // Reverse of EscapeCell.
+    private static string UnescapeCell(string text) =>
+        text.Trim().Replace("<br>", "\n").Replace("\\|", "|");
 
     public static void SyncAll(string dataFolder, IEnumerable<(string Guid, string PlayscriptName)> nodes)
     {

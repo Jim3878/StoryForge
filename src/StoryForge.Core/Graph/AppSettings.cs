@@ -53,6 +53,15 @@ public sealed class AppSettings
     // read and edit the same files directly, with nothing to import back afterward.
     public string ExternalDataFolder { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\AI劇本\";
 
+    // "定位到LDtk" launches this with [project.ldtk path, "--goto-level=<iid>", "--goto-entity=<iid>"] —
+    // LDtk's own single-instance lock forwards those args to an already-running instance instead of opening
+    // a second one. LdtkWorkingDirectory is only needed for the current dev-mode launch (running LDtk
+    // straight from its Electron dev build via "electron.exe .", which needs its cwd set to the app folder
+    // that "." resolves against) — leave it empty once pointing this at a real packaged LDtk.exe, which
+    // needs neither a working directory nor the "." argument PipelineStatusState only adds when this is set.
+    public string LdtkExecutablePath { get; set; } = @"E:\ldtk\app\node_modules\electron\dist\electron.exe";
+    public string LdtkWorkingDirectory { get; set; } = @"E:\ldtk\app";
+
     // ProcessGraphPanel's inspector sidebar — remembered so a user-dragged size doesn't reset every time
     // the tool reopens or a different node is selected.
     public float InspectorPanelWidth { get; set; } = 260f;

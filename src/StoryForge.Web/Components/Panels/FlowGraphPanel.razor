@@ -3,12 +3,13 @@
 @implements IDisposable
 @inject GraphEditorState State
 @inject ReloadCoordinator ReloadCoordinator
+@inject StoryForge.Web.FlowGraphFocusCoordinator FlowGraphFocusCoordinator
 @inject IJSRuntime JS
 
 <div class="graph-page">
     <div class="graph-toolbar">
         <button @onclick="FitView">縮放至全部</button>
-        <button @onclick="ImportLegacy" title="從 PlayscriptOfflineTool 的 session.json 重新匯入流程圖存檔">從舊工具匯入</button>
+        <button @onclick="RequestExportToUnity" title="存檔並匯出快照，供 Unity 自動套用到即時流程圖">匯出至Unity</button>
         <input class="graph-search-box" placeholder="搜尋劇本名稱..."
                value="@_searchQuery" @oninput="e => _searchQuery = e.Value?.ToString() ?? string.Empty"
                @onkeydown="OnSearchKeyDown" />
@@ -66,6 +67,23 @@
     </div>
 </div>
 
+@if (_pendingExportToUnity)
+{
+    <div class="graph-modal-backdrop">
+        <div class="graph-modal">
+            <h3>匯出至 Unity</h3>
+            <p>
+                會先存檔目前流程圖，再匯出一份快照到 Unity 專案。Unity 端會在數秒內自動偵測並整批覆蓋即時的流程圖
+                （若 Unity 目前沒開啟，會等下次開啟時自動套用）。確定要匯出嗎？
+            </p>
+            <div class="graph-modal-actions">
+                <button @onclick="CancelExportToUnity">取消</button>
+                <button @onclick="ConfirmExportToUnity">確定匯出</button>
+            </div>
+        </div>
+    </div>
+}
+
 <style>
     /* Fills the tab-body's .tab-pane wrapper (position:absolute; inset:0, sized by Home.razor's flex
        layout below the menubar + tab strip) rather than the viewport directly — this component is now
@@ -76,6 +94,17 @@
     .graph-search-box { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 3px 6px; border-radius: 3px; width: 160px; }
     .graph-search-status { opacity: 0.8; font-size: 12px; }
     .graph-status { margin-left: 8px; opacity: 0.8; }
+    .graph-modal-backdrop {
+        position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 1000;
+        display: flex; align-items: center; justify-content: center;
+    }
+    .graph-modal {
+        background: #262626; color: #ddd; border: 1px solid #444; border-radius: 6px;
+        padding: 18px 20px; max-width: 480px; width: 90%;
+        display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+    .graph-modal h3 { margin: 0; }
+    .graph-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
     .graph-body { flex: 1 1 auto; display: flex; min-height: 0; }
     /* No width/height:100% here — against a sibling (.graph-inspector) that itself has a fixed width, an
        explicit 100% here ignores that sibling entirely and both end up wider than .graph-body, pushing the
@@ -128,6 +157,7 @@
     protected override void OnInitialized()
     {
         ReloadCoordinator.Subscribe(LoadAndInit);
+        FlowGraphFocusCoordinator.SubscribeFocus(FocusOnPlayscript);
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -295,14 +325,44 @@
     public void Dispose()
     {
         ReloadCoordinator.Unsubscribe(LoadAndInit);
+        FlowGraphFocusCoordinator.UnsubscribeFocus(FocusOnPlayscript);
         _selfRef?.Dispose();
     }
 
-    private async Task ImportLegacy()
+    // "跳到劇情節點"'s focus half — see FlowGraphFocusCoordinator for why Home.razor's tab switch always
+    // runs before this. Reuses the exact same search box/status field the toolbar's own 搜尋 uses, so a
+    // playscript jumped to this way still shows up as "已定位到：X" and repeating the same jump afterwards
+    // via either path continues cycling through duplicate-name matches together, not as two separate
+    // search histories. Goes through focusOnPlayscriptWhenVisible (not plain searchNode) since the canvas
+    // may still be mid-transition from display:none when this runs — see that JS function's own comment.
+    private async Task FocusOnPlayscript(string playscriptName)
     {
-        _payload = State.ImportLegacySession();
-        _selfRef ??= DotNetObjectReference.Create(this);
-        await JS.InvokeVoidAsync("storyForgeGraph.init", "story-forge-canvas", _payload, _selfRef);
+        _searchQuery = playscriptName;
+        var found = await JS.InvokeAsync<bool>("storyForgeGraph.focusOnPlayscriptWhenVisible", playscriptName);
+        _searchStatus = found ? $"已定位到：{playscriptName}" : $"找不到符合「{playscriptName}」的節點";
+        StateHasChanged();
+    }
+
+    private bool _pendingExportToUnity;
+
+    private void RequestExportToUnity()
+    {
+        _pendingExportToUnity = true;
+    }
+
+    private void CancelExportToUnity()
+    {
+        _pendingExportToUnity = false;
+    }
+
+    // Mirrors MainLayout's own 存檔 (Save) — pulls the canvas's current node positions/edges/groups via the
+    // same JS interop call — before handing off to GraphEditorState.ExportToUnity, so the exported snapshot
+    // always reflects what's on screen rather than whatever was last saved.
+    private async Task ConfirmExportToUnity()
+    {
+        _pendingExportToUnity = false;
+        var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
+        State.ExportToUnity(export);
         StateHasChanged();
     }
 

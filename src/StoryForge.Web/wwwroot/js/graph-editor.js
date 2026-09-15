@@ -671,14 +671,17 @@ window.storyForgeGraph = (function () {
         canvasInstance.dirty_bgcanvas = canvasInstance.dirty_canvas = true;
     }
 
-    // Replaces LiteGraph's stock "Add Node" menus with a FLAT list, one item per node type — ported
-    // directly from the old WinForms tool's BuildContextMenu/ShowWiringCreateNodeMenu (ProcessGraphCanvas.cs),
-    // which never nested submenus at all: MenuName is used only to SORT the flat list, not to group it into
-    // clickable categories. An earlier version of this file built a two-level (sometimes three-level, for a
-    // MenuName group with only one member) nested ContextMenu instead — flagged by the user as confusing and
-    // needlessly deep compared to the original. Overriding both call sites directly (rather than the shared
-    // static onMenuAdd hook they both used to funnel through) also removes LiteGraph's own "Add Node"/"Search"
-    // wrapper level that stock showConnectionMenu otherwise inserts before ever reaching onMenuAdd.
+    // Replaces LiteGraph's stock "Add Node" menus. The node-type list itself stays the FLAT, MenuName-sorted
+    // list ported from the old WinForms tool's BuildContextMenu/ShowWiringCreateNodeMenu (ProcessGraphCanvas.cs)
+    // — MenuName only ever sorts, never groups into clickable categories. Where the two call sites differ:
+    // the empty-canvas right-click menu (getCanvasMenuOptions) nests that flat list one level down, behind a
+    // single "新增節點" submenu entry (explicit user request, reversing an earlier "keep it fully flat"
+    // request — the earlier version had it fully expanded at the top level); the wire-drop menu
+    // (showConnectionMenu) still shows its flat per-compatible-port list with no extra wrapping, matching the
+    // original tool's ShowWiringCreateNodeMenu exactly. Overriding both call sites directly (rather than the
+    // shared static onMenuAdd hook they both used to funnel through) also removes LiteGraph's own
+    // "Add Node"/"Search" wrapper level that stock showConnectionMenu otherwise inserts before ever reaching
+    // onMenuAdd.
     function patchAddNodeMenu() {
         // Off by default in stock LiteGraph: dropping a wire on empty space would otherwise just leave it
         // detached with no menu at all. Turning this on is what makes showConnectionMenu (and therefore the
@@ -687,10 +690,11 @@ window.storyForgeGraph = (function () {
 
         // Right-click on empty canvas. Stock getCanvasMenuOptions() return value becomes the ENTIRE
         // top-level menu with no extra wrapping (confirmed by reading the vendored source), so building our
-        // own flat array here — instead of leaving stock's {content:"Add Node", has_submenu:true} entry in
-        // place — removes that one extra level too, matching the original's flat BuildContextMenu exactly.
+        // own array here — instead of leaving stock's {content:"Add Node", has_submenu:true} entry in place
+        // — controls exactly what nests and what doesn't.
         LGraphCanvas.prototype.getCanvasMenuOptions = function () {
             const worldPos = this.graph_mouse ? this.graph_mouse.slice() : [0, 0];
+            const moveToGroupItems = buildMoveToGroupItems(this);
             const items = [
                 {
                     content: "新增群組",
@@ -706,7 +710,18 @@ window.storyForgeGraph = (function () {
                     },
                 },
                 null,
-                ...buildFlatAddNodeItems(this, null),
+                {
+                    content: "移動至群組",
+                    has_submenu: true,
+                    disabled: moveToGroupItems.length === 0,
+                    submenu: { title: "移動至群組", options: moveToGroupItems },
+                },
+                null,
+                {
+                    content: "新增節點",
+                    has_submenu: true,
+                    submenu: { title: "新增節點", options: buildFlatAddNodeItems(this, null) },
+                },
             ];
             return items;
         };
@@ -810,6 +825,38 @@ window.storyForgeGraph = (function () {
         return items;
     }
 
+    // Lists every NAMED group in the graph (not just those currently scrolled into view) for the empty-canvas
+    // menu's "移動至群組" submenu. A blank-titled group (_displayTitle "") is excluded — it renders no label
+    // on the canvas either (see drawFrozenLabels' own `if (!group._displayTitle) continue`), so a menu entry
+    // for it would just be an unlabeled, unidentifiable item. Sorted with numeric:true so "A2" sorts before
+    // "A10" instead of after it.
+    function buildMoveToGroupItems(canvasInstance) {
+        const groups = (canvasInstance.graph._groups || [])
+            .filter(group => group._displayTitle)
+            .slice()
+            .sort((a, b) => a._displayTitle.localeCompare(b._displayTitle, undefined, { numeric: true }));
+
+        return groups.map(group => ({
+            content: group._displayTitle,
+            callback: () => focusOnGroup(canvasInstance, group),
+        }));
+    }
+
+    // Pans so the group's center lands at the canvas center — deliberately leaves ds.scale untouched (unlike
+    // focusOnNode's search-jump, which raises zoom to a minimum), and selects nothing: this app has no
+    // group-selection concept to drive.
+    function focusOnGroup(canvasInstance, group) {
+        const canvasEl = canvasInstance.canvas;
+        const cssWidth = canvasEl.clientWidth;
+        const cssHeight = canvasEl.clientHeight;
+
+        const centerX = group.pos[0] + group.size[0] / 2;
+        const centerY = group.pos[1] + group.size[1] / 2;
+        canvasInstance.ds.offset[0] = cssWidth / (2 * canvasInstance.ds.scale) - centerX;
+        canvasInstance.ds.offset[1] = cssHeight / (2 * canvasInstance.ds.scale) - centerY;
+        canvasInstance.setDirty(true, true);
+    }
+
     // Shared setup for a client-created node: instantiate, position at the triggering event (matching
     // stock onMenuAdd's own convertEventToCanvasOffset placement), and register a client-generated guid so
     // it round-trips through 存檔 correctly (see exportGraph's newNodes and GraphEditorState.ApplyAndSave,
@@ -911,17 +958,39 @@ window.storyForgeGraph = (function () {
     // whatever it returns immediately, with no way to await anything. processContextMenu is the entry point
     // one level up (called directly from processMouseDown on a right-click), so overriding it gives an
     // async foothold before the menu ever appears. A right-click on empty canvas or a slot (node is
-    // null/undefined) still falls through to the original — the empty-canvas case is already handled by the
-    // getCanvasMenuOptions patch above.
+    // null/undefined) goes to showCanvasContextMenu below, not the stock original — needed so the
+    // getCanvasMenuOptions patch's 新增節點/移動至群組 submenus can open on hover (see that function's own
+    // comment for why delegating to the original no longer works once that menu has submenus in it).
     function patchNodeContextMenu() {
-        const originalProcessContextMenu = LGraphCanvas.prototype.processContextMenu;
         LGraphCanvas.prototype.processContextMenu = function (node, event) {
-            if (!node)
-                return originalProcessContextMenu.call(this, node, event);
+            if (!node) {
+                showCanvasContextMenu(this, event);
+                return false;
+            }
 
             showNodeContextMenu(this, node, event);
             return false;
         };
+    }
+
+    // Reimplements stock processContextMenu's own null-node branch (confirmed by reading the vendored
+    // source: getCanvasMenuOptions() plus, when the click landed on top of a group, an appended "Edit Group"
+    // submenu built from graph.getGroupOnPos/getGroupMenuOptions) rather than delegating to it, purely to add
+    // autoopen:true — the ONLY way a submenu opens on hover instead of needing an extra click to expand.
+    // LiteGraph reads that flag once, off the top-level ContextMenu's own options, and threads it down to
+    // every nested submenu (new nested ContextMenu instances each get `autoopen: d.autoopen` from their
+    // parent) — there is no per-item way to request it, so it has to be set here, at top-level construction.
+    function showCanvasContextMenu(canvasInstance, event) {
+        const items = canvasInstance.getCanvasMenuOptions();
+        const group = canvasInstance.graph.getGroupOnPos(event.canvasX, event.canvasY);
+        if (group) {
+            items.push(null, {
+                content: "Edit Group",
+                has_submenu: true,
+                submenu: { title: "Group", extra: group, options: canvasInstance.getGroupMenuOptions(group) },
+            });
+        }
+        new LiteGraph.ContextMenu(items, { event: event, autoopen: true }, canvasInstance.getCanvasWindow());
     }
 
     // this.selected_nodes is already exactly right by the time this runs: LiteGraph's own (unpatched)
@@ -1562,6 +1631,37 @@ window.storyForgeGraph = (function () {
         canvas.setDirty(true, true);
     }
 
+    // Entry point for "跳到劇情節點" (PipelineStatusPanel's right-click menu) — that action switches the
+    // Blazor tab shell to 流程圖 *and* calls this in the same server-side round trip, but Home.razor's
+    // display:none -> block toggle for this canvas's wrapper div is applied by the browser asynchronously
+    // (a Blazor Server render batch over SignalR, not something the C# side can block on) — searchNode's own
+    // focusOnNode reads canvasEl.clientWidth/clientHeight live, which is still 0 while the wrapper is
+    // display:none, producing a garbage pan offset. Polling on requestAnimationFrame until the canvas
+    // actually has real dimensions (bounded so a canvas that's somehow never going to become visible can't
+    // spin forever) sidesteps guessing a fixed delay for how long that round trip takes.
+    function focusOnPlayscriptWhenVisible(query) {
+        return new Promise((resolve) => {
+            let attempts = 0;
+            function tryFocus() {
+                const canvasEl = canvas && canvas.canvas;
+                if (canvasEl && canvasEl.clientWidth > 0 && canvasEl.clientHeight > 0) {
+                    resolve(searchNode(query));
+                    return;
+                }
+
+                attempts++;
+                if (attempts > 60) {
+                    resolve(searchNode(query));
+                    return;
+                }
+
+                requestAnimationFrame(tryFocus);
+            }
+
+            tryFocus();
+        });
+    }
+
     // The only title renderer for both nodes and groups (their native LiteGraph titles are blanked at
     // creation) — drawn here, in onDrawOverlay's screen space, for three reasons found by hand:
     //  1. LiteGraph's own title draws at a fixed *world*-space size, so it shrinks with everything else
@@ -1783,6 +1883,7 @@ window.storyForgeGraph = (function () {
         updateSettings: updateSettings,
         updateNodeTitle: updateNodeTitle,
         searchNode: searchNode,
+        focusOnPlayscriptWhenVisible: focusOnPlayscriptWhenVisible,
         _debug: {
             getGraph: () => graph, getCanvas: () => canvas, guidByNode: () => guidByNode,
             lastMouseUpShiftKey: () => lastMouseUpShiftKey,

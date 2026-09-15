@@ -1,5 +1,4 @@
 using System.Globalization;
-using OfficeOpenXml;
 
 namespace StoryForge.Core.Codegen;
 
@@ -17,100 +16,32 @@ public sealed class GeneratedPlayscriptOutput
     public string Code { get; }
 }
 
-public sealed class CodeGenerationError
-{
-    public CodeGenerationError(string playscriptName, Exception exception)
-    {
-        PlayscriptName = playscriptName;
-        Exception = exception;
-    }
-
-    public string PlayscriptName { get; }
-    public Exception Exception { get; }
-    public string Message => $"{PlayscriptName}: {Exception.Message}";
-}
-
-public sealed class CodeGenerationResult
-{
-    public CodeGenerationResult(List<string> outputPaths, List<CodeGenerationError> errors)
-    {
-        OutputPaths = outputPaths;
-        Errors = errors;
-    }
-
-    public List<string> OutputPaths { get; }
-    public List<CodeGenerationError> Errors { get; }
-    public bool HasErrors => Errors.Count > 0;
-}
-
+// 「匯出成C#」的核心邏輯——輸入是 NodeScriptTableStore 本機 .md 劇本檔已經讀出來的列資料（欄位順序固定比照
+// NodeScriptTableStore.Headers：名字/表情/配音情緒/台詞/功能/備註/參數），不再像 WinForms 版那樣即時從
+// Google重新下載一份 xlsx——StoryForge 已經有自己的本機快取（下載Sheet劇本／上傳補完到Sheet 用的同一份
+// .md），沒有理由為了產生 C# 再重打一次網路、也不需要依賴 PlaylistIndex.xlsx 的 Spreadsheet ID 欄位。
+// Generate 本身是純函式（不寫檔）——呼叫端（PipelineStatusState）先呼叫這個算出程式碼與目標路徑，自行決定
+// 目標檔案已存在時要不要跳覆蓋確認，確定要寫入才呼叫 WriteGeneratedOutput。
 public static class PlayscriptFactoryCodeGenerator
 {
-    private static readonly HttpClient HttpClient = new();
+    private const int ColName = 0;
+    private const int ColExpression = 1;
+    private const int ColVoiceMood = 2;
+    private const int ColText = 3;
+    private const int ColFunction = 4;
+    private const int ColNote = 5;
+    private const int ColParameter = 6;
 
-    public static async Task<CodeGenerationResult> GenerateSelectedAsync(
-        string playscriptIndexPath,
-        IEnumerable<string> selectedPlayscripts,
-        EnumLabelMaps enumLabelMaps,
-        string outputRoot,
-        Action<int, int, string>? onProgress = null)
-    {
-        var selected = selectedPlayscripts
-            .Select(CodegenTextUtility.SanitizeText)
-            .Where(x => !string.IsNullOrEmpty(x))
-            .ToHashSet();
-
-        if (selected.Count == 0)
-            throw new InvalidOperationException("No playscripts selected.");
-
-        var rows = FindIndexRows(playscriptIndexPath, selected, out var missing);
-        var errors = missing
-            .Select(x => new CodeGenerationError(x, new InvalidOperationException("PlayscriptIndex row not found.")))
-            .ToList();
-        var outputs = new List<GeneratedPlayscriptOutput>();
-
-        for (var i = 0; i < rows.Count; i++)
-        {
-            var row = rows[i];
-            onProgress?.Invoke(i, rows.Count, row.PlayscriptName);
-
-            try
-            {
-                outputs.Add(await GenerateOutputAsync(row, enumLabelMaps, outputRoot));
-            }
-            catch (Exception e)
-            {
-                errors.Add(new CodeGenerationError(row.PlayscriptName, e));
-            }
-        }
-
-        var outputPaths = new List<string>();
-        foreach (var output in outputs)
-        {
-            try
-            {
-                WriteGeneratedOutput(output);
-                outputPaths.Add(output.OutputPath);
-            }
-            catch (Exception e)
-            {
-                errors.Add(new CodeGenerationError(output.PlayscriptName, e));
-            }
-        }
-
-        onProgress?.Invoke(rows.Count, rows.Count, string.Empty);
-        return new CodeGenerationResult(outputPaths, errors);
-    }
-
-    private static async Task<GeneratedPlayscriptOutput> GenerateOutputAsync(
-        IndexRow row, EnumLabelMaps enumLabelMaps, string outputRoot)
+    public static GeneratedPlayscriptOutput Generate(
+        string playscriptName, IReadOnlyList<string[]> rows, EnumLabelMaps enumLabelMaps, string outputRoot)
     {
         var code = PlayscriptTextReplacementUtility.ApplyCommonPlayscriptCharacterReplacements(
-            await GenerateFromSpreadsheetAsync(row, enumLabelMaps));
-        var outputPath = GetOutputPath(row.PlayscriptName, outputRoot);
-        return new GeneratedPlayscriptOutput(row.PlayscriptName, outputPath, code);
+            GenerateCode(playscriptName, rows, enumLabelMaps));
+        var outputPath = GetOutputPath(playscriptName, outputRoot);
+        return new GeneratedPlayscriptOutput(playscriptName, outputPath, code);
     }
 
-    private static void WriteGeneratedOutput(GeneratedPlayscriptOutput output)
+    public static void WriteGeneratedOutput(GeneratedPlayscriptOutput output)
     {
         var directory = Path.GetDirectoryName(output.OutputPath);
         if (!string.IsNullOrEmpty(directory))
@@ -119,82 +50,20 @@ public static class PlayscriptFactoryCodeGenerator
         File.WriteAllText(output.OutputPath, output.Code, System.Text.Encoding.UTF8);
     }
 
-    private static List<IndexRow> FindIndexRows(
-        string playscriptIndexPath, HashSet<string> selectedPlayscripts, out List<string> missing)
+    // Exposed so callers (PipelineStatusState's conflict-count estimate) can find out whether a playscript's
+    // generated file already exists on disk without generating its code first — the output path only depends
+    // on the playscript name, not on its row content.
+    public static string GetOutputPath(string playscriptName, string outputRoot)
     {
-        ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
-        var rows = new List<IndexRow>();
-
-        using (var package = new ExcelPackage(new FileInfo(playscriptIndexPath)))
-        {
-            foreach (var sheet in package.Workbook.Worksheets)
-            {
-                if (sheet?.Dimension == null
-                    || string.Equals(sheet.Name, "CONFIG", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var columns = GetColumns(sheet, "劇本名", "Spreadsheet ID", "連結");
-                for (var row = 2; row <= sheet.Dimension.End.Row; row++)
-                {
-                    var playscriptName = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["劇本名"]].Text);
-                    if (!selectedPlayscripts.Contains(playscriptName))
-                        continue;
-
-                    var linkCell = sheet.Cells[row, columns["連結"]];
-                    rows.Add(new IndexRow(
-                        playscriptName,
-                        CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["Spreadsheet ID"]].Text),
-                        CodegenTextUtility.SanitizeText(linkCell.Text),
-                        CodegenTextUtility.SanitizeText(linkCell.Hyperlink?.OriginalString)));
-                }
-            }
-        }
-
-        var found = rows.Select(x => x.PlayscriptName).ToHashSet();
-        missing = selectedPlayscripts.Where(x => !found.Contains(x)).ToList();
-        return rows;
+        var parsed = PlayscriptNameParser.Parse(playscriptName);
+        return Path.Combine(outputRoot, parsed.OutputFolderName, $"{parsed.ClassName}.cs");
     }
 
-    private static async Task<string> GenerateFromSpreadsheetAsync(IndexRow indexRow, EnumLabelMaps enumLabelMaps)
+    private static string GenerateCode(string playscriptName, IReadOnlyList<string[]> rows, EnumLabelMaps enumLabelMaps)
     {
-        var spreadsheetId = GetSpreadsheetId(indexRow);
-        if (string.IsNullOrEmpty(spreadsheetId))
-            throw new InvalidOperationException($"{indexRow.PlayscriptName} 缺少 Spreadsheet ID。");
-
-        var tempPath = await DownloadSpreadsheetAsync(spreadsheetId);
-        try
-        {
-            ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
-            using var package = new ExcelPackage(new FileInfo(tempPath));
-            var sheet = package.Workbook.Worksheets.FirstOrDefault();
-            if (sheet?.Dimension == null)
-                throw new InvalidOperationException($"{indexRow.PlayscriptName} 的劇本表沒有內容。");
-
-            return GenerateCode(indexRow.PlayscriptName, sheet, enumLabelMaps);
-        }
-        finally
-        {
-            if (File.Exists(tempPath))
-                File.Delete(tempPath);
-        }
-    }
-
-    private static async Task<string> DownloadSpreadsheetAsync(string spreadsheetId)
-    {
-        var tempPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.xlsx");
-        var url = $"https://docs.google.com/spreadsheets/d/{spreadsheetId}/export?format=xlsx";
-        await using var response = await HttpClient.GetStreamAsync(url);
-        await using var fileStream = File.Create(tempPath);
-        await response.CopyToAsync(fileStream);
-        return tempPath;
-    }
-
-    private static string GenerateCode(string playscriptLink, ExcelWorksheet sheet, EnumLabelMaps enumLabelMaps)
-    {
-        var parsed = PlayscriptNameParser.Parse(playscriptLink);
+        var parsed = PlayscriptNameParser.Parse(playscriptName);
         var nameSpace = parsed.NamespaceName;
-        var columns = GetColumns(sheet, "名字", "表情", "配音情緒", "台詞", "功能", "備註");
-        ValidateSheetRows(parsed.PlayscriptName, sheet, columns, enumLabelMaps);
+        ValidateSheetRows(parsed.PlayscriptName, rows, enumLabelMaps);
 
         var lines = new List<string>
         {
@@ -212,7 +81,7 @@ public static class PlayscriptFactoryCodeGenerator
             "",
             "        public override void Playscript()",
             "        {",
-            "            StartRpgRole();",
+            parsed.IsHScene ? "            StartVideoAndFadeOn();" : "            StartRpgRole();",
         };
 
         var currentPortrait = string.Empty;
@@ -222,19 +91,20 @@ public static class PlayscriptFactoryCodeGenerator
         var choiceLabels = new HashSet<string>();
         var autoKey = 100;
 
-        for (var row = 2; row <= sheet.Dimension.End.Row; row++)
+        for (var i = 0; i < rows.Count; i++)
         {
-            var name = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["名字"]].Text);
-            var expression = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["表情"]].Text);
+            var cells = rows[i];
+            var name = Cell(cells, ColName);
+            var expression = Cell(cells, ColExpression);
             if (string.IsNullOrEmpty(expression))
                 expression = "一般";
 
-            var voiceMood = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["配音情緒"]].Text);
-            var text = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["台詞"]].Text);
-            var function = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["功能"]].Text);
-            var note = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["備註"]].Text);
+            var voiceMood = Cell(cells, ColVoiceMood);
+            var text = Cell(cells, ColText);
+            var function = Cell(cells, ColFunction);
+            var note = Cell(cells, ColNote);
             var functionLower = function.ToLowerInvariant();
-            var parameter = GetParameter(sheet, row, columns);
+            var parameter = GetParameter(cells);
 
             // Button/Choice借用備註欄放跳轉 Label 是舊資料的相容路徑（見 ResolveChoiceLabel）——只有這種情況才
             // 不能把備註當一般註解印出來；一旦該列有填「參數」欄，備註就恢復成單純註解。
@@ -271,34 +141,35 @@ public static class PlayscriptFactoryCodeGenerator
             if (IsChoiceFunction(function))
             {
                 var choiceKey = 100;
-                while (row <= sheet.Dimension.End.Row)
+                while (i < rows.Count)
                 {
-                    var choiceFunction = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["功能"]].Text);
+                    var choiceCells = rows[i];
+                    var choiceFunction = Cell(choiceCells, ColFunction);
                     if (!IsChoiceFunction(choiceFunction))
                         break;
 
-                    var choiceText = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["台詞"]].Text);
-                    var choiceLabel = ResolveChoiceLabel(sheet, row, columns);
+                    var choiceText = Cell(choiceCells, ColText);
+                    var choiceLabel = ResolveChoiceLabel(choiceCells);
                     if (string.IsNullOrEmpty(choiceText) || string.IsNullOrEmpty(choiceLabel))
-                        throw new InvalidOperationException($"第 {row} 列選項缺少台詞或 Label。");
+                        throw new InvalidOperationException($"第 {i + 1} 列選項缺少台詞或 Label。");
 
                     choiceLabels.Add(choiceLabel);
                     lines.Add(
                         $"            Choice().Button({choiceKey}, \"{CodegenTextUtility.EscapeCSharpString(choiceText)}\", \"{CodegenTextUtility.EscapeCSharpString(choiceLabel)}\");");
                     choiceKey += 100;
-                    row++;
+                    i++;
                 }
 
                 lines.Add("            Choice().Stop();");
                 AddBlankLine(lines);
-                row--;
+                i--;
                 continue;
             }
 
             if (function == "Label")
             {
                 if (string.IsNullOrEmpty(parameter))
-                    throw new InvalidOperationException($"第 {row} 列 Label 缺少「參數」欄的 label 名稱。");
+                    throw new InvalidOperationException($"第 {i + 1} 列 Label 缺少「參數」欄的 label 名稱。");
                 lines.Add(choiceLabels.Contains(parameter)
                     ? $"            Choice().Label(\"{CodegenTextUtility.EscapeCSharpString(parameter)}\");"
                     : $"            Label(\"{CodegenTextUtility.EscapeCSharpString(parameter)}\");");
@@ -365,7 +236,7 @@ public static class PlayscriptFactoryCodeGenerator
             {
                 CloseDialogueIfNeeded(lines, ref dialogueOpened, ref currentPortrait, ref currentFace);
                 if (!float.TryParse(parameter, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
-                    throw new InvalidOperationException($"第 {row} 列 WaitSeconds 的參數欄不是合法秒數：「{parameter}」。");
+                    throw new InvalidOperationException($"第 {i + 1} 列 WaitSeconds 的參數欄不是合法秒數：「{parameter}」。");
                 lines.Add($"            WaitSeconds({seconds.ToString(CultureInfo.InvariantCulture)}f);");
                 continue;
             }
@@ -383,7 +254,7 @@ public static class PlayscriptFactoryCodeGenerator
                 var lobbyParts = SplitParameterValues(parameter);
                 if (lobbyParts.Length != 2)
                     throw new InvalidOperationException(
-                        $"第 {row} 列 TryAddLobby 的參數欄格式應為「大廳名稱;目標劇本名稱」（以分號分隔）。");
+                        $"第 {i + 1} 列 TryAddLobby 的參數欄格式應為「大廳名稱;目標劇本名稱」（以分號分隔）。");
                 lines.Add(
                     $"            TryAddLobby(\"{CodegenTextUtility.EscapeCSharpString(lobbyParts[0])}\", \"{CodegenTextUtility.EscapeCSharpString(lobbyParts[1])}\");");
                 continue;
@@ -453,11 +324,13 @@ public static class PlayscriptFactoryCodeGenerator
             dialogueOpened = true;
         }
 
-        lines.Add(parsed.ShouldEndRpgRoleWithoutFinish
-            ? "            EndRpgRoleWithoutFinish();"
-            : parsed.IsSideStory
-                ? "            EndRpgRole(false);"
-                : "            EndRpgRole();");
+        lines.Add(parsed.IsHScene
+            ? "            EndVideoAndFadeOff();"
+            : parsed.ShouldEndRpgRoleWithoutFinish
+                ? "            EndRpgRoleWithoutFinish();"
+                : parsed.IsSideStory
+                    ? "            EndRpgRole(false);"
+                    : "            EndRpgRole();");
 
         lines.Add("        }");
         lines.Add("    }");
@@ -466,21 +339,21 @@ public static class PlayscriptFactoryCodeGenerator
         return string.Join("\n", lines);
     }
 
-    private static void ValidateSheetRows(
-        string playscriptName, ExcelWorksheet sheet, Dictionary<string, int> columns, EnumLabelMaps enumLabelMaps)
+    private static void ValidateSheetRows(string playscriptName, IReadOnlyList<string[]> rows, EnumLabelMaps enumLabelMaps)
     {
         var errors = new List<string>();
         var rpgRoleEnabled = true;
 
-        for (var row = 2; row <= sheet.Dimension.End.Row; row++)
+        for (var i = 0; i < rows.Count; i++)
         {
-            var name = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["名字"]].Text);
-            var expression = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["表情"]].Text);
+            var cells = rows[i];
+            var name = Cell(cells, ColName);
+            var expression = Cell(cells, ColExpression);
             if (string.IsNullOrEmpty(expression))
                 expression = "一般";
 
-            var text = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["台詞"]].Text);
-            var function = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["功能"]].Text);
+            var text = Cell(cells, ColText);
+            var function = Cell(cells, ColFunction);
             var functionLower = function.ToLowerInvariant();
 
             if (functionLower == "norole")
@@ -498,28 +371,29 @@ public static class PlayscriptFactoryCodeGenerator
 
             if (IsChoiceFunction(function))
             {
-                while (row <= sheet.Dimension.End.Row)
+                while (i < rows.Count)
                 {
-                    var choiceFunction = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["功能"]].Text);
+                    var choiceCells = rows[i];
+                    var choiceFunction = Cell(choiceCells, ColFunction);
                     if (!IsChoiceFunction(choiceFunction))
                         break;
 
-                    var choiceText = CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["台詞"]].Text);
-                    var choiceLabel = ResolveChoiceLabel(sheet, row, columns);
+                    var choiceText = Cell(choiceCells, ColText);
+                    var choiceLabel = ResolveChoiceLabel(choiceCells);
                     if (string.IsNullOrEmpty(choiceText) || string.IsNullOrEmpty(choiceLabel))
-                        errors.Add($"Row {row}: Choice requires text and label.");
+                        errors.Add($"Row {i + 1}: Choice requires text and label.");
 
-                    row++;
+                    i++;
                 }
 
-                row--;
+                i--;
                 continue;
             }
 
             if (function == "Label")
             {
-                if (string.IsNullOrEmpty(GetParameter(sheet, row, columns)))
-                    errors.Add($"Row {row}: Label 缺少「參數」欄的 label 名稱。");
+                if (string.IsNullOrEmpty(GetParameter(cells)))
+                    errors.Add($"Row {i + 1}: Label 缺少「參數」欄的 label 名稱。");
                 continue;
             }
 
@@ -529,23 +403,23 @@ public static class PlayscriptFactoryCodeGenerator
 
             if (functionLower == "tryaddlobby")
             {
-                if (SplitParameterValues(GetParameter(sheet, row, columns)).Length != 2)
-                    errors.Add($"Row {row}: TryAddLobby 的參數欄格式應為「大廳名稱;目標劇本名稱」（以分號分隔）。");
+                if (SplitParameterValues(GetParameter(cells)).Length != 2)
+                    errors.Add($"Row {i + 1}: TryAddLobby 的參數欄格式應為「大廳名稱;目標劇本名稱」（以分號分隔）。");
                 continue;
             }
 
             if (functionLower is "upblock" or "downblock" or "leftblock" or "rightblock")
             {
                 if (!string.IsNullOrEmpty(name) && !enumLabelMaps.DialogNameMap.ContainsKey(name))
-                    errors.Add($"Row {row}: DialogName not found for name '{name}'.");
+                    errors.Add($"Row {i + 1}: DialogName not found for name '{name}'.");
                 continue;
             }
 
             if (functionLower == "waitseconds")
             {
-                var waitParameter = GetParameter(sheet, row, columns);
+                var waitParameter = GetParameter(cells);
                 if (!float.TryParse(waitParameter, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
-                    errors.Add($"Row {row}: WaitSeconds 的參數欄不是合法秒數：「{waitParameter}」。");
+                    errors.Add($"Row {i + 1}: WaitSeconds 的參數欄不是合法秒數：「{waitParameter}」。");
                 continue;
             }
 
@@ -553,11 +427,11 @@ public static class PlayscriptFactoryCodeGenerator
                 continue;
 
             if (!enumLabelMaps.DialogNameMap.ContainsKey(name))
-                errors.Add($"Row {row}: DialogName not found for name '{name}'.");
+                errors.Add($"Row {i + 1}: DialogName not found for name '{name}'.");
 
             if (rpgRoleEnabled && enumLabelMaps.PortraitMap.ContainsKey(name) &&
                 !enumLabelMaps.FaceMap.ContainsKey(expression))
-                errors.Add($"Row {row}: Face not found for expression '{expression}'.");
+                errors.Add($"Row {i + 1}: Face not found for expression '{expression}'.");
         }
 
         if (errors.Count > 0)
@@ -618,55 +492,6 @@ public static class PlayscriptFactoryCodeGenerator
         currentFace = string.Empty;
     }
 
-    private static Dictionary<string, int> GetColumns(ExcelWorksheet sheet, params string[] requiredNames)
-    {
-        var result = new Dictionary<string, int>();
-        for (var col = 1; col <= sheet.Dimension.End.Column; col++)
-        {
-            var header = CodegenTextUtility.SanitizeText(sheet.Cells[1, col].Text);
-            if (!string.IsNullOrEmpty(header))
-                result[header] = col;
-        }
-
-        foreach (var requiredName in requiredNames)
-        {
-            if (!result.ContainsKey(requiredName))
-                throw new InvalidOperationException($"{sheet.Name} 缺少欄位：{requiredName}");
-        }
-
-        return result;
-    }
-
-    private static string GetOutputPath(string playscriptLink, string outputRoot)
-    {
-        var parsed = PlayscriptNameParser.Parse(playscriptLink);
-        return Path.Combine(outputRoot, parsed.OutputFolderName, $"{parsed.ClassName}.cs");
-    }
-
-    private static string GetSpreadsheetId(IndexRow indexRow)
-    {
-        var fromLink = ExtractSpreadsheetId(indexRow.LinkUrl);
-        return string.IsNullOrEmpty(fromLink) ? indexRow.SpreadsheetId : fromLink;
-    }
-
-    private static string ExtractSpreadsheetId(string? url)
-    {
-        var clean = CodegenTextUtility.SanitizeText(url);
-        const string marker = "/d/";
-        var markerIndex = clean.IndexOf(marker, StringComparison.Ordinal);
-        if (markerIndex < 0)
-            return string.Empty;
-
-        var startIndex = markerIndex + marker.Length;
-        var endIndex = clean.IndexOf('/', startIndex);
-        if (endIndex < 0)
-            endIndex = clean.IndexOf('?', startIndex);
-        if (endIndex < 0)
-            endIndex = clean.Length;
-
-        return clean.Substring(startIndex, endIndex - startIndex);
-    }
-
     // "選項"/"Choice" are legacy aliases from before the dropdown had a real option for this — the sheet's
     // actual "功能" dropdown value for a multi-row choice block is "Button".
     private static bool IsChoiceFunction(string value)
@@ -698,15 +523,14 @@ public static class PlayscriptFactoryCodeGenerator
         return $"\"{escaped}\"";
     }
 
-    // "參數" is an optional column (see GooglePlayscriptSheetClient.DownloadScriptTableAsync) added after
-    // the "功能" dropdown's existing values were already in use — a playscript spreadsheet created before
-    // it exists simply doesn't have the column.
-    private static string GetParameter(ExcelWorksheet sheet, int row, Dictionary<string, int> columns)
-    {
-        return columns.TryGetValue("參數", out var parameterColumn)
-            ? CodegenTextUtility.SanitizeText(sheet.Cells[row, parameterColumn].Text)
-            : string.Empty;
-    }
+    private static string Cell(string[] cells, int index) =>
+        index >= 0 && index < cells.Length ? CodegenTextUtility.SanitizeText(cells[index]) : string.Empty;
+
+    // "參數" is an optional column on the remote sheet template (see GooglePlayscriptSheetClient.
+    // DownloadScriptTableAsync) but NodeScriptTableStore always writes/reads a fixed 7-column local .md, so
+    // it's always at ColParameter here regardless of whether the remote sheet that originally fed it had the
+    // column at all.
+    private static string GetParameter(string[] cells) => Cell(cells, ColParameter);
 
     // Functions that need more than one value (currently only TryAddLobby) pack them all into "參數" as
     // "value1;value2" rather than splitting across "台詞"/"參數" — 分號 (semicolon) separated.
@@ -721,12 +545,10 @@ public static class PlayscriptFactoryCodeGenerator
 
     // Button/Choice's jump-target label used to be written into "備註" (there was nowhere else to put it);
     // that still works for a row with no "參數" value, but "參數" wins when both are present.
-    private static string ResolveChoiceLabel(ExcelWorksheet sheet, int row, Dictionary<string, int> columns)
+    private static string ResolveChoiceLabel(string[] cells)
     {
-        var parameter = GetParameter(sheet, row, columns);
-        return !string.IsNullOrEmpty(parameter)
-            ? parameter
-            : CodegenTextUtility.SanitizeText(sheet.Cells[row, columns["備註"]].Text);
+        var parameter = GetParameter(cells);
+        return !string.IsNullOrEmpty(parameter) ? parameter : Cell(cells, ColNote);
     }
 
     private static string BuildChatNameLiteral(string name, EnumLabelMaps enumLabelMaps)
@@ -734,21 +556,5 @@ public static class PlayscriptFactoryCodeGenerator
         return enumLabelMaps.ChatNameMap.TryGetValue(name, out var chatName)
             ? $"ChatName.{chatName}"
             : $"\"{CodegenTextUtility.EscapeCSharpString(name)}\"";
-    }
-
-    private sealed class IndexRow
-    {
-        public IndexRow(string playscriptName, string spreadsheetId, string linkText, string linkUrl)
-        {
-            PlayscriptName = playscriptName;
-            SpreadsheetId = spreadsheetId;
-            LinkText = string.IsNullOrEmpty(linkText) ? playscriptName : linkText;
-            LinkUrl = linkUrl;
-        }
-
-        public string PlayscriptName { get; }
-        public string SpreadsheetId { get; }
-        public string LinkText { get; }
-        public string LinkUrl { get; }
     }
 }

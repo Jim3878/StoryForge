@@ -5,12 +5,15 @@
 @inject PipelineStatusState State
 @inject IJSRuntime JS
 @inject ReloadCoordinator ReloadCoordinator
+@inject StoryForge.Web.FlowGraphFocusCoordinator FlowGraphFocusCoordinator
 
 <div class="ps-page">
     <div class="ps-toolbar">
         <button @onclick="Refresh">重新整理</button>
         <button @onclick="BuildNodeFiles">建立劇本檔</button>
         <button @onclick="DownloadSheetScripts" disabled="@State.IsSheetScriptDownloadRunning">下載Sheet劇本</button>
+        <button @onclick="RequestUpload" disabled="@(State.IsUploadRunning || _selectedNames.Count == 0)">上傳補完到Sheet</button>
+        <button @onclick="ExportCSharp" disabled="@(State.IsCSharpExportRunning || _selectedNames.Count == 0)">匯出成C#</button>
         <button @onclick="DownloadSheet">讀取Sheet資料</button>
         <details class="ps-chapter-filter">
             <summary>章節篩選 (@_selectedChapters.Count/@AllChapters.Count)</summary>
@@ -40,6 +43,32 @@
             </span>
         </div>
     }
+    @if (State.IsUploadRunning)
+    {
+        <div class="ps-progress-wrap">
+            <div class="ps-progress-bar"><div class="ps-progress-fill" style="width:@(UploadProgressPercent)%"></div></div>
+            <span class="ps-progress-text">
+                上傳中 @State.UploadProcessedCount / @State.UploadQueueTotal
+                @if (!string.IsNullOrEmpty(State.UploadCurrentName))
+                {
+                    <text> — @State.UploadCurrentName</text>
+                }
+            </span>
+        </div>
+    }
+    @if (State.IsCSharpExportRunning)
+    {
+        <div class="ps-progress-wrap">
+            <div class="ps-progress-bar"><div class="ps-progress-fill" style="width:@(CSharpExportProgressPercent)%"></div></div>
+            <span class="ps-progress-text">
+                匯出C#中 @State.CSharpExportProcessedCount / @State.CSharpExportQueueTotal
+                @if (!string.IsNullOrEmpty(State.CSharpExportCurrentName))
+                {
+                    <text> — @State.CSharpExportCurrentName</text>
+                }
+            </span>
+        </div>
+    }
     <div class="ps-grid-wrap">
         <table class="ps-grid">
             <thead>
@@ -50,17 +79,24 @@
                     </th>
                     @foreach (var col in _columns)
                     {
-                        <th @key="col.Key" class="@GetCellClass(col.Key)" title="拖曳可調整欄位順序">@col.Label</th>
+                        <th @key="col.Key" class="@GetCellClass(col.Key)" title="點擊可排序，拖曳可調整欄位順序"
+                            @onclick="() => OnColumnHeaderClicked(col.Key)">
+                            @col.Label
+                            @if (_sortColumn == col.Key)
+                            {
+                                <span class="ps-sort-indicator">@(_sortDescending ? "▼" : "▲")</span>
+                            }
+                        </th>
                     }
                 </tr>
             </thead>
             <tbody>
                 @foreach (var row in FilteredRows)
                 {
-                    <tr>
+                    <tr @oncontextmenu="e => OnRowContextMenu(e, row)" @oncontextmenu:preventDefault="true">
                         <td class="ps-select-col">
                             <input type="checkbox" checked="@_selectedNames.Contains(row.PlayscriptName)"
-                                   @onchange="e => ToggleRowSelected(row.PlayscriptName, e)" />
+                                   @onclick="e => OnRowCheckboxClicked(row, e)" @onclick:preventDefault="true" />
                         </td>
                         @foreach (var col in _columns)
                         {
@@ -76,6 +112,18 @@
         }
     </div>
 </div>
+
+@if (_contextMenuRow is { } contextMenuRow)
+{
+    <div class="ps-context-menu-backdrop" @onclick="CloseContextMenu"
+         @oncontextmenu="CloseContextMenu" @oncontextmenu:preventDefault="true"></div>
+    <div class="ps-context-menu" style="left:@(_contextMenuX)px; top:@(_contextMenuY)px">
+        <button disabled="@(!contextMenuRow.HasLocalScriptFile)" @onclick="OpenLocalScriptFileFromMenu">開啟本地劇本檔</button>
+        <button disabled="@(!contextMenuRow.IsOnGraph)" @onclick="JumpToGraphNodeFromMenu">跳到劇情節點</button>
+        <button disabled="@(!contextMenuRow.IsOnCSharp)" @onclick="OpenCSharpFileFromMenu">開啟C#檔</button>
+        <button disabled="@(!contextMenuRow.IsOnLdtk)" @onclick="LocateInLdtkFromMenu">定位到LDtk</button>
+    </div>
+}
 
 @if (State.PendingConflict is { } conflict)
 {
@@ -109,6 +157,27 @@
                 {
                     <button @onclick='() => ResolveScriptFileConflict(SheetScriptConflictChoice.OverwriteRemaining)'>覆蓋接下來的 @scriptConflict.RemainingConflictCount 個</button>
                     <button @onclick='() => ResolveScriptFileConflict(SheetScriptConflictChoice.SkipRemaining)'>略過接下來的 @scriptConflict.RemainingConflictCount 個</button>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+@if (State.PendingCSharpExportConflict is { } cSharpConflict)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>C#檔案已存在</h3>
+            <p>劇本「@cSharpConflict.PlayscriptName」本機已經有產生過的 .cs 檔案，要用這次的內容覆蓋它嗎？</p>
+            <p class="ps-conflict-warning">如果這個C#檔案裡有劇本表無法表達、額外手動加上去的程式碼（例如走位、鏡頭等），覆蓋後會永久遺失。</p>
+            <div class="ps-modal-actions">
+                <button @onclick="OpenPendingCSharpExportFile" style="margin-right:auto">開啟C#檔案</button>
+                <button @onclick='() => ResolveCSharpExportConflict(SheetScriptConflictChoice.OverwriteOne)'>覆蓋這個</button>
+                <button @onclick='() => ResolveCSharpExportConflict(SheetScriptConflictChoice.SkipOne)'>略過這個</button>
+                @if (cSharpConflict.RemainingConflictCount > 0)
+                {
+                    <button @onclick='() => ResolveCSharpExportConflict(SheetScriptConflictChoice.OverwriteRemaining)'>覆蓋接下來的 @cSharpConflict.RemainingConflictCount 個檔案</button>
+                    <button @onclick='() => ResolveCSharpExportConflict(SheetScriptConflictChoice.SkipRemaining)'>略過接下來的 @cSharpConflict.RemainingConflictCount 個檔案</button>
                 }
             </div>
         </div>
@@ -149,6 +218,94 @@
     </div>
 }
 
+@if (_pendingUploadNames is { } pendingUpload)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>上傳補完到Sheet</h3>
+            <p>即將處理以下 @pendingUpload.Count 個劇本（視情況補索引列、建立專屬Sheet、覆蓋上傳本機劇本檔內容）：</p>
+            <div class="ps-result-list">
+                @foreach (var name in pendingUpload)
+                {
+                    <div class="ps-result-row">@name</div>
+                }
+            </div>
+            <div class="ps-modal-actions">
+                <button @onclick="CancelUpload">取消</button>
+                <button @onclick="ConfirmUpload">確定上傳</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (State.UploadResults is { } uploadResults)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>上傳結果</h3>
+            @if (uploadResults.Count == 0)
+            {
+                <p>全部劇本都已成功上傳。</p>
+            }
+            else
+            {
+                <p>以下 @uploadResults.Count 個劇本上傳失敗：</p>
+                <div class="ps-result-list">
+                    @foreach (var failure in uploadResults)
+                    {
+                        <div class="ps-result-row"><b>@failure.PlayscriptName</b> — @failure.Reason</div>
+                    }
+                </div>
+            }
+            <div class="ps-modal-actions">
+                @if (!string.IsNullOrEmpty(_uploadCopyFeedback))
+                {
+                    <span class="ps-copy-feedback">@_uploadCopyFeedback</span>
+                }
+                @if (uploadResults.Count > 0)
+                {
+                    <button @onclick="CopyUploadResultsToClipboard">複製結果</button>
+                }
+                <button @onclick="CloseUploadResults">關閉</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (State.CSharpExportResults is { } cSharpResults)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>匯出成C#結果</h3>
+            @if (cSharpResults.Count == 0)
+            {
+                <p>全部劇本都已成功匯出成C#。</p>
+            }
+            else
+            {
+                <p>以下 @cSharpResults.Count 個劇本無法匯出：</p>
+                <div class="ps-result-list">
+                    @foreach (var failure in cSharpResults)
+                    {
+                        <div class="ps-result-row"><b>@failure.PlayscriptName</b> — @failure.Reason</div>
+                    }
+                </div>
+            }
+            <div class="ps-modal-actions">
+                @if (!string.IsNullOrEmpty(_cSharpExportCopyFeedback))
+                {
+                    <span class="ps-copy-feedback">@_cSharpExportCopyFeedback</span>
+                }
+                @if (cSharpResults.Count > 0)
+                {
+                    <button @onclick="CopyCSharpExportResultsToClipboard">複製結果</button>
+                }
+                <button @onclick="CloseCSharpExportResults">關閉</button>
+            </div>
+        </div>
+    </div>
+}
+
 <style>
     .ps-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; background: #262626; }
     .ps-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1e1e1e; border-bottom: 1px solid #333; }
@@ -164,6 +321,7 @@
     .ps-grid { width: 100%; border-collapse: collapse; font-size: 13px; }
     .ps-grid th { position: sticky; top: 0; background: #1e1e1e; text-align: left; padding: 6px 10px; border-bottom: 1px solid #333; cursor: grab; user-select: none; }
     .ps-grid th.ps-check { text-align: center; }
+    .ps-sort-indicator { margin-left: 4px; opacity: 0.8; font-size: 11px; }
     .ps-grid td { padding: 5px 10px; border-bottom: 1px solid #2e2e2e; }
     .ps-grid tr:hover td { background: #2f2f2f; }
     .ps-name { word-break: break-all; }
@@ -187,11 +345,24 @@
         display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
     }
     .ps-modal h3 { margin: 0; }
+    .ps-conflict-warning { color: #e0a83c; font-size: 12px; margin: -4px 0 0; }
     .ps-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
     .ps-result-list { overflow-y: auto; max-height: 40vh; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 10px; }
     .ps-result-row { padding: 3px 0; font-size: 13px; border-bottom: 1px solid #333; }
     .ps-result-row:last-child { border-bottom: none; }
     .ps-copy-feedback { align-self: center; font-size: 12px; opacity: 0.8; margin-right: auto; }
+
+    .ps-context-menu-backdrop { position: fixed; inset: 0; z-index: 1100; }
+    .ps-context-menu {
+        position: fixed; z-index: 1101; background: #2a2a2a; border: 1px solid #444; border-radius: 4px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.5); padding: 4px 0; min-width: 170px; font-size: 13px;
+    }
+    .ps-context-menu button {
+        display: block; width: 100%; text-align: left; padding: 7px 14px; background: none; border: none;
+        color: #ddd; cursor: pointer; font: inherit;
+    }
+    .ps-context-menu button:hover:not(:disabled) { background: #3a3a3a; }
+    .ps-context-menu button:disabled { color: #666; cursor: default; }
 </style>
 
 @code {
@@ -228,6 +399,38 @@
     // dialog is dismissed so it never lingers into the next batch's dialog.
     private string? _copyFeedback;
 
+    // "上傳補完到Sheet"'s pre-flight confirm list — a snapshot of _selectedNames taken when the button is
+    // clicked, shown in a plain name list (no per-row detail; a chapter-sized batch is too long to read a
+    // categorized breakdown of) so the user can back out before anything is actually sent. Purely panel-local
+    // UI state: State only needs to know about the batch once the user has actually confirmed it.
+    private List<string>? _pendingUploadNames;
+    private string? _uploadCopyFeedback;
+    private string? _cSharpExportCopyFeedback;
+
+    // Shift-click range-select anchor — the last row a plain (non-shift) checkbox click landed on, and the
+    // state that click left it in. A shift-click applies that same state to every row between the anchor
+    // and the shift-clicked row (inclusive), regardless of what state those rows or the shift-clicked row
+    // itself were in beforehand — not a per-row toggle. Only ever moved by a plain click; a shift-click never
+    // becomes the new anchor, so repeated shift-clicks keep extending/shrinking the range from the same
+    // fixed starting point (standard Explorer/Gmail-style range select).
+    private string? _lastClickedRowName;
+    private bool _lastClickedRowState;
+
+    // Column header click-to-sort. Null = unsorted (natural PlaylistPipelineComparer order). Independent of
+    // the header's own drag-to-reorder (storyForgeColumnSort.init/SortableJS) — a plain click (no pointer
+    // movement) never starts a SortableJS drag, so both gestures coexist on the same <th> without conflict.
+    private string? _sortColumn;
+    private bool _sortDescending;
+
+    // Right-click context menu — always targets whatever row the cursor was over when it opened, entirely
+    // independent of the checkbox selection above (mirrors the original WinForms grid's own single-row
+    // CurrentRow-based context menu, which predates this port's checkbox multi-select concept). Screen
+    // coordinates (MouseEventArgs.Client{X,Y}) pair with position:fixed in the menu's own CSS, so no scroll
+    // offset math is needed.
+    private PipelineStatusRow? _contextMenuRow;
+    private double _contextMenuX;
+    private double _contextMenuY;
+
     // Chapters newly seen on a refresh default to selected so a refresh never silently hides new data —
     // matching the original tool's own ChapterFilterSettings behavior — but a chapter the user has
     // manually deselected stays deselected across refreshes (tracked via _knownChapters).
@@ -247,14 +450,67 @@
 
     private bool AllSelected => AllChapters.Count > 0 && AllChapters.All(_selectedChapters.Contains);
 
-    private IEnumerable<PipelineStatusRow> FilteredRows =>
-        State.Rows
-            .Where(r => _selectedChapters.Contains(r.Chapter))
-            .Where(r => string.IsNullOrWhiteSpace(_searchText) ||
-                        r.PlayscriptName.Contains(_searchText, StringComparison.OrdinalIgnoreCase));
+    private IEnumerable<PipelineStatusRow> FilteredRows
+    {
+        get
+        {
+            var rows = State.Rows
+                .Where(r => _selectedChapters.Contains(r.Chapter))
+                .Where(r => string.IsNullOrWhiteSpace(_searchText) ||
+                            r.PlayscriptName.Contains(_searchText, StringComparison.OrdinalIgnoreCase));
+
+            return ApplySort(rows);
+        }
+    }
+
+    // A boolean/check column sorts unchecked-before-checked ascending (false < true) — grouping "still
+    // missing this" rows together is the actual point of sorting a check column at all. Ties keep their
+    // original relative order either direction (OrderBy/OrderByDescending are both stable sorts), so sorting
+    // by a mostly-uniform column like 章節 doesn't scramble the secondary 劇本名稱 ordering rows already had.
+    private IEnumerable<PipelineStatusRow> ApplySort(IEnumerable<PipelineStatusRow> rows)
+    {
+        if (_sortColumn == null)
+            return rows;
+
+        IOrderedEnumerable<PipelineStatusRow> OrderedBy<TKey>(
+            Func<PipelineStatusRow, TKey> keySelector, IComparer<TKey>? comparer = null) =>
+            _sortDescending
+                ? rows.OrderByDescending(keySelector, comparer)
+                : rows.OrderBy(keySelector, comparer);
+
+        return _sortColumn switch
+        {
+            "chapter" => OrderedBy(r => r.Chapter, NaturalStringComparer.Instance),
+            "name" => OrderedBy(r => r.PlayscriptName, NaturalStringComparer.Instance),
+            "ldtk" => OrderedBy(r => r.IsOnLdtk),
+            "graph" => OrderedBy(r => r.IsOnGraph),
+            "localScript" => OrderedBy(r => r.HasLocalScriptFile),
+            "sheetDir" => OrderedBy(r => r.IsOnSheet),
+            "sheetFile" => OrderedBy(r => r.HasSheetFile),
+            "csharp" => OrderedBy(r => r.IsOnCSharp),
+            _ => rows,
+        };
+    }
+
+    private void OnColumnHeaderClicked(string columnKey)
+    {
+        if (_sortColumn == columnKey)
+            _sortDescending = !_sortDescending;
+        else
+        {
+            _sortColumn = columnKey;
+            _sortDescending = false;
+        }
+    }
 
     private double SheetScriptProgressPercent =>
         State.SheetScriptQueueTotal == 0 ? 0 : 100.0 * State.SheetScriptProcessedCount / State.SheetScriptQueueTotal;
+
+    private double UploadProgressPercent =>
+        State.UploadQueueTotal == 0 ? 0 : 100.0 * State.UploadProcessedCount / State.UploadQueueTotal;
+
+    private double CSharpExportProgressPercent =>
+        State.CSharpExportQueueTotal == 0 ? 0 : 100.0 * State.CSharpExportProcessedCount / State.CSharpExportQueueTotal;
 
     private bool AllVisibleRowsSelected
     {
@@ -269,6 +525,8 @@
     {
         ReloadCoordinator.Subscribe(OnReload);
         State.OnSheetScriptProgress += OnSheetScriptProgress;
+        State.OnUploadProgress += OnUploadProgress;
+        State.OnCSharpExportProgress += OnCSharpExportProgress;
     }
 
     // Deferred to firstRender rather than done in OnInitialized: GraphEditorState's model (this panel's
@@ -325,6 +583,8 @@
     {
         ReloadCoordinator.Unsubscribe(OnReload);
         State.OnSheetScriptProgress -= OnSheetScriptProgress;
+        State.OnUploadProgress -= OnUploadProgress;
+        State.OnCSharpExportProgress -= OnCSharpExportProgress;
         _selfRef?.Dispose();
     }
 
@@ -351,6 +611,76 @@
     private async Task DownloadSheetScripts()
     {
         await State.StartSheetScriptDownloadAsync(_selectedNames);
+    }
+
+    // Snapshots the current checkbox selection into the confirm dialog rather than starting the batch
+    // immediately — button is already disabled when _selectedNames is empty, so this is never called with
+    // nothing to confirm.
+    private void RequestUpload()
+    {
+        _pendingUploadNames = _selectedNames.ToList();
+    }
+
+    private void CancelUpload()
+    {
+        _pendingUploadNames = null;
+    }
+
+    private async Task ConfirmUpload()
+    {
+        var names = _pendingUploadNames;
+        _pendingUploadNames = null;
+        if (names != null)
+            await State.StartUploadAsync(names);
+    }
+
+    private async Task ExportCSharp()
+    {
+        // Names State drops up front for having no local content at all never got queued, so there's
+        // nothing left in the batch to report a failure for them — remove them from the selection too,
+        // rather than leaving them checked (and invisible/unreachable the moment the current chapter
+        // filter/search no longer shows them) only to trigger the exact same drop again next time.
+        var excluded = await State.StartCSharpExportAsync(_selectedNames);
+        foreach (var name in excluded)
+            _selectedNames.Remove(name);
+    }
+
+    private async Task ResolveCSharpExportConflict(SheetScriptConflictChoice choice)
+    {
+        await State.ResolveCSharpExportConflictAsync(choice);
+    }
+
+    private void OpenPendingCSharpExportFile()
+    {
+        State.OpenPendingCSharpExportFile();
+    }
+
+    private void OnCSharpExportProgress()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void CloseCSharpExportResults()
+    {
+        State.DismissCSharpExportResults();
+        _cSharpExportCopyFeedback = null;
+    }
+
+    private async Task CopyCSharpExportResultsToClipboard()
+    {
+        if (State.CSharpExportResults is not { } results || results.Count == 0)
+            return;
+
+        var text = string.Join("\n", results.Select(r => $"{r.PlayscriptName} — {r.Reason}"));
+        try
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+            _cSharpExportCopyFeedback = "已複製到剪貼簿";
+        }
+        catch (Exception)
+        {
+            _cSharpExportCopyFeedback = "複製失敗，請手動選取上方清單文字複製";
+        }
     }
 
     private async Task ResolveConflict(SheetScriptConflictChoice choice)
@@ -396,6 +726,34 @@
         InvokeAsync(StateHasChanged);
     }
 
+    private void OnUploadProgress()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void CloseUploadResults()
+    {
+        State.DismissUploadResults();
+        _uploadCopyFeedback = null;
+    }
+
+    private async Task CopyUploadResultsToClipboard()
+    {
+        if (State.UploadResults is not { } results || results.Count == 0)
+            return;
+
+        var text = string.Join("\n", results.Select(r => $"{r.PlayscriptName} — {r.Reason}"));
+        try
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+            _uploadCopyFeedback = "已複製到剪貼簿";
+        }
+        catch (Exception)
+        {
+            _uploadCopyFeedback = "複製失敗，請手動選取上方清單文字複製";
+        }
+    }
+
     private void ToggleAllVisibleRows(ChangeEventArgs e)
     {
         var check = e.Value is bool b && b;
@@ -408,13 +766,89 @@
         }
     }
 
-    private void ToggleRowSelected(string playscriptName, ChangeEventArgs e)
+    // Driven by @onclick rather than @onchange — only MouseEventArgs (not ChangeEventArgs) carries ShiftKey,
+    // which the range-select behavior below needs. @onclick:preventDefault on the checkbox (see markup) stops
+    // the browser's own native check/uncheck from ever happening on click — without it, a shift-click that
+    // recomputes a row back to the SAME state it already had (e.g. re-checking a row that's already checked)
+    // is, from Blazor's own diffing perspective, "no change" to the rendered checked="@expr" attribute, so
+    // Blazor never re-pushes it to the DOM — but the browser had already toggled that checkbox's native state
+    // as the click's default action before this handler even ran, leaving it visually wrong (unchecked) while
+    // _selectedNames still correctly has it. Suppressing the native toggle entirely makes the server-rendered
+    // checked="@_selectedNames.Contains(...)" the only thing that ever changes the checkbox's displayed state.
+    private void OnRowCheckboxClicked(PipelineStatusRow row, MouseEventArgs e)
     {
-        var check = e.Value is bool b && b;
-        if (check)
-            _selectedNames.Add(playscriptName);
+        var newState = !_selectedNames.Contains(row.PlayscriptName);
+
+        if (e.ShiftKey && _lastClickedRowName != null)
+        {
+            var visibleNames = FilteredRows.Select(r => r.PlayscriptName).ToList();
+            var anchorIndex = visibleNames.IndexOf(_lastClickedRowName);
+            var targetIndex = visibleNames.IndexOf(row.PlayscriptName);
+
+            if (anchorIndex >= 0 && targetIndex >= 0)
+            {
+                var from = Math.Min(anchorIndex, targetIndex);
+                var to = Math.Max(anchorIndex, targetIndex);
+                for (var i = from; i <= to; i++)
+                {
+                    if (_lastClickedRowState)
+                        _selectedNames.Add(visibleNames[i]);
+                    else
+                        _selectedNames.Remove(visibleNames[i]);
+                }
+
+                // Deliberately doesn't move the anchor — see _lastClickedRowName's own comment.
+                return;
+            }
+        }
+
+        if (newState)
+            _selectedNames.Add(row.PlayscriptName);
         else
-            _selectedNames.Remove(playscriptName);
+            _selectedNames.Remove(row.PlayscriptName);
+
+        _lastClickedRowName = row.PlayscriptName;
+        _lastClickedRowState = newState;
+    }
+
+    private void OnRowContextMenu(MouseEventArgs e, PipelineStatusRow row)
+    {
+        _contextMenuRow = row;
+        _contextMenuX = e.ClientX;
+        _contextMenuY = e.ClientY;
+    }
+
+    private void CloseContextMenu()
+    {
+        _contextMenuRow = null;
+    }
+
+    private void OpenLocalScriptFileFromMenu()
+    {
+        if (_contextMenuRow is { } row)
+            State.OpenLocalScriptFile(row.PlayscriptName);
+        CloseContextMenu();
+    }
+
+    private void OpenCSharpFileFromMenu()
+    {
+        if (_contextMenuRow is { } row)
+            State.OpenCSharpFile(row.PlayscriptName);
+        CloseContextMenu();
+    }
+
+    private async Task JumpToGraphNodeFromMenu()
+    {
+        if (_contextMenuRow is { } row)
+            await FlowGraphFocusCoordinator.RequestFocusAsync(row.PlayscriptName);
+        CloseContextMenu();
+    }
+
+    private void LocateInLdtkFromMenu()
+    {
+        if (_contextMenuRow is { } row)
+            State.LocateInLdtk(row.PlayscriptName);
+        CloseContextMenu();
     }
 
     private void SyncChapterSelection()

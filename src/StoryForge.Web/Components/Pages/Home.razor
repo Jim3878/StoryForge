@@ -1,5 +1,7 @@
 @page "/"
 @using StoryForge.Web.Components.Panels
+@implements IDisposable
+@inject FlowGraphFocusCoordinator FlowGraphFocusCoordinator
 
 @* The "分頁" layer between MainLayout's global 工具列 and each panel's own 分頁工具列 (流程圖's
    重新載入/存檔/縮放至全部, 角色卡's 新增角色/刪除角色). Both panels are ALWAYS rendered — switching
@@ -55,5 +57,25 @@
     private void SetTab(string tab)
     {
         _activeTab = tab;
+    }
+
+    protected override void OnInitialized()
+    {
+        FlowGraphFocusCoordinator.SubscribeTabActivation(ActivateGraphTab);
+    }
+
+    // "跳到劇情節點"'s tab-switch half — see FlowGraphFocusCoordinator for why this and FlowGraphPanel's own
+    // focus handler are two separate steps run in a fixed order rather than one. InvokeAsync(StateHasChanged)
+    // (not a bare StateHasChanged()) since this runs from an event raised by PipelineStatusPanel's own
+    // click-handler Task, same reasoning as every other cross-panel callback in this app.
+    private Task ActivateGraphTab()
+    {
+        _activeTab = "graph";
+        return InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        FlowGraphFocusCoordinator.UnsubscribeTabActivation(ActivateGraphTab);
     }
 }

@@ -100,75 +100,6 @@ public sealed class GraphEditorState
         }
     }
 
-    // One-off / repeatable bridge for the parallel-development period (see CLAUDE.md — the old WinForms
-    // tool and this web port are developed side by side): pulls the old tool's own flow-graph resume file
-    // into this tool's own session.json and reloads the live model from it. That file lives inside the
-    // Unity project root itself ("<root>/PlayscriptOfflineTool/session.json", from the old tool's own
-    // ProcessGraphPanel — a leftover of it living inside the Unity project) — a completely different
-    // location than what LegacyToolMigration handles (that one only covers %LocalAppData%
-    // \PlayscriptOfflineTool\*.json). Not gated to run once like that migration is: the user may keep
-    // using the old tool for a while yet and want to re-pull its latest edits more than once. The
-    // GraphSessionDocument/GraphSessionNode/Edge/Group schema is identical between the two tools (same
-    // field names, no $type metadata) — the old tool still writes one unified file (it isn't getting the
-    // node/connection split, since it's being retired), with edges inline under "Edges" the same way
-    // this tool's own session.json used to before the split. So the old file deserializes here with no
-    // node/group conversion, but its edges are pulled out into a GraphConnectionsDocument the same way
-    // LoadGraph's own migration path handles a pre-split session.json. It's run through the normal
-    // GraphDocumentModel.LoadFromSession reconciliation against the current schema rather than copied as
-    // raw bytes, so anything Unity's schema no longer recognizes gets handled the same way a normal resume
-    // would. The current session.json/connections.json are backed up first (not silently clobbered) since
-    // this fully replaces whatever this tool already had.
-    public GraphEditorPayload ImportLegacySession()
-    {
-        try
-        {
-            var projectRoot = ProjectPaths.ResolveUnityProjectRoot();
-            var legacySessionPath = Path.Combine(projectRoot, "PlayscriptOfflineTool", "session.json");
-            if (!File.Exists(legacySessionPath))
-                throw new FileNotFoundException("找不到舊版 PlayscriptOfflineTool 的流程圖存檔。", legacySessionPath);
-
-            var legacyRoot = JObject.Parse(File.ReadAllText(legacySessionPath));
-            var legacySession = legacyRoot.ToObject<GraphSessionDocument>()
-                                 ?? throw new InvalidDataException("舊版流程圖存檔格式無法解析。");
-            var legacyEdges = legacyRoot["Edges"]?.ToObject<List<GraphSessionEdge>>() ?? new List<GraphSessionEdge>();
-            var legacyConnections = new GraphConnectionsDocument
-            {
-                SavedAtUtc = legacySession.SavedAtUtc,
-                Edges = legacyEdges,
-            };
-
-            var assetsRoot = Path.Combine(projectRoot, "Assets");
-            var schemaJsonPath = Path.Combine(assetsRoot, "06.Definition", "PlayscriptOfflineExport",
-                "ProcessNodeSchema.json");
-            if (!File.Exists(schemaJsonPath))
-                throw new FileNotFoundException("找不到節點 Schema，請先在 Unity 按「編輯器/劇本流程圖/匯出節點Schema」。", schemaJsonPath);
-
-            var schemaDocument = DocumentLoader.LoadNodeSchemaDocument(schemaJsonPath);
-
-            Directory.CreateDirectory(_appSettings.ExternalDataFolder);
-            _sessionPath = Path.Combine(_appSettings.ExternalDataFolder, "session.json");
-            _connectionsPath = Path.Combine(_appSettings.ExternalDataFolder, "connections.json");
-
-            if (File.Exists(_sessionPath))
-                File.Copy(_sessionPath, _sessionPath + ".bak", overwrite: true);
-            if (File.Exists(_connectionsPath))
-                File.Copy(_connectionsPath, _connectionsPath + ".bak", overwrite: true);
-
-            _model = GraphDocumentModel.LoadFromSession(legacySession, legacyConnections, schemaDocument, _appSettings);
-            SeedScriptFileNameTracking();
-            PersistModel();
-
-            StatusMessage = $"已從舊版工具匯入：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、" +
-                            $"{_model.Groups.Count} 群組（原存檔已備份為 .bak）";
-            return ToPayload(_model);
-        }
-        catch (Exception e)
-        {
-            StatusMessage = $"匯入舊版流程圖失敗：{e.Message}";
-            return new GraphEditorPayload();
-        }
-    }
-
     // Applies what the canvas actually lets a user change in this first pass — node positions and
     // connections — onto the live model, then saves it the same way ProcessGraphPanel's own SaveSession
     // did (a local resume file, not a changelist for Unity yet).
@@ -179,75 +110,7 @@ public sealed class GraphEditorState
 
         try
         {
-            // New nodes first, before positions/edges: an edge exported alongside its brand-new endpoint
-            // node needs that node to already exist in the model.
-            foreach (var newNode in export.NewNodes)
-            {
-                if (_model.FindNode(newNode.Guid) != null)
-                    continue;
-
-                var schema = _model.GetSchema(newNode.TypeName);
-                if (schema != null)
-                    _model.AddNode(schema, newNode.X, newNode.Y, newNode.Guid);
-            }
-
-            // A node the canvas no longer has (Delete key, or LiteGraph's own node-menu Remove) — mark it
-            // and its edges for deletion the same way MarkNodeForDeletion always has; the edge-diff loop
-            // below would eventually detach its edges too, but doing it here also gets the node itself.
-            foreach (var deletedGuid in export.DeletedNodeGuids)
-                _model.MarkNodeForDeletion(deletedGuid);
-
-            foreach (var position in export.NodePositions)
-            {
-                var node = _model.FindNode(position.Guid);
-                if (node != null)
-                {
-                    node.X = position.X;
-                    node.Y = position.Y;
-                }
-            }
-
-            var exportedKeys = new HashSet<string>(
-                export.Edges.Select(e => $"{e.FromNodeGuid}.{e.FromPort}->{e.ToNodeGuid}.{e.ToPort}"));
-            var currentKeys = new HashSet<string>(
-                _model.Edges.Where(e => !e.IsMarkedForDeletion)
-                    .Select(e => $"{e.FromNodeGuid}.{e.FromPort}->{e.ToNodeGuid}.{e.ToPort}"));
-
-            foreach (var edge in _model.Edges.Where(e => !e.IsMarkedForDeletion).ToList())
-            {
-                var key = $"{edge.FromNodeGuid}.{edge.FromPort}->{edge.ToNodeGuid}.{edge.ToPort}";
-                if (!exportedKeys.Contains(key))
-                    _model.DetachEdge(edge);
-            }
-
-            foreach (var edge in export.Edges)
-            {
-                var key = $"{edge.FromNodeGuid}.{edge.FromPort}->{edge.ToNodeGuid}.{edge.ToPort}";
-                if (!currentKeys.Contains(key))
-                    _model.AddEdge(edge.FromNodeGuid, edge.FromPort, edge.ToNodeGuid, edge.ToPort);
-            }
-
-            // The canvas already recomputes each group's membership + tight bounding box live as nodes are
-            // dragged in/out (graph-editor.js's recomputeGroupBounds, mirroring RecomputeGroupBounds below
-            // exactly), so this just trusts that already-correct result rather than re-deriving it from a
-            // position diff. A group the client doesn't have a matching ClientId for yet (created this
-            // session via 新增群組, never round-tripped through 存檔 before) is silently skipped — same
-            // known v1 gap as new nodes had before OnNodeCreated, not yet wired up for groups.
-            foreach (var exportedGroup in export.Groups)
-            {
-                var group = _model.FindGroup(exportedGroup.ClientId);
-                if (group == null)
-                    continue;
-
-                group.MemberNodeGuids.Clear();
-                foreach (var guid in exportedGroup.MemberNodeGuids)
-                    group.MemberNodeGuids.Add(guid);
-
-                group.X = exportedGroup.X;
-                group.Y = exportedGroup.Y;
-                group.Width = exportedGroup.Width;
-                group.Height = exportedGroup.Height;
-            }
+            ApplyExportDiff(export);
 
             var renameCollisions = SyncRenamedScriptFiles();
             PersistModel();
@@ -258,6 +121,121 @@ public sealed class GraphEditorState
         catch (Exception e)
         {
             StatusMessage = $"存檔失敗：{e.Message}";
+        }
+    }
+
+    // Same canvas-sync-then-save flow as ApplyAndSave above, plus a full-document snapshot dropped into
+    // Unity's own hand-off folder — mirrors the legacy WinForms tool's 匯出變更清單 (ChangelistReviewForm.
+    // ExportAndClose), which writes the exact same {timestamp}-graphsnapshot.json shape to the exact same
+    // "<UnityProjectRoot>/PlayscriptOfflineTool/Changelists/" folder that Unity's own
+    // PlayscriptGraphChangelistAutoImporter (Assets/Editor/EditorWindow/PlayscriptGraph, polls every few
+    // seconds) already watches and fully overwrites the live graph from. StoryForge never talks to Unity
+    // directly — if the Editor isn't currently running, the file just waits there until it is, so this can
+    // only confirm the snapshot was written, never that Unity actually applied it.
+    public void ExportToUnity(GraphEditorExport export)
+    {
+        if (_model == null || _sessionPath == null || _connectionsPath == null)
+            return;
+
+        try
+        {
+            ApplyExportDiff(export);
+
+            var renameCollisions = SyncRenamedScriptFiles();
+            PersistModel();
+
+            var projectRoot = ProjectPaths.ResolveUnityProjectRoot();
+            var changelistFolder = Path.Combine(projectRoot, "PlayscriptOfflineTool", "Changelists");
+            Directory.CreateDirectory(changelistFolder);
+
+            var fullDocument = _model.BuildFullDocument();
+            var fileName = $"{DateTime.Now:yyyyMMdd-HHmmss}-graphsnapshot.json";
+            File.WriteAllText(Path.Combine(changelistFolder, fileName),
+                JsonConvert.SerializeObject(fullDocument, Formatting.Indented));
+
+            StatusMessage = $"已存檔並匯出快照至 Unity（{fileName}），將於 Unity 開啟時自動套用：" +
+                            $"{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
+            AppendRenameCollisionWarning(renameCollisions);
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"匯出至 Unity 失敗：{e.Message}";
+        }
+    }
+
+    // The node/edge/group diff itself, shared by ApplyAndSave and ExportToUnity — everything downstream of
+    // "apply the canvas's export onto the live model" (persisting, status messages, snapshot export) is
+    // each caller's own concern.
+    private void ApplyExportDiff(GraphEditorExport export)
+    {
+        // New nodes first, before positions/edges: an edge exported alongside its brand-new endpoint
+        // node needs that node to already exist in the model.
+        foreach (var newNode in export.NewNodes)
+        {
+            if (_model!.FindNode(newNode.Guid) != null)
+                continue;
+
+            var schema = _model.GetSchema(newNode.TypeName);
+            if (schema != null)
+                _model.AddNode(schema, newNode.X, newNode.Y, newNode.Guid);
+        }
+
+        // A node the canvas no longer has (Delete key, or LiteGraph's own node-menu Remove) — mark it
+        // and its edges for deletion the same way MarkNodeForDeletion always has; the edge-diff loop
+        // below would eventually detach its edges too, but doing it here also gets the node itself.
+        foreach (var deletedGuid in export.DeletedNodeGuids)
+            _model!.MarkNodeForDeletion(deletedGuid);
+
+        foreach (var position in export.NodePositions)
+        {
+            var node = _model!.FindNode(position.Guid);
+            if (node != null)
+            {
+                node.X = position.X;
+                node.Y = position.Y;
+            }
+        }
+
+        var exportedKeys = new HashSet<string>(
+            export.Edges.Select(e => $"{e.FromNodeGuid}.{e.FromPort}->{e.ToNodeGuid}.{e.ToPort}"));
+        var currentKeys = new HashSet<string>(
+            _model!.Edges.Where(e => !e.IsMarkedForDeletion)
+                .Select(e => $"{e.FromNodeGuid}.{e.FromPort}->{e.ToNodeGuid}.{e.ToPort}"));
+
+        foreach (var edge in _model.Edges.Where(e => !e.IsMarkedForDeletion).ToList())
+        {
+            var key = $"{edge.FromNodeGuid}.{edge.FromPort}->{edge.ToNodeGuid}.{edge.ToPort}";
+            if (!exportedKeys.Contains(key))
+                _model.DetachEdge(edge);
+        }
+
+        foreach (var edge in export.Edges)
+        {
+            var key = $"{edge.FromNodeGuid}.{edge.FromPort}->{edge.ToNodeGuid}.{edge.ToPort}";
+            if (!currentKeys.Contains(key))
+                _model.AddEdge(edge.FromNodeGuid, edge.FromPort, edge.ToNodeGuid, edge.ToPort);
+        }
+
+        // The canvas already recomputes each group's membership + tight bounding box live as nodes are
+        // dragged in/out (graph-editor.js's recomputeGroupBounds, mirroring RecomputeGroupBounds below
+        // exactly), so this just trusts that already-correct result rather than re-deriving it from a
+        // position diff. A group the client doesn't have a matching ClientId for yet (created this
+        // session via 新增群組, never round-tripped through 存檔 before) is silently skipped — same
+        // known v1 gap as new nodes had before OnNodeCreated, not yet wired up for groups.
+        foreach (var exportedGroup in export.Groups)
+        {
+            var group = _model.FindGroup(exportedGroup.ClientId);
+            if (group == null)
+                continue;
+
+            group.MemberNodeGuids.Clear();
+            foreach (var guid in exportedGroup.MemberNodeGuids)
+                group.MemberNodeGuids.Add(guid);
+
+            group.X = exportedGroup.X;
+            group.Y = exportedGroup.Y;
+            group.Width = exportedGroup.Width;
+            group.Height = exportedGroup.Height;
         }
     }
 

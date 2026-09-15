@@ -24,6 +24,7 @@ builder.Services.AddScoped<StoryForge.Web.CharacterCard.CharacterCardState>();
 builder.Services.AddScoped<StoryForge.Web.StoryOutline.StoryOutlineState>();
 builder.Services.AddScoped<StoryForge.Web.Pipeline.PipelineStatusState>();
 builder.Services.AddScoped<StoryForge.Web.ReloadCoordinator>();
+builder.Services.AddScoped<StoryForge.Web.FlowGraphFocusCoordinator>();
 // Singleton, not scoped — see UpdateCheckService's own comment: one GitHub check result shared by the
 // whole process, not one per browser tab/circuit.
 builder.Services.AddSingleton<UpdateCheckService>();
