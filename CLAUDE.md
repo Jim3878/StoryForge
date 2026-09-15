@@ -107,6 +107,36 @@ from up to 4 sources into `PlayscriptPipelineInfo` rows (`IsOnLdtk`/`IsOnGraph`/
 source only exists once `DownloadSheetAsync()` has fetched `GooglePlayscriptSheetClient`'s xlsx export at
 least once — there's no sheet data until that button has been pressed.
 
+### Playscript factory codegen: "參數" column convention
+`PlayscriptFactoryCodeGenerator` (`StoryForge.Core/Codegen`) turns each spreadsheet row's `功能` (function)
+value into one generated C# call, reading its argument(s) from the `台詞`/`參數` columns. The rule: a
+function's value only belongs in `台詞` when it genuinely **is** dialogue/display text being said or shown
+(`Chat`'s message, `Button`/`Choice`/`選項`'s choice text, `UpBlock`/`DownBlock`/`LeftBlock`/`RightBlock`'s
+spoken line). Any argument that is not dialogue text (a label name, a target playscript name, a duration, a
+CG/diff key, ...) goes in `參數`, never `台詞` — this is a hard rule for every new function added going
+forward, not just a preference. A function needing more than one such value (e.g. `TryAddLobby`) packs them
+into `參數` as `value1;value2` (semicolon-separated — see `SplitParameterValues`) rather than splitting
+across columns. `OpenCg`/`Diff` are grandfathered with a `參數`-first/`台詞`-fallback (`GetParameter`) purely
+for backward compatibility with sheets authored before `參數` existed — that fallback pattern should not be
+copied for new functions.
+
+Whenever a `功能` value is added, removed, or has its argument column(s) changed in
+`PlayscriptFactoryCodeGenerator` (both `GenerateCode` and its matching check in `ValidateSheetRows`), two
+other places must be updated in the same change, not left for later:
+1. The legal-value list and per-function rules in `AGENTS.md` at the root of `AppSettings.ExternalDataFolder`
+   (default `E:\本地端\遊戲專案管理\臥底治安官\AI劇本\`) — that file, not this one, is what a human or AI
+   actually filling in a playscript spreadsheet reads (see the comment atop `NodeScriptTableStore.cs`).
+2. The `功能` column's dropdown (Data validation) on the live "劇本檔範本" Google Sheet template itself —
+   without this, the sheet still offers/accepts the old value and rejects the new one when someone actually
+   types it in. On that sheet the dropdown has been observed saved as two separate data-validation rules
+   covering `E2` and `E3:E1000` rather than one rule over the whole column (apparently never consolidated) —
+   until that's cleaned up, editing the dropdown means opening the rule from a cell in each of those two
+   ranges and applying the same edit to both, or the two ranges will drift out of sync again.
+
+It is easy to change the generator's accepted `功能` values while forgetting that the spreadsheet and
+`AGENTS.md` still describe the old ones — both are the actual interface a spreadsheet author sees, this file
+isn't.
+
 ### Settings persistence: two different homes, do not confuse them
 - **Tracked in the Unity project, in git** (`Assets/06.Definition/PlayscriptOfflineToolData/*.json`):
   `CharacterCardSettings`, `StoryOutlineSettings`. Shared, collaboratively-written content — the same

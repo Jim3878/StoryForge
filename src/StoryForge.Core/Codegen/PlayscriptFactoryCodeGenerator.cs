@@ -297,9 +297,11 @@ public static class PlayscriptFactoryCodeGenerator
 
             if (function == "Label")
             {
-                lines.Add(choiceLabels.Contains(text)
-                    ? $"            Choice().Label(\"{CodegenTextUtility.EscapeCSharpString(text)}\");"
-                    : $"            Label(\"{CodegenTextUtility.EscapeCSharpString(text)}\");");
+                if (string.IsNullOrEmpty(parameter))
+                    throw new InvalidOperationException($"第 {row} 列 Label 缺少「參數」欄的 label 名稱。");
+                lines.Add(choiceLabels.Contains(parameter)
+                    ? $"            Choice().Label(\"{CodegenTextUtility.EscapeCSharpString(parameter)}\");"
+                    : $"            Label(\"{CodegenTextUtility.EscapeCSharpString(parameter)}\");");
                 AddBlankLine(lines);
                 continue;
             }
@@ -376,10 +378,20 @@ public static class PlayscriptFactoryCodeGenerator
                 continue;
             }
 
-            if (functionLower == "lobby")
+            if (functionLower == "tryaddlobby")
             {
+                var lobbyParts = SplitParameterValues(parameter);
+                if (lobbyParts.Length != 2)
+                    throw new InvalidOperationException(
+                        $"第 {row} 列 TryAddLobby 的參數欄格式應為「大廳名稱;目標劇本名稱」（以分號分隔）。");
                 lines.Add(
-                    $"            Chat().TryAddChatLobby({textLiteral}, \"{CodegenTextUtility.EscapeCSharpString(parsed.ClassName)}\");");
+                    $"            TryAddLobby(\"{CodegenTextUtility.EscapeCSharpString(lobbyParts[0])}\", \"{CodegenTextUtility.EscapeCSharpString(lobbyParts[1])}\");");
+                continue;
+            }
+
+            if (functionLower == "setmessagelobby")
+            {
+                lines.Add("            Chat().SetMessageLobby();");
                 continue;
             }
 
@@ -505,11 +517,22 @@ public static class PlayscriptFactoryCodeGenerator
             }
 
             if (function == "Label")
+            {
+                if (string.IsNullOrEmpty(GetParameter(sheet, row, columns)))
+                    errors.Add($"Row {row}: Label 缺少「參數」欄的 label 名稱。");
                 continue;
+            }
 
             if (functionLower is "fadeondark" or "fadeoff" or "fadeonwhite" or "opencg" or "diff" or "closecg"
-                or "closedialogue" or "chat" or "lobby")
+                or "closedialogue" or "chat" or "setmessagelobby")
                 continue;
+
+            if (functionLower == "tryaddlobby")
+            {
+                if (SplitParameterValues(GetParameter(sheet, row, columns)).Length != 2)
+                    errors.Add($"Row {row}: TryAddLobby 的參數欄格式應為「大廳名稱;目標劇本名稱」（以分號分隔）。");
+                continue;
+            }
 
             if (functionLower is "upblock" or "downblock" or "leftblock" or "rightblock")
             {
@@ -683,6 +706,17 @@ public static class PlayscriptFactoryCodeGenerator
         return columns.TryGetValue("參數", out var parameterColumn)
             ? CodegenTextUtility.SanitizeText(sheet.Cells[row, parameterColumn].Text)
             : string.Empty;
+    }
+
+    // Functions that need more than one value (currently only TryAddLobby) pack them all into "參數" as
+    // "value1;value2" rather than splitting across "台詞"/"參數" — 分號 (semicolon) separated.
+    private static string[] SplitParameterValues(string parameter)
+    {
+        return (parameter ?? string.Empty)
+            .Split(';')
+            .Select(CodegenTextUtility.SanitizeText)
+            .Where(x => !string.IsNullOrEmpty(x))
+            .ToArray();
     }
 
     // Button/Choice's jump-target label used to be written into "備註" (there was nowhere else to put it);
