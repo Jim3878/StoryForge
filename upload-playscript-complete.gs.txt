@@ -1,0 +1,189 @@
+/*
+ * 「上傳補完到Sheet」新增的 Apps Script action：uploadPlayscriptComplete
+ *
+ * 這段程式碼要貼進索引試算表（PlaylistIndex 那份，也就是 createMissingScenarioSheets() 所在的同一個
+ * Apps Script 專案）。因為我看不到你現有的 doPost(e) 完整原始碼（只看得到 appendPlayscriptIndexRows
+ * 這個 action 的請求/回應格式，以及你貼給我的 createMissingScenarioSheets），所以這裡分成兩塊：
+ *
+ *   1. 一個全新、自包含的函式 handleUploadPlaysecriptComplete_(payload)（連同它呼叫的小工具函式）—
+ *      可以直接整段貼進專案。
+ *   2. 你「既有」doPost(e) 裡要手動加的一個 else if 分支，把 action === "uploadPlayscriptComplete"
+ *      的請求導去呼叫上面那個函式。這段要你自己找到 doPost 貼進去，因為我沒看過它現在長怎樣。
+ *
+ * === 重要假設，請對照你的真實試算表結構確認 ===
+ *  - CONFIG.ROOT_FOLDER_ID / CONFIG.TEMPLATE_FILE_ID 沿用你原本 createMissingScenarioSheets() 那份
+ *    CONFIG（如果那個常數已經在別處定義，這裡不要重複宣告，直接刪掉下面這段 CONFIG，改成共用同一個）。
+ *  - 新建立的劇本專屬試算表，資料要寫進「第一個分頁」（copy 範本後預期只有一個分頁）。如果你的範本
+ *    檔案有多個分頁、資料應該寫在特定名稱的分頁，要把 getSheets()[0] 改成 getSheetByName("分頁名稱")。
+ *  - 索引列的判斷／新增欄位（劇本名/Spreadsheet ID/連結/備註/in劇本編輯器）沿用
+ *    createMissingScenarioSheets() 同一套 headers.indexOf(...) 找欄位邏輯。
+ *  - 對話表覆蓋寫入時，表頭固定七欄：名字,表情,配音情緒,台詞,功能,備註,參數（和 NodeScriptTableStore
+ *    / GooglePlayscriptSheetClient.ScriptTableHeaders 完全一致）。
+ */
+
+// 如果你的專案已經有這個 CONFIG（createMissingScenarioSheets 那份），不要重複宣告，刪掉這段即可。
+const CONFIG = {
+  ROOT_FOLDER_ID: '1UATp77QTESXzovLlp7OsCEenggCa4zzu',
+  TEMPLATE_FILE_ID: '1zVINkxB3WddSm-2xiMEV1ExbhyNcWAlQJu-unuqTtDc',
+};
+
+/**
+ * 處理一筆「上傳補完到Sheet」的請求。
+ * payload 形狀（來自 GooglePlayscriptUploadCompleteRequest）：
+ *   {
+ *     action: "uploadPlayscriptComplete",
+ *     chapterKey: "A1",
+ *     sheetName: "A1",              // 這個劇本在索引試算表裡對應的分頁名稱
+ *     playscriptName: "A1/1_釣魚執法",
+ *     headers: ["名字","表情","配音情緒","台詞","功能","備註","參數"],
+ *     rows: [["旁白","一般","","...","Chat","",""], ...] 或 null（本機沒有 .md 內容時不會帶這個欄位）
+ *   }
+ * 回傳形狀（GooglePlayscriptUploadCompleteResponse 會解析的欄位）：
+ *   { success, spreadsheetId, link, createdIndexRow, createdSheet, wroteContent, message, errors }
+ */
+function handleUploadPlaysecriptComplete_(payload) {
+  try {
+    const playscriptName = String(payload.playscriptName || '').trim();
+    const sheetName = String(payload.sheetName || '').trim();
+    if (!playscriptName || !sheetName) {
+      return { success: false, errors: ['playscriptName 或 sheetName 缺漏'] };
+    }
+
+    const indexSpreadsheet = SpreadsheetApp.getActive();
+    const indexSheet = indexSpreadsheet.getSheetByName(sheetName);
+    if (!indexSheet) {
+      return { success: false, errors: ['索引試算表找不到分頁：' + sheetName] };
+    }
+
+    const headers = indexSheet.getRange(1, 1, 1, indexSheet.getLastColumn()).getValues()[0];
+    const nameCol = headers.indexOf('劇本名');
+    const idCol = headers.indexOf('Spreadsheet ID');
+    const linkCol = headers.indexOf('連結');
+    if (nameCol < 0 || idCol < 0 || linkCol < 0) {
+      return { success: false, errors: ['分頁「' + sheetName + '」找不到必要欄位：劇本名 / Spreadsheet ID / 連結'] };
+    }
+
+    // Step 1：找這個劇本現有的索引列；找不到就補一列（沿用 appendPlayscriptIndexRows 既有的
+    // 備註="Graph"、in劇本編輯器="完成" 慣例）。
+    let rowIndex = findIndexRow_(indexSheet, nameCol, playscriptName);
+    let createdIndexRow = false;
+    if (rowIndex < 0) {
+      rowIndex = indexSheet.getLastRow() + 1;
+      indexSheet.getRange(rowIndex, nameCol + 1).setValue(playscriptName);
+      const noteCol = headers.indexOf('備註');
+      const editorCol = headers.indexOf('in劇本編輯器');
+      if (noteCol >= 0) indexSheet.getRange(rowIndex, noteCol + 1).setValue('Graph');
+      if (editorCol >= 0) indexSheet.getRange(rowIndex, editorCol + 1).setValue('完成');
+      createdIndexRow = true;
+    }
+
+    // Step 2：這一列還沒有自己的試算表 → 用範本複製一份，規則跟 createMissingScenarioSheets() 完全一樣
+    // （依 sheetName 建立/複用 Drive 資料夾、用 playscriptName 當檔名、寫回 ID + HYPERLINK 公式）。
+    let spreadsheetId = String(indexSheet.getRange(rowIndex, idCol + 1).getValue() || '').trim();
+    let createdSheet = false;
+    if (!spreadsheetId) {
+      const rootFolder = DriveApp.getFolderById(CONFIG.ROOT_FOLDER_ID);
+      const templateFile = DriveApp.getFileById(CONFIG.TEMPLATE_FILE_ID);
+      const targetFolder = getOrCreateFolder_(rootFolder, sheetName);
+
+      const existingFile = findFileByName_(targetFolder, playscriptName);
+      const file = existingFile || templateFile.makeCopy(playscriptName, targetFolder);
+      spreadsheetId = file.getId();
+      const url = file.getUrl();
+
+      indexSheet.getRange(rowIndex, idCol + 1).setValue(spreadsheetId);
+      indexSheet.getRange(rowIndex, linkCol + 1).setFormula('=HYPERLINK("' + url + '", "' + playscriptName + '")');
+      createdSheet = !existingFile;
+    }
+
+    const link = 'https://docs.google.com/spreadsheets/d/' + spreadsheetId + '/edit';
+
+    // Step 3：本機有帶對話列內容才覆蓋寫入；rows 缺漏/空陣列代表這次沒有本機內容，維持該 Sheet 原樣。
+    let wroteContent = false;
+    if (payload.rows && payload.rows.length > 0) {
+      writeScriptTable_(spreadsheetId, payload.headers, payload.rows);
+      wroteContent = true;
+    }
+
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      spreadsheetId: spreadsheetId,
+      link: link,
+      createdIndexRow: createdIndexRow,
+      createdSheet: createdSheet,
+      wroteContent: wroteContent,
+    };
+  } catch (err) {
+    return { success: false, errors: [String(err && err.message || err)] };
+  }
+}
+
+// 整表覆蓋寫入：清空第一個分頁表頭以下所有內容，寫入表頭 + rows。本機 .md 是權威版本，遠端多出來的舊
+// 資料一律蓋掉（這是刻意的設計，不是差異比對合併）。
+function writeScriptTable_(spreadsheetId, headers, rows) {
+  const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = spreadsheet.getSheets()[0];
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  }
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+function findIndexRow_(sheet, nameCol, playscriptName) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return -1;
+
+  const values = sheet.getRange(2, nameCol + 1, lastRow - 1, 1).getValues();
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || '').trim() === playscriptName) {
+      return i + 2; // +2：從第 2 列開始、陣列從 0 起算
+    }
+  }
+  return -1;
+}
+
+// 與 createMissingScenarioSheets() 裡的同名函式邏輯相同——如果專案裡已經有這兩個函式，直接刪掉這裡的
+// 重複定義即可，Apps Script 同一個檔案/專案內函式名稱不能重複。
+function getOrCreateFolder_(parent, name) {
+  const folders = parent.getFoldersByName(name);
+  if (folders.hasNext()) return folders.next();
+  return parent.createFolder(name);
+}
+
+function findFileByName_(folder, name) {
+  const files = folder.getFilesByName(name);
+  if (files.hasNext()) return files.next();
+  return null;
+}
+
+/*
+ * === 要手動接到既有 doPost(e) 的部分 ===
+ *
+ * 找到你現有的 doPost(e)，裡面應該已經有類似這樣的 if/else 在依 payload.action 分派：
+ *
+ *   function doPost(e) {
+ *     const payload = JSON.parse(e.postData.contents);
+ *     if (payload.action === "appendPlayscriptIndexRows") {
+ *       const result = ...; // 現有邏輯
+ *       return ContentService.createTextOutput(JSON.stringify(result))
+ *         .setMimeType(ContentService.MimeType.JSON);
+ *     }
+ *     // 在這裡加一個新分支：
+ *     if (payload.action === "uploadPlayscriptComplete") {
+ *       const result = handleUploadPlaysecriptComplete_(payload);
+ *       return ContentService.createTextOutput(JSON.stringify(result))
+ *         .setMimeType(ContentService.MimeType.JSON);
+ *     }
+ *   }
+ *
+ * 加完之後要重新部署（部署 → 管理部署作業 → 現有部署的鉛筆圖示 → 版本選「新版本」→ 部署），
+ * 網址（AppsScriptUrl）不會變，但不重新部署的話新程式碼不會生效。
+ */

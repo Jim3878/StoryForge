@@ -83,6 +83,17 @@
                     <input type="text" @bind="_ldtkWorkingDirectory" />
                 </label>
             </div>
+
+            <h3>ffmpeg</h3>
+            <p class="settings-hint">
+                BGM／音效分頁「轉檔成 OGG」按鈕使用的 ffmpeg.exe 路徑。
+            </p>
+            <div class="settings-grid settings-grid-1col">
+                <label>
+                    <span>ffmpeg執行檔路徑</span>
+                    <input type="text" @bind="_ffmpegPath" />
+                </label>
+            </div>
         </div>
         <div class="settings-dialog-footer">
             <span class="settings-status">@_statusMessage</span>
@@ -126,6 +137,7 @@
     private string _externalDataFolder = string.Empty;
     private string _ldtkExecutablePath = string.Empty;
     private string _ldtkWorkingDirectory = string.Empty;
+    private string _ffmpegPath = string.Empty;
 
     // Called from the toolbar's 設定 button — snapshots current values into local scratch fields (rather
     // than binding the inputs straight to AppSettingsStore) so 取消 has something to discard back to.
@@ -140,6 +152,7 @@
         _externalDataFolder = AppSettingsStore.ExternalDataFolder;
         _ldtkExecutablePath = AppSettingsStore.LdtkExecutablePath;
         _ldtkWorkingDirectory = AppSettingsStore.LdtkWorkingDirectory;
+        _ffmpegPath = AppSettingsStore.FfmpegPath;
         _statusMessage = string.Empty;
         _isOpen = true;
         StateHasChanged();
@@ -164,6 +177,7 @@
         AppSettingsStore.ExternalDataFolder = _externalDataFolder;
         AppSettingsStore.LdtkExecutablePath = _ldtkExecutablePath;
         AppSettingsStore.LdtkWorkingDirectory = _ldtkWorkingDirectory;
+        AppSettingsStore.FfmpegPath = _ffmpegPath;
         AppSettingsStore.Save();
 
         await JS.InvokeVoidAsync("storyForgeGraph.updateSettings", new

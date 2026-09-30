@@ -42,6 +42,7 @@
 
 <SettingsDialog @ref="_settingsDialog" />
 <UpdateDialog @ref="_updateDialog" />
+<SaveResultDialog @ref="_saveResultDialog" />
 
 <div id="blazor-error-ui">
     An unhandled error has occurred.
@@ -84,6 +85,7 @@
 @code {
     private SettingsDialog? _settingsDialog;
     private UpdateDialog? _updateDialog;
+    private SaveResultDialog? _saveResultDialog;
     private UpdateInfo? _pendingUpdate;
     private string _fileStatus = string.Empty;
     private DotNetObjectReference<MainLayout>? _selfRef;
@@ -117,10 +119,44 @@
     // works regardless of which tab is currently visible — the canvas element itself is always mounted.
     private async Task Save()
     {
-        var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
-        GraphState.ApplyAndSave(export);
-        _fileStatus = GraphState.StatusMessage ?? string.Empty;
+        SaveReport report;
+        try
+        {
+            var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
+            GraphState.ApplyAndSave(export);
+            _fileStatus = GraphState.StatusMessage ?? string.Empty;
+            report = GraphState.LastSaveReport
+                     ?? new SaveReport(SaveOutcome.Failure, "存檔失敗", new[] { "沒有取得存檔結果。" });
+        }
+        catch (Exception e)
+        {
+            // 例如流程圖畫布還沒初始化，exportGraph 就不存在
+            _fileStatus = $"存檔失敗：{e.Message}";
+            report = new SaveReport(SaveOutcome.Failure, "存檔失敗", new[] { e.Message });
+        }
+
+        if (report.SaveSucceeded)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("storyForgeGraph.markSaveSucceeded");
+            }
+            catch (Exception e)
+            {
+                var details = report.Details.Concat(new[]
+                {
+                    $"存檔已寫入，但前端存檔基準更新失敗：{e.Message}",
+                    "請重新讀取後再繼續編輯，避免下一次刪除判斷錯誤。",
+                }).ToList();
+                report = new SaveReport(SaveOutcome.Warning, report.Title + "（有警告）", details,
+                    report.OrphanFiles);
+                _fileStatus = "存檔已寫入，但前端狀態更新失敗；請重新讀取";
+            }
+        }
+
         StateHasChanged();
+        _saveResultDialog?.Show(report);
+        await JS.InvokeVoidAsync("storyForgeUi.playSaveFeedback", report.Outcome.ToString());
     }
 
     // Ctrl/Cmd+S — bound globally in JS (see ui-draggable.js's bindSaveShortcut) rather than through

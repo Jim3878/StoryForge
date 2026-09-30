@@ -1,0 +1,1357 @@
+@using StoryForge.Core
+@using StoryForge.Core.Audio
+@using StoryForge.Web.Audio
+@implements IDisposable
+@inject StoryForge.Core.Graph.AppSettings AppSettings
+@inject AudioWaveformCacheService WaveformCache
+@inject ReloadCoordinator ReloadCoordinator
+@inject IJSRuntime JS
+
+@* One instance per tab (BGM / 音效), told which folder it browses via Category. Always mounted like every
+   other panel (see Home.razor) — the canvases, scroll position and any in-progress note edit survive
+   switching tabs. Waveform decoding, drawing, playback and column drag/resize all live in
+   audio-browser.js; this component owns the file list, notes, remembered settings and the 轉檔 run. *@
+<div class="ab-page" id="@_rootId" data-audio-root>
+    <div class="ab-toolbar">
+        <span class="ab-view-toggle">
+            <button class="@(State.Page.ViewMode == AudioPageSettings.ViewList ? "active" : "")"
+                    @onclick="() => SetViewMode(AudioPageSettings.ViewList)">列表</button>
+            <button class="@(State.Page.ViewMode == AudioPageSettings.ViewCard ? "active" : "")"
+                    @onclick="() => SetViewMode(AudioPageSettings.ViewCard)">卡片</button>
+        </span>
+        <label class="ab-check"><input type="checkbox" checked="@State.Page.AutoPlay" @onchange="OnAutoPlayChanged" /> 自動播放</label>
+        <label class="ab-check"><input type="checkbox" checked="@State.Page.Loop" @onchange="OnLoopChanged" /> Loop</label>
+        <label class="ab-slider">
+            <span>音量</span>
+            <input type="range" min="0" max="100" step="1" value="@((int)Math.Round(State.Page.Volume * 100))"
+                   @oninput="OnVolumeInput" @onchange="OnSliderCommitted" />
+            <span class="ab-slider-value">@((int)Math.Round(State.Page.Volume * 100))%</span>
+        </label>
+        @if (State.Page.ViewMode == AudioPageSettings.ViewCard)
+        {
+            <label class="ab-slider">
+                <span>卡片大小</span>
+                <input type="range" min="160" max="520" step="10" value="@((int)State.Page.CardSize)"
+                       @oninput="OnCardSizeInput" @onchange="OnSliderCommitted" />
+                <span class="ab-slider-value">@((int)State.Page.CardSize)px</span>
+            </label>
+        }
+        <input class="ab-search" placeholder="搜尋檔名或備註..." @bind="_searchText" @bind:event="oninput" />
+        <button @onclick="Rescan">重新掃描</button>
+        <button @onclick="RequestConvert" disabled="@(State.PendingConvertFiles.Count == 0 || State.IsBusy)"
+                title="把這個資料夾裡不是 .ogg 的音檔轉成 .ogg（原始檔會刪除，.meta 會保留給新檔案沿用）">
+            轉檔成 OGG（@State.PendingConvertFiles.Count）
+        </button>
+        <button @onclick="RequestNormalize" disabled="@(State.IsBusy)"
+                title="把還沒標準化（或標準化目標已變更）的檔案，從原檔以固定增益拉到目標響度（@State.TargetLufs.ToString("0.#") LUFS）">
+            標準化（@State.PendingNormalizeFiles.Count）
+        </button>
+        @if (State.Adjustments.Orphans.Count > 0)
+        {
+            <button class="ab-warn-button" @onclick="() => _showOrphans = true"
+                    title="AudioAdjustments.json 裡找不到對應檔案（GUID）的調整記錄">
+                孤兒記錄（@State.Adjustments.Orphans.Count）
+            </button>
+        }
+        <span class="ab-status">@State.StatusMessage</span>
+    </div>
+
+    <div class="ab-body">
+        @if (State.Entries.Count == 0)
+        {
+            <div class="ab-empty">這個資料夾（Assets/@AudioAssetScanner.GetFolderRelativePath(Category)）裡沒有音檔</div>
+        }
+        else if (State.Page.ViewMode == AudioPageSettings.ViewList)
+        {
+            <table class="ab-grid" style="width:@(TableWidth)px">
+                <thead>
+                    <tr id="@_headerRowId">
+                        @foreach (var col in State.Page.Columns)
+                        {
+                            <th @key="col.Key" data-key="@col.Key" style="width:@(col.Width)px"
+                                title="@(col.Key == "wave" ? "拖曳可調整欄位順序" : "點擊可排序，拖曳可調整欄位順序")"
+                                @onclick="() => OnColumnHeaderClicked(col.Key)">
+                                <span class="ab-th-label">@GetColumnLabel(col.Key)</span>
+                                @if (State.Page.SortColumn == col.Key)
+                                {
+                                    <span class="ab-sort-indicator">@(State.Page.SortDescending ? "▼" : "▲")</span>
+                                }
+                                <span class="ab-col-resize" title="拖曳調整欄寬"></span>
+                            </th>
+                        }
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var entry in VisibleEntries)
+                    {
+                        <tr @key="entry.FileName" class="@(entry.Name == _flashName ? "ab-flash" : null)" @oncontextmenu="e => OpenContextMenu(e, entry)" @oncontextmenu:preventDefault="true">
+                            @foreach (var col in State.Page.Columns)
+                            {
+                                <td @key="col.Key" class="ab-cell-@col.Key">@RenderCell(entry, col.Key)</td>
+                            }
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+        else
+        {
+            <div class="ab-cards">
+                @foreach (var entry in VisibleEntries)
+                {
+                    <div class="ab-card @(entry.Name == _flashName ? "ab-flash" : null)" @key="entry.FileName" style="width:@(State.Page.CardSize)px"
+                         @oncontextmenu="e => OpenContextMenu(e, entry)" @oncontextmenu:preventDefault="true">
+                        @RenderWave(entry, "ab-wave-card")
+                        <div class="ab-card-title" title="@entry.FileName">@entry.Name</div>
+                        <div class="ab-card-meta">
+                            <span class="ab-card-duration">@FormatDuration(entry)</span>
+                            @RenderGain(entry)
+                            <span class="ab-card-minor">@entry.Format · @FormatSize(entry.SizeBytes)</span>
+                        </div>
+                        <textarea class="ab-card-note" placeholder="這個音檔的用途／氣氛（給 AI 參考）"
+                                  value="@State.GetNote(entry)" @onchange="e => SaveNote(entry, e.Value?.ToString())"></textarea>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+</div>
+
+@if (_contextMenuEntry is { } menuEntry)
+{
+    <div class="ab-context-menu-backdrop" @onclick="CloseContextMenu"
+         @oncontextmenu="CloseContextMenu" @oncontextmenu:preventDefault="true"></div>
+    <div class="ab-context-menu" style="left:@(_contextMenuX)px; top:@(_contextMenuY)px">
+        <button @onclick="() => CopyName(menuEntry)">複製檔名</button>
+        <button @onclick="() => RefreshWaveform(menuEntry)">刷新音紋圖</button>
+        <button @onclick="() => OpenGainDialog(menuEntry, false)" disabled="@State.IsBusy">調整音量…</button>
+        @if (State.GetAdjustment(menuEntry) is { Record: not null } menuStatus)
+        {
+            <button @onclick="() => RequestRestore(menuEntry)" disabled="@State.IsBusy">還原原檔…</button>
+            @if (menuStatus.ExternallyChanged)
+            {
+                <button @onclick="() => RequestForget(menuEntry)" disabled="@State.IsBusy">採用目前檔案（清除調整記錄）…</button>
+            }
+        }
+    </div>
+}
+
+@if (_convertError != null)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>無法轉檔</h3>
+            <p class="ab-pre">@_convertError</p>
+            <div class="ab-modal-actions"><button @onclick="() => _convertError = null">關閉</button></div>
+        </div>
+    </div>
+}
+
+@if (_pendingConvert != null)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>轉檔成 OGG</h3>
+            <p>以下 @_pendingConvert.Count 個檔案會用 ffmpeg 轉成 .ogg：</p>
+            <div class="ab-result-list">
+                @foreach (var file in _pendingConvert)
+                {
+                    <div class="ab-result-row">@file.FileName</div>
+                }
+            </div>
+            <p class="ab-warning">轉檔成功後原始檔會被刪除（無法復原，只能靠 Unity 專案的 git 還原）。原始檔的 .meta 會改名給新的 .ogg 沿用，GUID 不變。</p>
+            <div class="ab-modal-actions">
+                <button @onclick="ConfirmConvert">開始轉檔</button>
+                <button @onclick="() => _pendingConvert = null">取消</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if ((State.IsConvertRunning || State.IsNormalizeRunning) && State.ConvertProgress is { } progress)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>@(State.IsNormalizeRunning ? "標準化中…" : "轉檔中…")</h3>
+            <div class="ab-progress-bar"><div class="ab-progress-fill" style="width:@(progress.Total == 0 ? 0 : 100.0 * progress.Processed / progress.Total)%"></div></div>
+            <div class="ab-progress-text">@progress.Processed / @progress.Total — @progress.CurrentFileName</div>
+            <div class="ab-modal-actions">
+                <button @onclick="State.CancelConvert" disabled="@State.IsCancelRequested">
+                    @(State.IsCancelRequested ? "等目前這個檔案處理完…" : "取消")
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (!State.IsConvertRunning && State.ConvertResult is { } result)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>@(result.Cancelled ? "轉檔已取消" : "轉檔完成")</h3>
+            <p>轉換 @result.Converted、跳過 @result.Skipped、同名衝突 @result.Collisions（原始檔已移到 08.Audio/Collision）、失敗 @result.Failed</p>
+            @if (result.Failures.Count > 0)
+            {
+                <div class="ab-result-list">
+                    @foreach (var failure in result.Failures)
+                    {
+                        <div class="ab-result-row"><b>@failure.FileName</b><div class="ab-pre ab-failure">@failure.Error</div></div>
+                    }
+                </div>
+            }
+            <div class="ab-modal-actions">
+                @if (result.LogPath != null)
+                {
+                    <button @onclick="() => State.OpenLogFile(result.LogPath)">開啟記錄檔</button>
+                }
+                <button @onclick="CloseConvertResult">關閉</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_gainMessage != null)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>無法調整音量</h3>
+            <p class="ab-pre">@_gainMessage</p>
+            <div class="ab-modal-actions"><button @onclick="() => _gainMessage = null">關閉</button></div>
+        </div>
+    </div>
+}
+
+@if (_adoptPromptEntry is { } adoptEntry)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>檔案在工具外被換過了</h3>
+            <p><b>@adoptEntry.FileName</b> 和上次調整音量時寫入的檔案不同（或備份原檔不見了）。可能是換了新版素材，也可能是切換了 git 版本。</p>
+            <p>要把<b>目前的檔案</b>當成新的原檔來調整嗎？套用時會刪除舊的備份和調整記錄，改用目前的檔案當原檔。</p>
+            <div class="ab-modal-actions">
+                <button @onclick="() => OpenGainDialogAdopting(adoptEntry)">當成新原檔，繼續調整</button>
+                <button @onclick="() => _adoptPromptEntry = null">取消</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_gain is { } gain)
+{
+    var record = gain.Adopt ? null : State.GetAdjustment(gain.Entry).Record;
+    var normalizeGain = NormalizeGainOf(gain);
+    var normalizeAvailable = normalizeGain is { } ng && Math.Abs(ng) <= AudioGainProcessor.MaxNormalizeGainDb;
+    var total = TotalGainOf(gain);
+    var predictedPeak = gain.Loudness?.SamplePeakDb is { } peak ? peak + total : (double?)null;
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal ab-gain-modal">
+            <h3>調整音量：@gain.Entry.Name</h3>
+            <div class="ab-gain-grid">
+                <span>原檔</span>
+                <span>
+                    @(record != null ? $"備份（AudioOriginals，.{record.OriginalExtension}）" : $"目前的檔案（.{gain.Entry.Format}）")
+                    @if (!gain.Entry.IsOgg) { <span class="ab-warning">　套用時會轉成 .ogg</span> }
+                </span>
+
+                <span>原檔響度</span>
+                <span>
+                    @if (gain.Measuring) { <text>量測中…</text> }
+                    else if (gain.MeasureError != null) { <span class="ab-warning">量測失敗：@gain.MeasureError</span> }
+                    else if (gain.Loudness is { } loud)
+                    {
+                        @(loud.IntegratedLufs is { } lufs ? $"{lufs:0.0} LUFS" : "無法量測（太短或太安靜）")
+                        @($"　峰值 {FormatDb(loud.SamplePeakDb)} dBFS")
+                    }
+                </span>
+
+                <span>標準化</span>
+                <span>
+                    <label class="ab-check" title="@(normalizeAvailable ? "" : "量不出可靠的整合響度，只能用手動增益")">
+                        <input type="checkbox" checked="@(gain.Normalize && normalizeAvailable)" disabled="@(!normalizeAvailable)"
+                               @onchange="e => OnGainNormalizeChanged(e.Value is true)" />
+                        到 @State.TargetLufs.ToString("0.#") LUFS
+                    </label>
+                    @if (normalizeGain is { } g)
+                    {
+                        <span class="ab-gain-muted">　（@(normalizeAvailable ? $"{g:+0.0;-0.0;0.0} dB" : $"需要 {g:+0.0;-0.0} dB，超出 ±{AudioGainProcessor.MaxNormalizeGainDb} dB，不可靠")）</span>
+                    }
+                </span>
+
+                <span>手動增益</span>
+                <span class="ab-gain-manual">
+                    <input type="range" min="@AudioGainProcessor.MinManualGainDb" max="@AudioGainProcessor.MaxManualGainDb" step="0.5"
+                           value="@gain.ManualDb.ToString(System.Globalization.CultureInfo.InvariantCulture)"
+                           @oninput="e => OnGainManualChanged(e.Value?.ToString())" />
+                    <input type="number" min="@AudioGainProcessor.MinManualGainDb" max="@AudioGainProcessor.MaxManualGainDb" step="0.5"
+                           value="@gain.ManualDb.ToString(System.Globalization.CultureInfo.InvariantCulture)"
+                           @onchange="e => OnGainManualChanged(e.Value?.ToString())" /> dB
+                    <button class="ab-small-button" @onclick="() => OnGainManualChanged(0)">歸零</button>
+                </span>
+
+                <span>總增益</span>
+                <span><b>@($"{total:+0.0;-0.0;0.0}") dB</b></span>
+
+                <span>處理後峰值</span>
+                <span>
+                    @if (predictedPeak is { } pp)
+                    {
+                        <text>@FormatDb(pp) dBFS</text>
+                        @if (pp > 0)
+                        {
+                            <span class="ab-warning">　⚠ 會削波約 @pp.ToString("0.0") dB</span>
+                        }
+                    }
+                    else { <text>—</text> }
+                </span>
+            </div>
+
+            <div class="ab-gain-preview">
+                <button @onclick="TogglePreview" disabled="@(gain.Loading)">
+                    @(gain.Loading ? "載入中…" : gain.Playing ? "■ 停止" : "▶ 試聽")
+                </button>
+                <span class="ab-view-toggle">
+                    <button class="@(gain.ListenOriginal ? "active" : "")" @onclick="() => SetListenOriginal(true)">A 原檔</button>
+                    <button class="@(gain.ListenOriginal ? "" : "active")" @onclick="() => SetListenOriginal(false)">B 調整後</button>
+                </span>
+                <span class="ab-gain-muted">空白鍵切換 A/B；試聽音量跟著分頁的音量滑桿</span>
+            </div>
+            @if (gain.PreviewError != null) { <p class="ab-warning">@gain.PreviewError</p> }
+
+            <p class="ab-warning">套用會從原檔重新編碼並覆蓋 Assets 裡的檔案（第一次調整時會先把原檔備份到 Unity 專案的 AudioOriginals/）。</p>
+            @if (gain.ApplyError != null) { <p class="ab-warning ab-pre">@gain.ApplyError</p> }
+
+            <div class="ab-modal-actions">
+                @if (record != null)
+                {
+                    <button class="ab-left-action" @onclick="() => RestoreFromDialog(gain.Entry)" disabled="@State.IsBusy">還原原檔…</button>
+                }
+                <button @onclick="ApplyGain" disabled="@(gain.Measuring || gain.MeasureError != null || State.IsBusy)">
+                    @(State.IsGainWriting ? "套用中…" : "套用")
+                </button>
+                <button @onclick="CloseGainDialog" disabled="@State.IsGainWriting">取消</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_writingMessage != null)
+{
+    <div class="ab-modal-backdrop ab-writing-backdrop">
+        <div class="ab-modal ab-writing">
+            <div class="ab-spinner"></div>
+            <div>
+                <div><b>@_writingMessage</b></div>
+                <div class="ab-gain-muted">從原檔重新編碼並覆蓋 Assets 裡的檔案，請稍候…</div>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_restoreEntry is { } restoreEntry)
+{
+    var restoreStatus = State.GetAdjustment(restoreEntry);
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>還原原檔：@restoreEntry.Name</h3>
+            <p>
+                會把備份的原檔（.@restoreStatus.Record?.OriginalExtension）寫回 Assets
+                @(restoreStatus.Record?.OriginalExtension == "ogg" ? "（原封不動複製回去）" : "（重新編碼成 .ogg，增益 0）")，
+                然後刪除備份和這個檔案的調整記錄。
+            </p>
+            @if (restoreStatus.ExternallyChanged)
+            {
+                <p class="ab-warning">⚠ 這個檔案在工具外被換過了，還原會用<b>舊的原檔</b>蓋掉目前的檔案。</p>
+            }
+            <div class="ab-modal-actions">
+                <button @onclick="ConfirmRestore" disabled="@State.IsBusy">@(State.IsGainWriting ? "還原中…" : "還原")</button>
+                <button @onclick="() => _restoreEntry = null" disabled="@State.IsGainWriting">取消</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_forgetEntry is { } forgetEntry)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>採用目前檔案：@forgetEntry.Name</h3>
+            <p>把 Assets 裡目前的檔案當成正確版本：刪除舊的備份原檔和這個檔案的調整記錄，檔案本身不會被改動。</p>
+            <div class="ab-modal-actions">
+                <button @onclick="ConfirmForget">採用</button>
+                <button @onclick="() => _forgetEntry = null">取消</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_pendingNormalize)
+{
+    var pendingNormalize = State.PendingNormalizeFiles;
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>標準化</h3>
+            <p>
+                目標響度
+                <input class="ab-number" type="number" step="0.5" min="-40" max="-5"
+                       value="@State.TargetLufs.ToString(System.Globalization.CultureInfo.InvariantCulture)"
+                       @onchange="OnTargetChanged" /> LUFS
+                <span class="ab-gain-muted">（BGM 和音效各自一個值，存在 Unity 專案的 @AudioAdjustmentSettings.FileName，所有人共用）</span>
+            </p>
+            <p>以下 @pendingNormalize.Count 個檔案還沒標準化，或標準化時的目標值和目前不同。每個檔案會從原檔以固定增益拉到目標響度，已設定的手動增益會保留：</p>
+            <div class="ab-result-list">
+                @foreach (var file in pendingNormalize)
+                {
+                    <div class="ab-result-row">@file.FileName</div>
+                }
+            </div>
+            <p class="ab-warning">會重新編碼並覆蓋 Assets 裡的檔案（原檔會先備份到 AudioOriginals/）。在工具外被換過、量不出響度、增益超出 ±@AudioGainProcessor.MaxNormalizeGainDb dB 的檔案會跳過並列出。</p>
+            <div class="ab-modal-actions">
+                <button @onclick="ConfirmNormalize" disabled="@(pendingNormalize.Count == 0)">開始標準化</button>
+                <button @onclick="() => _pendingNormalize = false">取消</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (!State.IsNormalizeRunning && State.NormalizeResult is { } normalizeResult)
+{
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>@(normalizeResult.Cancelled ? "標準化已取消" : "標準化完成")</h3>
+            <p>完成 @normalizeResult.Applied、跳過 @normalizeResult.Skipped.Count、失敗 @normalizeResult.Failures.Count</p>
+            @if (normalizeResult.Skipped.Count + normalizeResult.Failures.Count > 0)
+            {
+                <div class="ab-result-list">
+                    @foreach (var group in normalizeResult.Skipped.Concat(normalizeResult.Failures).GroupBy(r => r.Outcome))
+                    {
+                        <div class="ab-result-group">@GetOutcomeLabel(group.Key)（@group.Count()）</div>
+                        @foreach (var item in group)
+                        {
+                            <div class="ab-result-row"><b>@item.FileName</b><div class="ab-pre ab-failure">@item.Message</div></div>
+                        }
+                    }
+                </div>
+            }
+            <div class="ab-modal-actions">
+                <button @onclick="CloseNormalizeResult">關閉</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_showOrphans)
+{
+    var unmanaged = State.Entries.Where(e => State.GetAdjustment(e) is { Guid: not null, Record: null }).ToList();
+    <div class="ab-modal-backdrop">
+        <div class="ab-modal">
+            <h3>孤兒記錄</h3>
+            <p>這些調整記錄對應的檔案（依 .meta GUID）已經不在資料夾裡了。檔案真的刪掉了就刪除記錄；如果檔案被刪掉後重新加入（GUID 變了），可以把記錄接到它身上。</p>
+            <div class="ab-result-list">
+                @foreach (var orphan in State.Adjustments.Orphans)
+                {
+                    <div class="ab-result-row ab-orphan-row">
+                        <span class="ab-orphan-name" title="GUID @orphan.Guid"><b>@orphan.Record.LastKnownName</b>
+                            <span class="ab-gain-muted">.@orphan.Record.OriginalExtension　@FormatGainBadge(orphan.Record)</span></span>
+                        <select @onchange="e => _orphanTargets[orphan.Guid] = e.Value?.ToString() ?? string.Empty">
+                            <option value="">（選擇要接上的檔案）</option>
+                            @foreach (var candidate in unmanaged)
+                            {
+                                <option value="@candidate.FileName" selected="@(_orphanTargets.GetValueOrDefault(orphan.Guid) == candidate.FileName)">@candidate.FileName</option>
+                            }
+                        </select>
+                        <button class="ab-small-button" disabled="@string.IsNullOrEmpty(_orphanTargets.GetValueOrDefault(orphan.Guid))"
+                                @onclick="() => RebindOrphan(orphan.Guid)">接上</button>
+                        <button class="ab-small-button" @onclick="() => DeleteOrphan(orphan.Guid)">刪除記錄</button>
+                    </div>
+                }
+            </div>
+            <div class="ab-modal-actions">
+                <button @onclick="() => _showOrphans = false">關閉</button>
+            </div>
+        </div>
+    </div>
+}
+
+<style>
+    .ab-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; background: #262626; }
+    .ab-toolbar { flex: 0 0 auto; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 6px 10px; background: #1e1e1e; border-bottom: 1px solid #333; font-size: 13px; }
+    .ab-view-toggle { display: inline-flex; }
+    .ab-view-toggle button { background: #2a2a2a; color: #bbb; border: 1px solid #444; padding: 4px 12px; cursor: pointer; }
+    .ab-view-toggle button:first-child { border-radius: 3px 0 0 3px; }
+    .ab-view-toggle button:last-child { border-radius: 0 3px 3px 0; border-left: none; }
+    .ab-view-toggle button.active { background: #37507a; color: #fff; }
+    .ab-check { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+    .ab-slider { display: inline-flex; align-items: center; gap: 6px; opacity: 0.9; }
+    .ab-slider input[type="range"] { width: 110px; }
+    .ab-slider-value { min-width: 38px; font-size: 12px; opacity: 0.8; }
+    .ab-search { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 8px; border-radius: 3px; width: 200px; }
+    .ab-status { margin-left: auto; opacity: 0.8; font-size: 12px; }
+    .ab-body { flex: 1 1 auto; overflow: auto; min-height: 0; }
+    .ab-empty { padding: 16px; opacity: 0.6; font-size: 13px; }
+
+    /* table-layout:fixed + an explicit table width (sum of the column widths) is what makes each header cell's
+       width authoritative — with the default auto layout, or a 100% table width, the browser redistributes
+       space and a dragged width wouldn't stick. Wider than the pane = horizontal scroll via .ab-body. */
+    .ab-grid { table-layout: fixed; border-collapse: collapse; font-size: 13px; }
+    .ab-grid th { box-sizing: border-box; position: sticky; top: 0; z-index: 2; background: #1e1e1e; text-align: left; padding: 6px 10px; border-bottom: 1px solid #333; border-right: 1px solid #2c2c2c; cursor: grab; user-select: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ab-sort-indicator { margin-left: 4px; opacity: 0.8; font-size: 11px; }
+    .ab-col-resize { position: absolute; top: 0; right: 0; width: 7px; height: 100%; cursor: col-resize; }
+    .ab-col-resize:hover, body.ab-col-resizing .ab-col-resize:hover { background: #4c8bf5; }
+    body.ab-col-resizing, body.ab-col-resizing * { cursor: col-resize !important; user-select: none; }
+    .ab-grid td { padding: 4px 10px; border-bottom: 1px solid #2e2e2e; height: 48px; box-sizing: border-box; vertical-align: middle; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ab-grid tr:hover td { background: #2c2c2c; }
+    .ab-grid td.ab-cell-wave { padding: 4px 6px; }
+    .ab-grid td.ab-cell-note { white-space: normal; }
+    .ab-cell-duration, .ab-cell-size { font-variant-numeric: tabular-nums; }
+
+    .ab-wave { position: relative; height: 40px; background: #1b1b1b; border-radius: 3px; cursor: pointer; overflow: hidden; }
+    .ab-wave-card { height: 64px; }
+    .ab-wave.playing { box-shadow: inset 0 0 0 1px #9fd08a; }
+    .ab-wave-canvas { display: block; width: 100%; height: 100%; }
+    .ab-wave-progress { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #fff; opacity: 0; pointer-events: none; }
+    .ab-wave.playing .ab-wave-progress { opacity: 0.85; }
+
+    .ab-note-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: text; min-height: 18px; }
+    .ab-note-placeholder { opacity: 0.35; }
+    .ab-note-edit { width: 100%; box-sizing: border-box; resize: none; overflow: hidden; background: #2a2a2a; color: #eee; border: 1px solid #4c8bf5; border-radius: 3px; padding: 4px 6px; font: inherit; min-height: 38px; }
+
+    .ab-cards { display: flex; flex-wrap: wrap; gap: 12px; padding: 12px; align-content: flex-start; }
+    .ab-card { background: #2c2c2c; border: 1px solid #383838; border-radius: 5px; padding: 8px; display: flex; flex-direction: column; gap: 6px; box-sizing: border-box; }
+    .ab-card-title { font-size: 13px; font-weight: bold; word-break: break-all; }
+    .ab-card-meta { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; }
+    .ab-card-duration { font-variant-numeric: tabular-nums; }
+    .ab-card-minor { font-size: 11px; opacity: 0.5; }
+    .ab-card-note { width: 100%; box-sizing: border-box; min-height: 54px; resize: vertical; background: #242424; color: #ddd; border: 1px solid #3c3c3c; border-radius: 3px; padding: 4px 6px; font: inherit; font-size: 12px; }
+
+    .ab-context-menu-backdrop { position: fixed; inset: 0; z-index: 1100; }
+    .ab-context-menu { position: fixed; z-index: 1101; background: #2a2a2a; border: 1px solid #444; border-radius: 4px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); padding: 4px 0; min-width: 150px; font-size: 13px; }
+    .ab-context-menu button { display: block; width: 100%; text-align: left; padding: 7px 14px; background: none; border: none; color: #ddd; cursor: pointer; font: inherit; }
+    .ab-context-menu button:hover { background: #3a3a3a; }
+
+    .ab-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+    .ab-modal { background: #262626; color: #ddd; border: 1px solid #444; border-radius: 6px; padding: 18px 20px; max-width: 600px; width: 90%; max-height: 80vh; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); font-family: sans-serif; font-size: 13px; }
+    .ab-modal h3 { margin: 0; }
+    .ab-modal p { margin: 0; }
+    .ab-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .ab-warning { color: #e0a83c; font-size: 12px; }
+    .ab-pre { white-space: pre-wrap; word-break: break-all; }
+    .ab-failure { font-family: monospace; font-size: 11px; opacity: 0.8; max-height: 120px; overflow: auto; }
+    .ab-result-list { overflow-y: auto; max-height: 40vh; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 10px; }
+    .ab-result-row { padding: 3px 0; border-bottom: 1px solid #333; }
+    .ab-result-row:last-child { border-bottom: none; }
+    .ab-progress-bar { height: 8px; border-radius: 4px; background: #333; overflow: hidden; }
+    .ab-progress-fill { height: 100%; background: #4c8bf5; transition: width 0.15s ease-out; }
+    .ab-progress-text { font-size: 12px; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .ab-warn-button { color: #e0a83c; }
+    .ab-context-menu button:disabled { opacity: 0.4; cursor: default; }
+    .ab-gain { font-variant-numeric: tabular-nums; font-size: 12px; color: #b9d4ff; }
+    .ab-card-meta .ab-gain { margin-left: auto; margin-right: 8px; }
+    .ab-gain-warn { color: #e0a83c; margin-left: 4px; }
+    .ab-gain-stale { color: #e0a83c; margin-left: 4px; }
+    .ab-gain-modal { max-width: 640px; }
+    .ab-writing-backdrop { z-index: 1200; }
+    .ab-writing { flex-direction: row; align-items: center; gap: 14px; max-width: 420px; }
+    .ab-spinner { flex: 0 0 auto; width: 26px; height: 26px; border: 3px solid #444; border-top-color: #4c8bf5; border-radius: 50%; animation: ab-spin 0.8s linear infinite; }
+    @@keyframes ab-spin { to { transform: rotate(360deg); } }
+    /* Just-written row/card: a short green pulse so the result of 套用/還原 is findable in a long list. */
+    .ab-grid tr.ab-flash td, .ab-card.ab-flash { animation: ab-flash 2.4s ease-out; }
+    @@keyframes ab-flash { 0%, 30% { background: #2f5a34; } 100% { background: transparent; } }
+    .ab-gain-grid { display: grid; grid-template-columns: 90px 1fr; gap: 8px 12px; align-items: center; }
+    .ab-gain-grid > span:nth-child(odd) { opacity: 0.7; }
+    .ab-gain-manual { display: flex; align-items: center; gap: 8px; }
+    .ab-gain-manual input[type="range"] { flex: 1 1 auto; min-width: 160px; }
+    .ab-gain-manual input[type="number"], .ab-number { width: 64px; background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 3px; padding: 3px 6px; }
+    .ab-gain-muted { opacity: 0.6; font-size: 12px; }
+    .ab-gain-preview { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 4px; }
+    .ab-small-button { padding: 2px 8px; font-size: 12px; }
+    .ab-left-action { margin-right: auto; }
+    .ab-result-group { font-weight: bold; padding: 6px 0 2px; color: #e0a83c; }
+    .ab-orphan-row { display: flex; align-items: center; gap: 8px; }
+    .ab-orphan-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ab-orphan-row select { max-width: 200px; background: #2a2a2a; color: #eee; border: 1px solid #444; }
+</style>
+
+@code {
+    [Parameter, EditorRequired] public AudioCategory Category { get; set; }
+
+    private AudioLibraryState State = null!;
+    private DotNetObjectReference<AudioBrowserPanel>? _selfRef;
+    private string _rootId = string.Empty;
+    private string _headerRowId = string.Empty;
+    private string _noteEditorId = string.Empty;
+
+    private string _searchText = string.Empty;
+
+    // Set whenever the scanned file list changes, so the next OnAfterRenderAsync pushes it (URLs + cached
+    // waveforms) to audio-browser.js — only then, not on every render.
+    private bool _entriesDirty = true;
+
+    private string? _editingNoteFile;
+    private string? _escapedNoteFile;
+    private bool _focusNoteEditor;
+
+    private AudioEntry? _contextMenuEntry;
+    private double _contextMenuX;
+    private double _contextMenuY;
+
+    private List<AudioEntry>? _pendingConvert;
+    private string? _convertError;
+
+    private sealed class GainDialog
+    {
+        public AudioEntry Entry { get; init; } = null!;
+        // The user confirmed the (externally changed) current file is the new original.
+        public bool Adopt { get; init; }
+        public string Url { get; init; } = string.Empty;
+        public AudioLoudness? Loudness { get; set; }
+        public bool Measuring { get; set; }
+        public string? MeasureError { get; set; }
+        public bool Normalize { get; set; }
+        public double ManualDb { get; set; }
+        public bool ListenOriginal { get; set; }
+        public bool Playing { get; set; }
+        public bool Loading { get; set; }
+        public string? PreviewError { get; set; }
+        public string? ApplyError { get; set; }
+    }
+
+    private GainDialog? _gain;
+
+    // Non-null while a single-file write (套用/還原) runs — drives the blocking 轉檔中 overlay.
+    private string? _writingMessage;
+
+    // Name (no extension — a .wav becomes .ogg on write) of the row/card to pulse after a write.
+    private string? _flashName;
+    private int _flashToken;
+    private string? _gainMessage;
+    private AudioEntry? _adoptPromptEntry;
+    private AudioEntry? _restoreEntry;
+    private AudioEntry? _forgetEntry;
+    private bool _pendingNormalize;
+    private bool _showOrphans;
+    private readonly Dictionary<string, string> _orphanTargets = new(StringComparer.OrdinalIgnoreCase);
+
+    protected override void OnInitialized()
+    {
+        var segment = Category == AudioCategory.Bgm ? "bgm" : "sfx";
+        _rootId = $"ab-root-{segment}";
+        _headerRowId = $"ab-header-{segment}";
+        _noteEditorId = $"ab-note-edit-{segment}";
+
+        State = new AudioLibraryState(Category, AppSettings, WaveformCache);
+        State.Load();
+        State.OnConvertProgress += OnConvertProgress;
+        ReloadCoordinator.Subscribe(OnReload);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _selfRef ??= DotNetObjectReference.Create(this);
+        if (firstRender)
+            await JS.InvokeVoidAsync("storyForgeAudio.init", _rootId, _selfRef, PlaybackOptions);
+
+        if (_entriesDirty)
+        {
+            _entriesDirty = false;
+            await JS.InvokeVoidAsync("storyForgeAudio.setEntries", _rootId, State.Entries.Select(entry => new
+            {
+                name = entry.FileName,
+                url = State.GetUrl(entry),
+                peaks = State.GetWaveform(entry)?.Peaks,
+            }).ToList());
+        }
+        else
+        {
+            await JS.InvokeVoidAsync("storyForgeAudio.redraw", _rootId, false);
+        }
+
+        if (State.Page.ViewMode == AudioPageSettings.ViewList && State.Entries.Count > 0)
+            await JS.InvokeVoidAsync("storyForgeAudio.initColumns", _headerRowId, _selfRef);
+
+        if (_focusNoteEditor)
+        {
+            _focusNoteEditor = false;
+            await JS.InvokeVoidAsync("storyForgeAudio.focusNote", _noteEditorId);
+        }
+    }
+
+    private object PlaybackOptions => new { autoPlay = State.Page.AutoPlay, loop = State.Page.Loop, volume = State.Page.Volume };
+
+    private IEnumerable<AudioEntry> VisibleEntries
+    {
+        get
+        {
+            var search = _searchText.Trim();
+            var entries = State.Entries.Where(e => search.Length == 0
+                || e.FileName.Contains(search, StringComparison.OrdinalIgnoreCase)
+                || State.GetNote(e).Contains(search, StringComparison.OrdinalIgnoreCase));
+            return ApplySort(entries);
+        }
+    }
+
+    // Values that don't exist yet (a duration still being decoded, an empty note) always sort after the
+    // ones that do, in either direction — they're "no data", not "smallest".
+    private IEnumerable<AudioEntry> ApplySort(IEnumerable<AudioEntry> entries)
+    {
+        var desc = State.Page.SortDescending;
+
+        IEnumerable<AudioEntry> By<TKey>(Func<AudioEntry, TKey> key, IComparer<TKey>? comparer = null) =>
+            desc ? entries.OrderByDescending(key, comparer) : entries.OrderBy(key, comparer);
+
+        IEnumerable<AudioEntry> ByMissingLast<TKey>(Func<AudioEntry, bool> has, Func<AudioEntry, TKey> key, IComparer<TKey>? comparer = null)
+        {
+            var ordered = entries.OrderBy(e => has(e) ? 0 : 1);
+            return desc ? ordered.ThenByDescending(key, comparer) : ordered.ThenBy(key, comparer);
+        }
+
+        return State.Page.SortColumn switch
+        {
+            "name" => By(e => e.FileName, NaturalStringComparer.Instance),
+            "duration" => ByMissingLast(e => State.GetWaveform(e) != null, e => State.GetWaveform(e)?.DurationSeconds ?? 0),
+            "format" => By(e => e.Format, StringComparer.Ordinal),
+            "size" => By(e => e.SizeBytes),
+            "gain" => ByMissingLast(e => State.GetAdjustment(e).Record != null, e => State.GetAdjustment(e).Record?.TotalGainDb ?? 0),
+            "note" => ByMissingLast(e => State.GetNote(e).Length > 0, e => State.GetNote(e), StringComparer.Ordinal),
+            _ => entries,
+        };
+    }
+
+    private double TableWidth => State.Page.Columns.Sum(c => c.Width);
+
+    private static string GetColumnLabel(string key) => key switch
+    {
+        "wave" => "音紋",
+        "name" => "檔名",
+        "duration" => "長度",
+        "format" => "格式",
+        "size" => "大小",
+        "gain" => "音量",
+        "note" => "備註",
+        _ => key,
+    };
+
+    private RenderFragment RenderWave(AudioEntry entry, string extraClass) => @<div class="ab-wave @extraClass" data-name="@entry.FileName" title="@(State.Page.AutoPlay ? "游標停留自動從頭播放；點擊從該位置播放；移開停止" : "點擊從該位置播放；移開停止")">
+        <canvas class="ab-wave-canvas" data-name="@entry.FileName"></canvas>
+        <div class="ab-wave-progress"></div>
+    </div>;
+
+    private RenderFragment RenderCell(AudioEntry entry, string key) => key switch
+    {
+        "wave" => RenderWave(entry, string.Empty),
+        "name" => @<span title="@entry.FileName">@entry.Name</span>,
+        "duration" => @<span>@FormatDuration(entry)</span>,
+        "format" => @<span>@entry.Format</span>,
+        "size" => @<span>@FormatSize(entry.SizeBytes)</span>,
+        "gain" => RenderGain(entry),
+        "note" => RenderNoteCell(entry),
+        _ => @<span></span>,
+    };
+
+    private RenderFragment RenderNoteCell(AudioEntry entry)
+    {
+        if (_editingNoteFile == entry.FileName)
+        {
+            return @<textarea id="@_noteEditorId" class="ab-note-edit" rows="1" value="@State.GetNote(entry)"
+                              @onchange="e => SaveNote(entry, e.Value?.ToString())"
+                              @onblur="() => _editingNoteFile = null"
+                              @onkeydown="e => OnNoteKeyDown(entry, e)"></textarea>;
+        }
+
+        var note = State.GetNote(entry);
+        return @<div class="ab-note-text" title="@note" @onclick="() => StartEditNote(entry)">
+            @if (note.Length == 0)
+            {
+                <span class="ab-note-placeholder">（點擊輸入備註）</span>
+            }
+            else
+            {
+                @note
+            }
+        </div>;
+    }
+
+    private string FormatDuration(AudioEntry entry)
+    {
+        var waveform = State.GetWaveform(entry);
+        if (waveform == null)
+            return "…";
+        // Short clips (most SFX) keep a tenth of a second — "0:01" for everything under two seconds would
+        // make them indistinguishable.
+        var seconds = waveform.DurationSeconds;
+        if (seconds < 10)
+            return $"0:{seconds:00.0}";
+        var total = (int)Math.Round(seconds);
+        return $"{total / 60}:{total % 60:00}";
+    }
+
+    private static string FormatSize(long bytes) =>
+        bytes >= 1024 * 1024 ? $"{bytes / 1024.0 / 1024.0:0.0} MB" : $"{Math.Max(1, (int)Math.Round(bytes / 1024.0))} KB";
+
+    // ---- toolbar ----
+
+    private async Task SetViewMode(string mode)
+    {
+        if (State.Page.ViewMode == mode)
+            return;
+        // The playing wave element is about to be destroyed by the re-render.
+        await JS.InvokeVoidAsync("storyForgeAudio.stopAll");
+        State.Page.ViewMode = mode;
+        _editingNoteFile = null;
+        State.SavePage();
+    }
+
+    private async Task OnAutoPlayChanged(ChangeEventArgs e)
+    {
+        State.Page.AutoPlay = e.Value is true;
+        State.SavePage();
+        await PushPlaybackOptions();
+    }
+
+    private async Task OnLoopChanged(ChangeEventArgs e)
+    {
+        State.Page.Loop = e.Value is true;
+        State.SavePage();
+        await PushPlaybackOptions();
+    }
+
+    // Slider drags update live (volume applies to a clip already playing) but only save on release.
+    private async Task OnVolumeInput(ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), out var value))
+        {
+            State.Page.Volume = Math.Clamp(value / 100.0, 0, 1);
+            await PushPlaybackOptions();
+        }
+    }
+
+    private void OnCardSizeInput(ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), out var value))
+            State.Page.CardSize = value;
+    }
+
+    private void OnSliderCommitted() => State.SavePage();
+
+    private Task PushPlaybackOptions() => JS.InvokeVoidAsync("storyForgeAudio.updateOptions", _rootId, PlaybackOptions).AsTask();
+
+    private async Task Rescan()
+    {
+        await JS.InvokeVoidAsync("storyForgeAudio.stopAll");
+        State.Load();
+        _entriesDirty = true;
+    }
+
+    private async Task OnReload()
+    {
+        State.Load();
+        _entriesDirty = true;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    // ---- list columns ----
+
+    private void OnColumnHeaderClicked(string key)
+    {
+        if (key == "wave")
+            return;
+
+        if (State.Page.SortColumn == key)
+            State.Page.SortDescending = !State.Page.SortDescending;
+        else
+        {
+            State.Page.SortColumn = key;
+            State.Page.SortDescending = false;
+        }
+        State.SavePage();
+    }
+
+    [JSInvokable]
+    public void OnColumnReordered(int oldIndex, int newIndex)
+    {
+        var columns = State.Page.Columns;
+        if (oldIndex < 0 || oldIndex >= columns.Count || newIndex < 0 || newIndex >= columns.Count)
+            return;
+
+        var column = columns[oldIndex];
+        columns.RemoveAt(oldIndex);
+        columns.Insert(newIndex, column);
+        State.SavePage();
+        StateHasChanged();
+    }
+
+    [JSInvokable]
+    public void OnColumnResized(string key, double width)
+    {
+        var column = State.Page.Columns.FirstOrDefault(c => c.Key == key);
+        if (column == null)
+            return;
+
+        column.Width = Math.Max(AudioPageSettings.MinColumnWidth, width);
+        State.SavePage();
+        StateHasChanged();
+    }
+
+    // ---- waveform ----
+
+    [JSInvokable]
+    public void OnWaveformComputed(string fileName, double durationSeconds, byte[] peaks)
+    {
+        State.StoreWaveform(fileName, durationSeconds, peaks);
+        StateHasChanged();
+    }
+
+    // ---- notes ----
+
+    private void StartEditNote(AudioEntry entry)
+    {
+        _editingNoteFile = entry.FileName;
+        _escapedNoteFile = null;
+        _focusNoteEditor = true;
+    }
+
+    private void OnNoteKeyDown(AudioEntry entry, KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            _escapedNoteFile = entry.FileName;
+            _editingNoteFile = null;
+        }
+    }
+
+    private void SaveNote(AudioEntry entry, string? text)
+    {
+        // Esc means discard — a change event that still arrives for the editor Esc just closed is ignored.
+        if (_escapedNoteFile == entry.FileName)
+            return;
+        State.SetNote(entry, text ?? string.Empty);
+    }
+
+    // ---- context menu ----
+
+    private void OpenContextMenu(MouseEventArgs e, AudioEntry entry)
+    {
+        _contextMenuEntry = entry;
+        _contextMenuX = e.ClientX;
+        _contextMenuY = e.ClientY;
+    }
+
+    private void CloseContextMenu() => _contextMenuEntry = null;
+
+    private async Task CopyName(AudioEntry entry)
+    {
+        _contextMenuEntry = null;
+        await JS.InvokeVoidAsync("navigator.clipboard.writeText", entry.Name);
+    }
+
+    private async Task RefreshWaveform(AudioEntry entry)
+    {
+        _contextMenuEntry = null;
+        State.InvalidateWaveform(entry.FileName);
+        await JS.InvokeVoidAsync("storyForgeAudio.recompute", _rootId, entry.FileName);
+    }
+
+    // ---- 轉檔成 OGG ----
+
+    private void RequestConvert()
+    {
+        _convertError = State.ValidateFfmpeg();
+        if (_convertError == null)
+            _pendingConvert = State.PendingConvertFiles;
+    }
+
+    private async Task ConfirmConvert()
+    {
+        var files = _pendingConvert;
+        _pendingConvert = null;
+        if (files == null || files.Count == 0)
+            return;
+
+        await JS.InvokeVoidAsync("storyForgeAudio.stopAll");
+        await State.RunConvertAsync(files);
+    }
+
+    private Task OnConvertProgress() => InvokeAsync(StateHasChanged);
+
+    private void CloseConvertResult()
+    {
+        State.ClearConvertResult();
+        State.Load();
+        _entriesDirty = true;
+    }
+
+    // ---- 音量 column ----
+
+    private RenderFragment RenderGain(AudioEntry entry)
+    {
+        var status = State.GetAdjustment(entry);
+        if (status.Record is not { } record)
+            return @<span></span>;
+
+        var outdated = State.IsTargetOutdated(status);
+        return @<span class="ab-gain" title="@GainTooltip(record, status.ExternallyChanged, outdated)">
+            @FormatGainBadge(record)
+            @if (status.ExternallyChanged)
+            {
+                <span class="ab-gain-warn">⚠ 外部已變更</span>
+            }
+            else if (outdated)
+            {
+                <span class="ab-gain-stale">↻</span>
+            }
+        </span>;
+    }
+
+    // "N -3.2 +1.5" = normalized (its gain), then the manual gain on top.
+    private static string FormatGainBadge(AudioAdjustmentRecord record)
+    {
+        var parts = new List<string>();
+        if (record.Normalize)
+            parts.Add($"N {record.NormalizeGainDb:+0.0;-0.0;0.0}");
+        if (record.ManualGainDb != 0)
+            parts.Add($"{record.ManualGainDb:+0.0;-0.0}");
+        return parts.Count == 0 ? "0 dB" : string.Join(" ", parts);
+    }
+
+    private string GainTooltip(AudioAdjustmentRecord record, bool externallyChanged, bool outdated)
+    {
+        var lines = new List<string>
+        {
+            $"原檔響度：{(record.MeasuredLufs is { } lufs ? $"{lufs:0.0} LUFS" : "無法量測")}，峰值 {FormatDb(record.OriginalPeakDb)} dBFS",
+            record.Normalize ? $"標準化到 {record.NormalizeTargetLufs:0.#} LUFS：{record.NormalizeGainDb:+0.0;-0.0;0.0} dB" : "未標準化",
+            $"手動增益：{record.ManualGainDb:+0.0;-0.0;0.0} dB",
+            $"總增益：{record.TotalGainDb:+0.0;-0.0;0.0} dB",
+        };
+        if (externallyChanged)
+            lines.Add("⚠ 檔案在工具外被換過了（或備份不見了）");
+        else if (outdated)
+            lines.Add($"↻ 目標響度已改成 {State.TargetLufs:0.#} LUFS，需要重新標準化");
+        return string.Join("\n", lines);
+    }
+
+    private static string FormatDb(double? db) => db is { } value ? value.ToString("0.0") : "—";
+
+    private static string GetOutcomeLabel(AudioGainOutcome outcome) => outcome switch
+    {
+        AudioGainOutcome.NeedsAdopt => "在工具外被換過（請用右鍵「調整音量」處理）",
+        AudioGainOutcome.Unmeasurable => "量不出響度（請改用手動增益）",
+        AudioGainOutcome.GainOutOfRange => "增益超出範圍（量測不可靠）",
+        AudioGainOutcome.NoMeta => "沒有 .meta",
+        AudioGainOutcome.LfsPointer => "Git LFS 指標檔（尚未下載）",
+        AudioGainOutcome.Collision => "同名 .ogg 已存在",
+        AudioGainOutcome.Failed => "失敗",
+        _ => outcome.ToString(),
+    };
+
+    // ---- 調整音量 dialog ----
+
+    private async Task OpenGainDialog(AudioEntry entry, bool adopt)
+    {
+        _contextMenuEntry = null;
+        _adoptPromptEntry = null;
+
+        if (State.CheckCanAdjust(entry) is { } error)
+        {
+            _gainMessage = error;
+            return;
+        }
+
+        var status = State.GetAdjustment(entry);
+        if (status.ExternallyChanged && !adopt)
+        {
+            _adoptPromptEntry = entry;
+            return;
+        }
+
+        await JS.InvokeVoidAsync("storyForgeAudio.stopAll");
+        var record = adopt ? null : status.Record;
+        var dialog = new GainDialog
+        {
+            Entry = entry,
+            Adopt = adopt,
+            Url = State.GetOriginalUrl(entry, adopt),
+            Normalize = record?.Normalize ?? false,
+            ManualDb = record?.ManualGainDb ?? 0,
+        };
+        _gain = dialog;
+        _selfRef ??= DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("storyForgeAudio.previewBindKeys", _selfRef);
+
+        if (record != null)
+        {
+            dialog.Loudness = new AudioLoudness { IntegratedLufs = record.MeasuredLufs, SamplePeakDb = record.OriginalPeakDb };
+            return;
+        }
+
+        dialog.Measuring = true;
+        StateHasChanged();
+        var (loudness, measureError) = await State.MeasureAsync(entry);
+        dialog.Measuring = false;
+        if (loudness == null)
+            dialog.MeasureError = measureError;
+        dialog.Loudness = loudness;
+    }
+
+    private Task OpenGainDialogAdopting(AudioEntry entry) => OpenGainDialog(entry, true);
+
+    private double? NormalizeGainOf(GainDialog dialog) =>
+        dialog.Loudness?.IntegratedLufs is { } lufs ? State.TargetLufs - lufs : null;
+
+    private bool IsNormalizeUsable(GainDialog dialog) =>
+        dialog.Normalize && NormalizeGainOf(dialog) is { } gain && Math.Abs(gain) <= AudioGainProcessor.MaxNormalizeGainDb;
+
+    private double TotalGainOf(GainDialog dialog) =>
+        (IsNormalizeUsable(dialog) ? NormalizeGainOf(dialog)!.Value : 0) + dialog.ManualDb;
+
+    private double PreviewGainOf(GainDialog dialog) => dialog.ListenOriginal ? 0 : TotalGainOf(dialog);
+
+    private Task PushPreviewGain() =>
+        _gain is { Playing: true } dialog
+            ? JS.InvokeVoidAsync("storyForgeAudio.previewSetGain", PreviewGainOf(dialog)).AsTask()
+            : Task.CompletedTask;
+
+    private async Task OnGainNormalizeChanged(bool value)
+    {
+        if (_gain == null)
+            return;
+        _gain.Normalize = value;
+        await PushPreviewGain();
+    }
+
+    private Task OnGainManualChanged(string? text) =>
+        double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? OnGainManualChanged(value)
+            : Task.CompletedTask;
+
+    private async Task OnGainManualChanged(double value)
+    {
+        if (_gain == null)
+            return;
+        _gain.ManualDb = AudioGainProcessor.ClampManualGain(value);
+        await PushPreviewGain();
+    }
+
+    private async Task SetListenOriginal(bool original)
+    {
+        if (_gain == null)
+            return;
+        _gain.ListenOriginal = original;
+        await PushPreviewGain();
+    }
+
+    [JSInvokable]
+    public async Task OnPreviewToggleAB()
+    {
+        if (_gain == null)
+            return;
+        await SetListenOriginal(!_gain.ListenOriginal);
+        StateHasChanged();
+    }
+
+    private async Task TogglePreview()
+    {
+        if (_gain is not { } dialog)
+            return;
+
+        if (dialog.Playing)
+        {
+            dialog.Playing = false;
+            await JS.InvokeVoidAsync("storyForgeAudio.previewStop");
+            return;
+        }
+
+        dialog.Loading = true;
+        dialog.PreviewError = null;
+        StateHasChanged();
+        try
+        {
+            dialog.Playing = await JS.InvokeAsync<bool>("storyForgeAudio.previewStart", dialog.Url, PreviewGainOf(dialog), State.Page.Volume);
+            // The gain may have moved while the file was still loading.
+            await PushPreviewGain();
+        }
+        catch (JSException e)
+        {
+            dialog.PreviewError = $"無法播放：{e.Message}";
+        }
+        finally
+        {
+            dialog.Loading = false;
+        }
+    }
+
+    private async Task StopPreview()
+    {
+        await JS.InvokeVoidAsync("storyForgeAudio.previewStop");
+        await JS.InvokeVoidAsync("storyForgeAudio.previewUnbindKeys");
+    }
+
+    private async Task CloseGainDialog()
+    {
+        _gain = null;
+        await StopPreview();
+    }
+
+    private async Task ApplyGain()
+    {
+        if (_gain is not { } dialog)
+            return;
+
+        dialog.ApplyError = null;
+        await JS.InvokeVoidAsync("storyForgeAudio.previewStop");
+        dialog.Playing = false;
+
+        var result = await RunWithOverlay($"轉檔中：{dialog.Entry.Name}",
+            () => State.ApplyGainAsync(dialog.Entry, IsNormalizeUsable(dialog), dialog.ManualDb, dialog.Adopt));
+        if (!result.Succeeded)
+        {
+            dialog.ApplyError = result.Message;
+            return;
+        }
+
+        await CloseGainDialog();
+        ReloadAfterWrite(dialog.Entry);
+    }
+
+    // Blazor only re-renders an event handler at its first yield and at its end — and ApplyGain's first
+    // yield is the preview stop, before the write starts — so the overlay needs an explicit render.
+    private async Task<AudioGainResult> RunWithOverlay(string message, Func<Task<AudioGainResult>> write)
+    {
+        _writingMessage = message;
+        StateHasChanged();
+        try
+        {
+            return await write();
+        }
+        finally
+        {
+            _writingMessage = null;
+        }
+    }
+
+    private async Task RestoreFromDialog(AudioEntry entry)
+    {
+        await CloseGainDialog();
+        RequestRestore(entry);
+    }
+
+    private void ReloadAfterWrite(AudioEntry written)
+    {
+        var message = State.StatusMessage;
+        State.Load();
+        State.SetStatusMessage(message);
+        _entriesDirty = true;
+        _ = FlashAsync(written.Name);
+    }
+
+    private async Task FlashAsync(string name)
+    {
+        var token = ++_flashToken;
+        _flashName = name;
+        await Task.Delay(2500);
+        if (token != _flashToken)
+            return;
+        _flashName = null;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    // ---- 還原原檔 / 採用目前檔案 ----
+
+    private void RequestRestore(AudioEntry entry)
+    {
+        _contextMenuEntry = null;
+        if (State.ValidateFfmpeg() is { } error)
+            _gainMessage = error;
+        else
+            _restoreEntry = entry;
+    }
+
+    private async Task ConfirmRestore()
+    {
+        if (_restoreEntry is not { } entry)
+            return;
+
+        await JS.InvokeVoidAsync("storyForgeAudio.stopAll");
+        var overwrite = State.GetAdjustment(entry).ExternallyChanged;
+        _restoreEntry = null;
+        var result = await RunWithOverlay($"還原中：{entry.Name}", () => State.RestoreAsync(entry, overwrite));
+        if (!result.Succeeded)
+            _gainMessage = result.Message;
+        ReloadAfterWrite(entry);
+    }
+
+    private void RequestForget(AudioEntry entry)
+    {
+        _contextMenuEntry = null;
+        _forgetEntry = entry;
+    }
+
+    private void ConfirmForget()
+    {
+        if (_forgetEntry is { } entry)
+            State.ForgetAdjustment(entry);
+        _forgetEntry = null;
+    }
+
+    // ---- 標準化（批次） ----
+
+    private void RequestNormalize()
+    {
+        _convertError = null;
+        if (State.ValidateFfmpeg() is { } error)
+            _gainMessage = error;
+        else
+            _pendingNormalize = true;
+    }
+
+    private void OnTargetChanged(ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var value))
+            State.SetTargetLufs(Math.Round(Math.Clamp(value, -40, -5) * 2, MidpointRounding.AwayFromZero) / 2);
+    }
+
+    private async Task ConfirmNormalize()
+    {
+        _pendingNormalize = false;
+        var files = State.PendingNormalizeFiles;
+        if (files.Count == 0)
+            return;
+
+        await JS.InvokeVoidAsync("storyForgeAudio.stopAll");
+        await State.RunNormalizeAsync(files);
+    }
+
+    private void CloseNormalizeResult()
+    {
+        State.ClearNormalizeResult();
+        State.Load();
+        _entriesDirty = true;
+    }
+
+    // ---- 孤兒記錄 ----
+
+    private void RebindOrphan(string guid)
+    {
+        var target = State.Find(_orphanTargets.GetValueOrDefault(guid) ?? string.Empty);
+        if (target == null)
+            return;
+        State.RebindOrphan(guid, target);
+        _orphanTargets.Remove(guid);
+        if (State.Adjustments.Orphans.Count == 0)
+            _showOrphans = false;
+    }
+
+    private void DeleteOrphan(string guid)
+    {
+        State.DeleteOrphan(guid);
+        _orphanTargets.Remove(guid);
+        if (State.Adjustments.Orphans.Count == 0)
+            _showOrphans = false;
+    }
+
+    public void Dispose()
+    {
+        State.OnConvertProgress -= OnConvertProgress;
+        ReloadCoordinator.Unsubscribe(OnReload);
+        _selfRef?.Dispose();
+    }
+}

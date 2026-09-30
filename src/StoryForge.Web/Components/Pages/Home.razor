@@ -2,6 +2,8 @@
 @using StoryForge.Web.Components.Panels
 @implements IDisposable
 @inject FlowGraphFocusCoordinator FlowGraphFocusCoordinator
+@inject StoryForge.Core.Graph.AppSettings AppSettings
+@inject IJSRuntime JS
 
 @* The "分頁" layer between MainLayout's global 工具列 and each panel's own 分頁工具列 (流程圖's
    重新載入/存檔/縮放至全部, 角色卡's 新增角色/刪除角色). Both panels are ALWAYS rendered — switching
@@ -10,11 +12,15 @@
 <PageTitle>StoryForge</PageTitle>
 
 <div class="tab-shell">
-    <div class="tab-strip">
-        <button class="tab-strip-item @(_activeTab == "outline" ? "active" : "")" @onclick='() => SetTab("outline")'>世界書</button>
-        <button class="tab-strip-item @(_activeTab == "pipeline" ? "active" : "")" @onclick='() => SetTab("pipeline")'>劇本管線狀態</button>
-        <button class="tab-strip-item @(_activeTab == "graph" ? "active" : "")" @onclick='() => SetTab("graph")'>流程圖</button>
-        <button class="tab-strip-item @(_activeTab == "card" ? "active" : "")" @onclick='() => SetTab("card")'>角色卡</button>
+    @* Only the strip's button order is user-reorderable (drag, remembered in AppSettings.TabOrder) — the
+       .tab-pane divs below stay in their fixed DOM order regardless, which matters for the
+       FlowGraphPanel-before-PipelineStatusPanel ordering explained further down. *@
+    <div class="tab-strip" id="tab-strip">
+        @foreach (var tab in _tabs)
+        {
+            <button @key="tab.Key" class="tab-strip-item @(_activeTab == tab.Key ? "active" : "")"
+                    @onclick="() => SetTab(tab.Key)">@tab.Label</button>
+        }
     </div>
     <div class="tab-body">
         <div class="tab-pane" style="display:@(_activeTab == "outline" ? "block" : "none")">
@@ -35,6 +41,12 @@
         <div class="tab-pane" style="display:@(_activeTab == "card" ? "block" : "none")">
             <CharacterCardPanel />
         </div>
+        <div class="tab-pane" style="display:@(_activeTab == "bgm" ? "block" : "none")">
+            <AudioBrowserPanel Category="StoryForge.Core.Audio.AudioCategory.Bgm" />
+        </div>
+        <div class="tab-pane" style="display:@(_activeTab == "sfx" ? "block" : "none")">
+            <AudioBrowserPanel Category="StoryForge.Core.Audio.AudioCategory.Sfx" />
+        </div>
     </div>
 </div>
 
@@ -52,16 +64,65 @@
 </style>
 
 @code {
-    private string _activeTab = "graph";
+    private sealed record TabDef(string Key, string Label);
 
-    private void SetTab(string tab)
+    private static readonly IReadOnlyList<TabDef> DefaultTabs = new List<TabDef>
     {
+        new("outline", "世界書"),
+        new("pipeline", "劇本管線狀態"),
+        new("graph", "流程圖"),
+        new("card", "角色卡"),
+        new("bgm", "BGM"),
+        new("sfx", "音效"),
+    };
+
+    private string _activeTab = "graph";
+    private List<TabDef> _tabs = new();
+    private DotNetObjectReference<Home>? _selfRef;
+
+    private async Task SetTab(string tab)
+    {
+        if (_activeTab == tab)
+            return;
         _activeTab = tab;
+        // Nothing should keep playing from a tab that's no longer visible.
+        await JS.InvokeVoidAsync("storyForgeAudio.stopAll");
     }
 
     protected override void OnInitialized()
     {
         FlowGraphFocusCoordinator.SubscribeTabActivation(ActivateGraphTab);
+
+        // Saved order first (skipping keys no longer known), then any tab the saved order doesn't mention
+        // yet — e.g. one added in a later build — at the end in its default position.
+        var byKey = DefaultTabs.ToDictionary(t => t.Key);
+        _tabs = AppSettings.TabOrder.Where(byKey.ContainsKey).Distinct().Select(k => byKey[k]).ToList();
+        _tabs.AddRange(DefaultTabs.Where(t => !_tabs.Contains(t)));
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _selfRef ??= DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("storyForgeColumnSort.initReverting", "tab-strip", _selfRef, nameof(OnTabReordered), null);
+    }
+
+    [JSInvokable]
+    public void OnTabReordered(int oldIndex, int newIndex)
+    {
+        if (oldIndex < 0 || oldIndex >= _tabs.Count || newIndex < 0 || newIndex >= _tabs.Count)
+            return;
+
+        var tab = _tabs[oldIndex];
+        _tabs.RemoveAt(oldIndex);
+        _tabs.Insert(newIndex, tab);
+
+        // Read-modify-write through a fresh load rather than saving the circuit's own AppSettings copy
+        // wholesale — this circuit's copy may predate edits another tab made in the 設定 dialog.
+        var fresh = StoryForge.Core.Graph.AppSettings.LoadOrDefault();
+        fresh.TabOrder = _tabs.Select(t => t.Key).ToList();
+        fresh.Save();
+        AppSettings.TabOrder = fresh.TabOrder;
+        StateHasChanged();
     }
 
     // "跳到劇情節點"'s tab-switch half — see FlowGraphFocusCoordinator for why this and FlowGraphPanel's own
@@ -77,5 +138,6 @@
     public void Dispose()
     {
         FlowGraphFocusCoordinator.UnsubscribeTabActivation(ActivateGraphTab);
+        _selfRef?.Dispose();
     }
 }

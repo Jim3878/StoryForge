@@ -58,15 +58,6 @@ public static class NodeScriptTableStore
         File.WriteAllText(basePath + ".md", BuildTemplate(playscriptName));
     }
 
-    // Deletes this node's .md 劇本檔, if any — the .md counterpart to NodeContentStore.DeleteFile, called
-    // for the same reason: the node is actually being deleted, so its old name never lingers as an orphan.
-    public static void DeleteFile(string dataFolder, string playscriptName, string guid)
-    {
-        var path = ResolvePath(dataFolder, playscriptName, guid);
-        if (File.Exists(path))
-            File.Delete(path);
-    }
-
     // Writes a playscript's real downloaded dialogue rows (from
     // GooglePlayscriptSheetClient.DownloadScriptTableAsync) into its .md 劇本檔, unconditionally overwriting
     // whatever is already there — unlike SyncAll below, the caller (the "下載Sheet劇本" batch flow) has

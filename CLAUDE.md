@@ -61,11 +61,38 @@ StoryForge has no directory relationship to it, so the root is read from a one-l
 Unity project data fails at that point with a message telling the user to create it.
 
 ### Always-mounted tab shell
-`Home.razor` renders all four panels (`StoryOutlinePanel`/`PipelineStatusPanel`/`FlowGraphPanel`/
-`CharacterCardPanel`) simultaneously inside `.tab-pane` divs; switching tabs only toggles
-`style="display:none/block"`. Panels are never conditionally removed with `@if` — that would destroy and
+`Home.razor` renders all panels (`StoryOutlinePanel`/`PipelineStatusPanel`/`FlowGraphPanel`/
+`CharacterCardPanel`, plus two `AudioBrowserPanel` instances for BGM/音效) simultaneously inside `.tab-pane`
+divs; switching tabs only toggles `style="display:none/block"`. Panels are never conditionally removed with `@if` — that would destroy and
 recreate the component, losing state (most importantly `FlowGraphPanel`'s LiteGraph canvas: zoom/pan/
-selection). A new panel must follow this same pattern.
+selection). A new panel must follow this same pattern. The tab strip's button order is user-draggable (persisted in
+`AppSettings.TabOrder`); a new tab also needs an entry in `Home.razor`'s `DefaultTabs` list. Only the buttons
+reorder — the `.tab-pane` divs keep their fixed DOM order.
+
+### BGM / 音效 tabs (`AudioBrowserPanel`)
+One component, two instances (`Category` = Bgm/Sfx), each browsing a hard-coded flat folder
+(`Assets/08.Audio/Clip/BGM` / `SFX`, via `Core/Audio/AudioAssetScanner`) — never the asset-store packs
+elsewhere under `Assets/`. Files are served by `/api/audio/{bgm|sfx}/{fileName}`. Waveforms are decoded
+**browser-side** (`wwwroot/js/audio-browser.js`, Web Audio `decodeAudioData`) and sent back to the singleton
+`AudioWaveformCacheService`, which persists peaks + duration keyed by size+mtime — so no server-side audio
+decoder packages are needed. All per-pixel/per-frame work (hover playback, progress line, column resize)
+stays in that JS file; the server only hears about finished results. The 轉檔成 OGG button
+(`Core/Audio/AudioOggConverter`) is a port of the Unity editor window `AudioBatchConvertOgg`, except it
+renames the source `.meta` onto the new `.ogg` (keeping the GUID) and patches the importer settings into
+that `.meta` text directly, since `AudioImporter` only exists inside Unity.
+
+The 音量 features (`Core/Audio/AudioGainProcessor`) — batch 標準化 and the right-click 調整音量 dialog —
+are destructive writes into Assets, but always recomputed from a backed-up original in one encode:
+`original -> volume=(normalize gain + manual gain)dB -> libvorbis -> Assets/<name>.ogg`. Normalizing is a
+**fixed** gain (target LUFS − the original's ebur128 integrated LUFS), never ffmpeg's dynamic `loudnorm`;
+that is what lets the dialog's browser preview (a plain `GainNode`, then a hard-clip `WaveShaper`, then
+the tab's volume) sound exactly like what gets written. Originals are backed up on first adjustment to
+`<UnityProjectRoot>/AudioOriginals/{BGM,SFX}/<guid>.<ext>` and each clip's record lives in
+`<UnityProjectRoot>/AudioAdjustments.json`, keyed by the clip's `.meta` GUID (survives renames inside
+Unity); both sit outside `Assets/` so Unity never imports the backups, and both are tracked in the Unity
+repo (LFS). A record stores the SHA-256 of what was last written — a mismatch means the file was replaced
+outside the tool, and nothing may be written over it until the user adopts the current file as the new
+original. Adjusting a not-yet-`.ogg` clip converts it on the way (reusing `AudioOggConverter.CarryOverMeta`).
 
 ### Flow-graph editor: server model + JS canvas, kept in sync explicitly
 `GraphEditorState` (scoped per circuit) holds the authoritative `GraphDocumentModel` server-side, loaded
@@ -141,8 +168,11 @@ isn't.
 - **Tracked in the Unity project, in git** (`Assets/06.Definition/PlayscriptOfflineToolData/*.json`):
   `CharacterCardSettings`, `StoryOutlineSettings`. Shared, collaboratively-written content — the same
   physical file the old WinForms tool reads/writes if pointed at the same project.
+- **Tracked in the Unity project, in git, at the project root (outside `Assets/`)**: `AudioAdjustmentSettings`
+  (`AudioAdjustments.json` — loudness targets + per-clip 音量 records) and the `AudioOriginals/` backups.
 - **Per-machine, in `%LocalAppData%\StoryForge\`**: `AppSettings` (`settings.json`), `ChapterFilterSettings`
-  (`pipeline-filter.json`), `PortraitDescriptionSettings` (`portrait-descriptions.json`),
+  (`pipeline-filter.json`), `AudioBrowserSettings` (`audio-browser-settings.json`), `AudioWaveformCache`
+  (`audio-waveform-cache.json`), `PortraitDescriptionSettings` (`portrait-descriptions.json`),
   `PortraitFilterSettings` (`portrait-filter.json`). The old WinForms tool has its own separate
   `%LocalAppData%\PlayscriptOfflineTool\` folder — `LegacyToolMigration.MigrateIfNeeded()` (called once at
   the top of `Program.cs`, gated by a `legacy-migration-done.txt` marker so it only ever runs once) is the

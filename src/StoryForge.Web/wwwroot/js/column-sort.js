@@ -26,5 +26,34 @@ window.storyForgeColumnSort = (function () {
         });
     }
 
-    return { init: init };
+    // Same idea as init, but SortableJS's own DOM move is undone before telling Blazor, so the only thing
+    // that ever reorders the actual nodes is Blazor's re-render from the C# list — Blazor's diff tracks
+    // child nodes by position (including whitespace text nodes), and a move it didn't make itself can leave
+    // its later updates landing on the wrong element. The item goes back before its exact original next
+    // sibling node, not just the Nth element, so interleaved text nodes end up where they were too.
+    // filterSelector (optional) marks descendants that must never start a drag, e.g. a resize handle.
+    function initReverting(elementId, dotNetRef, methodName, filterSelector) {
+        const el = document.getElementById(elementId);
+        if (!el) return;
+
+        if (el._sortableInstance) {
+            el._sortableInstance.destroy();
+        }
+
+        el._sortableInstance = Sortable.create(el, {
+            animation: 150,
+            filter: filterSelector || null,
+            preventOnFilter: false,
+            onStart: function (evt) {
+                evt.item._originalNextSibling = evt.item.nextSibling;
+            },
+            onEnd: function (evt) {
+                if (evt.oldIndex === evt.newIndex) return;
+                evt.from.insertBefore(evt.item, evt.item._originalNextSibling);
+                dotNetRef.invokeMethodAsync(methodName, evt.oldIndex, evt.newIndex);
+            },
+        });
+    }
+
+    return { init: init, initReverting: initReverting };
 })();

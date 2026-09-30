@@ -128,6 +128,40 @@ window.storyForgeUi = (function () {
     // scoped to "not inside a text input" the way graph-editor.js's own Ctrl+Z/Y guard is — Ctrl+S never
     // types a literal "s" into a field in the first place (browsers already reserve the combo for their own
     // save dialog), so there's no risk of hijacking normal typing by leaving this unconditional.
+    // 存檔提示音：用 Web Audio 直接合成，不需要音檔。成功是上升的「叮咚」、有警告是單一個「叮」、失敗是低沉的「嗡嗡」。
+    // 存檔一定由按鍵或按鈕觸發，頁面已經有使用者互動，不會被瀏覽器的自動播放限制擋住。
+    function playSaveFeedback(outcome) {
+        try {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) return;
+            const ctx = window._storyForgeAudioContext || (window._storyForgeAudioContext = new AudioContextClass());
+            if (ctx.state === "suspended") ctx.resume();
+
+            // [頻率 Hz, 開始秒數, 長度秒數]
+            const tones = outcome === "Success" ? [[880, 0, 0.14], [1318.5, 0.11, 0.22]]
+                : outcome === "Warning" ? [[660, 0, 0.3]]
+                : [[196, 0, 0.18], [196, 0.24, 0.24]];
+            const type = outcome === "Failure" ? "square" : "sine";
+            const peak = outcome === "Failure" ? 0.06 : 0.16;
+
+            for (const [frequency, start, duration] of tones) {
+                const oscillator = ctx.createOscillator();
+                const gain = ctx.createGain();
+                oscillator.type = type;
+                oscillator.frequency.value = frequency;
+                const t0 = ctx.currentTime + start;
+                gain.gain.setValueAtTime(0.0001, t0);
+                gain.gain.exponentialRampToValueAtTime(peak, t0 + 0.015);
+                gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+                oscillator.connect(gain).connect(ctx.destination);
+                oscillator.start(t0);
+                oscillator.stop(t0 + duration + 0.02);
+            }
+        } catch (e) {
+            // 提示音失敗不影響存檔本身
+        }
+    }
+
     function bindSaveShortcut(dotNetRef) {
         if (window._storyForgeSaveShortcutBound) return;
         window._storyForgeSaveShortcutBound = true;
@@ -136,6 +170,7 @@ window.storyForgeUi = (function () {
             const key = (e.key || "").toLowerCase();
             if ((e.ctrlKey || e.metaKey) && key === "s") {
                 e.preventDefault();
+                if (document.querySelector(".save-result-overlay")) return;
                 dotNetRef.invokeMethodAsync("SaveFromShortcut");
             }
         });
@@ -233,5 +268,6 @@ window.storyForgeUi = (function () {
     return {
         makeDraggable: makeDraggable, makeResizable: makeResizable, makeVResizable: makeVResizable,
         bindSaveShortcut: bindSaveShortcut, makeSortableList: makeSortableList,
+        playSaveFeedback: playSaveFeedback,
     };
 })();

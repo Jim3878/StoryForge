@@ -19,6 +19,10 @@
     </div>
     <div class="graph-body">
         <canvas id="story-forge-canvas" class="graph-canvas" tabindex="0"></canvas>
+        @if (_isLoading)
+        {
+            <div class="graph-loading-shield" aria-hidden="true"></div>
+        }
         @if (_selectedNodeGuid != null)
         {
             <div class="graph-inspector-resize-handle" id="graph-inspector-resize-handle"></div>
@@ -65,6 +69,11 @@
             </div>
         }
     </div>
+    <div class="graph-bottom-status @(_loadFailed ? "failed" : _isLoading ? "loading" : "ready")"
+         role="status" aria-live="polite">
+        <span class="graph-status-dot"></span>
+        <span>@_loadStatus</span>
+    </div>
 </div>
 
 @if (_pendingExportToUnity)
@@ -105,7 +114,18 @@
     }
     .graph-modal h3 { margin: 0; }
     .graph-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
-    .graph-body { flex: 1 1 auto; display: flex; min-height: 0; }
+    .graph-body { position: relative; flex: 1 1 auto; display: flex; min-height: 0; }
+    .graph-loading-shield { position: absolute; inset: 0; z-index: 20; cursor: wait; background: rgba(0,0,0,0.04); }
+    .graph-bottom-status {
+        flex: 0 0 24px; display: flex; align-items: center; gap: 7px; padding: 0 10px;
+        box-sizing: border-box; background: #171717; color: #aaa; border-top: 1px solid #333;
+        font-family: sans-serif; font-size: 12px;
+    }
+    .graph-status-dot { width: 7px; height: 7px; border-radius: 50%; background: #5f9f62; }
+    .graph-bottom-status.loading .graph-status-dot { background: #d2a43c; animation: graph-status-pulse 1s ease-in-out infinite; }
+    .graph-bottom-status.failed { color: #e49a9a; }
+    .graph-bottom-status.failed .graph-status-dot { background: #d75a5a; }
+    @@keyframes graph-status-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
     /* No width/height:100% here — against a sibling (.graph-inspector) that itself has a fixed width, an
        explicit 100% here ignores that sibling entirely and both end up wider than .graph-body, pushing the
        inspector off past the viewport edge (invisible, but present in the DOM). flex:1 1 auto with
@@ -153,6 +173,9 @@
 
     private string _searchQuery = string.Empty;
     private string _searchStatus = string.Empty;
+    private bool _isLoading = true;
+    private bool _loadFailed;
+    private string _loadStatus = "正在載入流程圖……";
 
     protected override void OnInitialized()
     {
@@ -173,20 +196,34 @@
 
     private async Task LoadAndInit()
     {
+        _isLoading = true;
+        _loadFailed = false;
+        _loadStatus = "正在載入流程圖資料……";
+        await InvokeAsync(StateHasChanged);
+        await Task.Yield();
+
         try
         {
             DiagnosticsLog.Write("LoadAndInit: start");
             _payload = State.LoadGraph();
+            _loadStatus = $"正在建立 {_payload.Nodes.Count} 個節點、{_payload.Edges.Count} 條連線……";
+            await InvokeAsync(StateHasChanged);
+            await Task.Yield();
             _selfRef ??= DotNetObjectReference.Create(this);
             await JS.InvokeVoidAsync("storyForgeGraph.init", "story-forge-canvas", _payload, _selfRef);
             DiagnosticsLog.Write("LoadAndInit: done, status=" + State.StatusMessage);
-            StateHasChanged();
+            _isLoading = false;
+            _loadStatus = $"流程圖已就緒：{_payload.Nodes.Count} 節點、{_payload.Edges.Count} 連線";
         }
         catch (Exception e)
         {
             DiagnosticsLog.Write("LoadAndInit: EXCEPTION " + e);
-            throw;
+            _isLoading = false;
+            _loadFailed = true;
+            _loadStatus = $"流程圖載入失敗：{e.Message}";
         }
+
+        await InvokeAsync(StateHasChanged);
     }
 
     // Called from graph-editor.js the instant it creates a node via the add-node menu (before the node is
@@ -204,6 +241,20 @@
     // on the next unrelated 存檔) unless this mirrors the removal there too.
     [JSInvokable]
     public void OnNodeUndoRemoved(string guid)
+    {
+        RemoveUnsavedNode(guid);
+    }
+
+    // Normal Delete/context-menu removal of a node created since the last successful save. Existing nodes
+    // remain in the server model until ApplyAndSave consumes deletedNodeGuids; only unsaved nodes use this
+    // immediate path because they cannot appear in a diff against the previous saved baseline.
+    [JSInvokable]
+    public void OnUnsavedNodeRemoved(string guid)
+    {
+        RemoveUnsavedNode(guid);
+    }
+
+    private void RemoveUnsavedNode(string guid)
     {
         State.RemoveUnsavedNode(guid);
         if (_selectedNodeGuid == guid)
@@ -363,6 +414,8 @@
         _pendingExportToUnity = false;
         var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
         State.ExportToUnity(export);
+        if (State.LastSaveReport?.SaveSucceeded == true)
+            await JS.InvokeVoidAsync("storyForgeGraph.markSaveSucceeded");
         StateHasChanged();
     }
 

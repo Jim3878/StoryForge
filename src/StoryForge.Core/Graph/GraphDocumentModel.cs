@@ -469,15 +469,9 @@ public sealed class GraphDocumentModel
         if (node == null)
             return;
 
-        // The node is actually being removed here (either purged immediately, IsNew, or marked and
-        // excluded from the next persisted session) — its content files (if any) would otherwise become
-        // orphans, permanently occupying their plain-name path for whichever unrelated node types that
-        // name next (see NodeContentStore.ResolveBasePath's own collision-suffix comment).
-        if (node.TypeName == NodeContentStore.PlayscriptProcessNodeTypeName && !string.IsNullOrEmpty(node.IdentityValue))
-        {
-            NodeContentStore.DeleteFile(Settings.ExternalDataFolder, node.IdentityValue!, node.Guid);
-            NodeScriptTableStore.DeleteFile(Settings.ExternalDataFolder, node.IdentityValue!, node.Guid);
-        }
+        // 不刪除節點的內容檔（.json/.md）：刪除可能還沒存檔就被放棄，或只是切換分支造成節點暫時不存在，
+        // 直接刪檔會讓劇情內容永久遺失。留下的檔案成為孤兒，由 GraphEditorState 列出數量，交給使用者處理；
+        // 同名的新節點要使用原本的檔名時，會走「建立劇本檔」的覆蓋確認流程。
 
         var affectedGroups = Groups.Where(g => g.MemberNodeGuids.Contains(guid)).ToList();
         foreach (var group in affectedGroups)

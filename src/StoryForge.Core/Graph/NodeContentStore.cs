@@ -48,6 +48,7 @@ public static class NodeContentStore
             entry.Guid = guid;
             entry.PlayscriptName = playscriptName;
             File.WriteAllText(path, JsonConvert.SerializeObject(entry, Formatting.Indented));
+            NodeFileIndex.Set(dataFolder, guid, path[..^".json".Length]);
         }
     }
 
@@ -73,6 +74,7 @@ public static class NodeContentStore
             Directory.CreateDirectory(directory);
 
         File.WriteAllText(path, JsonConvert.SerializeObject(entry, Formatting.Indented));
+        NodeFileIndex.Set(dataFolder, entry.Guid, path[..^".json".Length]);
     }
 
     // Unconditionally writes at the PLAIN (non-collision-suffixed) path, overwriting whatever is already
@@ -87,16 +89,7 @@ public static class NodeContentStore
             Directory.CreateDirectory(directory);
 
         File.WriteAllText(basePath + ".json", JsonConvert.SerializeObject(entry, Formatting.Indented));
-    }
-
-    // Deletes this node's content file, if any — called when the node itself is actually being deleted
-    // (GraphDocumentModel.MarkNodeForDeletion), so its old identity name never lingers on disk as an
-    // orphaned file that a later, unrelated node could collide with.
-    public static void DeleteFile(string dataFolder, string playscriptName, string guid)
-    {
-        var path = ResolveBasePath(dataFolder, playscriptName, guid) + ".json";
-        if (File.Exists(path))
-            File.Delete(path);
+        NodeFileIndex.Set(dataFolder, entry.Guid, basePath);
     }
 
     // A node's file lives at Nodes\<chapter>\<remainder>.json (e.g. "A1/1_釣魚執法" -> Nodes\A1\1_釣魚執法.json).
@@ -108,8 +101,16 @@ public static class NodeContentStore
     // resolves to the same base name — this JSON file's own recorded Guid is the source of truth for the
     // duplicate-playscriptId collision case, so routing through here keeps both stores in agreement without
     // a second copy of this check.
+    //
+    // 已經有內容檔的節點一律以檔案內的 Guid 配對（NodeFileIndex），不看目前的劇本名稱：節點在 Unity、
+    // 切換分支或其他工具中改名時，檔名會暫時對不上，但內容仍然跟著節點；檔名由存檔時的 SyncRenamedScriptFiles 更新。
+    // 以下依名稱計算的規則只用在還沒有內容檔的節點（決定新檔案要建在哪裡）。
     public static string ResolveBasePath(string dataFolder, string playscriptName, string guid)
     {
+        var indexed = NodeFileIndex.TryGetBasePath(dataFolder, guid);
+        if (indexed != null)
+            return indexed;
+
         var plainBase = ResolvePlainBasePath(dataFolder, playscriptName);
 
         var existing = TryReadRaw(plainBase + ".json");

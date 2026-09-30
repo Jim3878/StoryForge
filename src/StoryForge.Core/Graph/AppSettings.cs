@@ -62,6 +62,15 @@ public sealed class AppSettings
     public string LdtkExecutablePath { get; set; } = @"E:\ldtk\app\node_modules\electron\dist\electron.exe";
     public string LdtkWorkingDirectory { get; set; } = @"E:\ldtk\app";
 
+    // BGM/音效 tabs' 轉檔成 OGG button — defaults to the exact path the Unity project's AudioBatchConvertOgg
+    // editor window hard-coded (a WinGet-installed Gyan.FFmpeg build).
+    public string FfmpegPath { get; set; } =
+        @"C:\Users\User\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe";
+
+    // Home.razor's tab strip order, as tab keys, after drag-to-reorder. Empty = default order. Keys missing
+    // here (a tab added in a later build) are appended at the end; keys no longer known are ignored.
+    public List<string> TabOrder { get; set; } = new();
+
     // ProcessGraphPanel's inspector sidebar — remembered so a user-dragged size doesn't reset every time
     // the tool reopens or a different node is selected.
     public float InspectorPanelWidth { get; set; } = 260f;

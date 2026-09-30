@@ -1,0 +1,198 @@
+@using StoryForge.Web.GraphEditor
+@inject GraphEditorState GraphState
+@inject IJSRuntime JS
+
+@if (_report != null)
+{
+    <div class="save-result-overlay">
+        <section class="save-result save-result-@_report.Outcome.ToString().ToLowerInvariant()"
+                 role="dialog" aria-modal="true" aria-labelledby="save-result-title">
+            @if (_confirmingCleanup)
+            {
+                <header>
+                    <span class="save-result-icon">⚠</span>
+                    <h2 id="save-result-title">確認清除孤兒內容檔</h2>
+                </header>
+                <p>下列檔案會移到 Windows 資源回收筒。清除前會重新掃描；若清單有變化，這次操作會取消。</p>
+                <div class="save-result-details save-result-file-list">
+                    @foreach (var path in CleanupPaths)
+                    {
+                        <div>@path</div>
+                    }
+                </div>
+                <footer>
+                    <button type="button" @onclick="CancelCleanup">返回</button>
+                    <button type="button" class="danger" @ref="_primaryButton" @onclick="ConfirmCleanup">
+                        移到資源回收筒
+                    </button>
+                </footer>
+            }
+            else
+            {
+                <header>
+                    <span class="save-result-icon">@Icon</span>
+                    <div>
+                        <h2 id="save-result-title">@_report.Title</h2>
+                        <time>@_time</time>
+                    </div>
+                </header>
+                <div class="save-result-details">
+                    @foreach (var detail in _report.Details)
+                    {
+                        <div>@detail</div>
+                    }
+                </div>
+                <footer>
+                    @if (_report.SaveSucceeded && _report.OrphanFiles.Count > 0)
+                    {
+                        <button type="button" class="danger" @onclick="BeginCleanup">清除孤兒內容檔</button>
+                    }
+                    <button type="button" class="primary" @ref="_primaryButton" @onclick="Close">確定</button>
+                </footer>
+            }
+        </section>
+    </div>
+}
+
+<style>
+    .save-result-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1900;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: rgba(0, 0, 0, 0.72);
+        font-family: sans-serif;
+        box-sizing: border-box;
+    }
+
+    .save-result {
+        width: min(680px, 100%);
+        max-height: min(720px, calc(100vh - 48px));
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        padding: 20px;
+        color: #ddd;
+        background: #202020;
+        border: 1px solid #555;
+        border-top: 4px solid #68a95b;
+        border-radius: 7px;
+        box-shadow: 0 18px 60px rgba(0, 0, 0, 0.65);
+        box-sizing: border-box;
+    }
+
+    .save-result-warning { border-top-color: #d8a63d; }
+    .save-result-failure { border-top-color: #d75a5a; }
+
+    .save-result header { display: flex; align-items: flex-start; gap: 12px; }
+    .save-result-icon { font-size: 25px; line-height: 1; }
+    .save-result h2 { margin: 0; color: #fff; font-size: 19px; }
+    .save-result time { display: block; margin-top: 4px; color: #999; font-size: 12px; }
+    .save-result p { margin: 0; color: #ccc; line-height: 1.5; }
+
+    .save-result-details {
+        min-height: 0;
+        overflow: auto;
+        padding: 12px;
+        color: #ccc;
+        background: #171717;
+        border: 1px solid #383838;
+        border-radius: 4px;
+        font-size: 13px;
+        line-height: 1.6;
+        overflow-wrap: anywhere;
+    }
+
+    .save-result-file-list { font-family: Consolas, monospace; }
+    .save-result footer { display: flex; justify-content: flex-end; gap: 8px; }
+    .save-result button {
+        padding: 7px 15px;
+        color: #ddd;
+        background: #333;
+        border: 1px solid #555;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+    .save-result button:hover { background: #414141; }
+    .save-result button:focus-visible { outline: 2px solid #8eb8e5; outline-offset: 2px; }
+    .save-result button.primary { color: #fff; background: #356b9b; border-color: #4f8fc5; }
+    .save-result button.primary:hover { background: #407cad; }
+    .save-result button.danger { color: #fff; background: #873d3d; border-color: #b45858; }
+    .save-result button.danger:hover { background: #a04848; }
+</style>
+
+@code {
+    private SaveReport? _report;
+    private string _time = string.Empty;
+    private ElementReference _primaryButton;
+    private bool _focusPending;
+    private bool _confirmingCleanup;
+
+    private string Icon => _report?.Outcome switch
+    {
+        SaveOutcome.Success => "✓",
+        SaveOutcome.Warning => "⚠",
+        _ => "✕",
+    };
+
+    private IEnumerable<string> CleanupPaths =>
+        _report?.OrphanFiles
+            .SelectMany(orphan => orphan.RelativePaths)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+        ?? Enumerable.Empty<string>();
+
+    public void Show(SaveReport report)
+    {
+        _report = report;
+        _time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        _confirmingCleanup = false;
+        RequestPrimaryFocus();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_focusPending || _report == null)
+            return;
+
+        _focusPending = false;
+        await _primaryButton.FocusAsync();
+    }
+
+    private void BeginCleanup()
+    {
+        _confirmingCleanup = true;
+        RequestPrimaryFocus();
+    }
+
+    private void CancelCleanup()
+    {
+        _confirmingCleanup = false;
+        RequestPrimaryFocus();
+    }
+
+    private async Task ConfirmCleanup()
+    {
+        if (_report == null)
+            return;
+
+        _report = GraphState.ClearOrphanContentFiles(_report.OrphanFiles);
+        _time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        _confirmingCleanup = false;
+        RequestPrimaryFocus();
+        await JS.InvokeVoidAsync("storyForgeUi.playSaveFeedback", _report.Outcome.ToString());
+    }
+
+    private void Close()
+    {
+        _report = null;
+        _confirmingCleanup = false;
+    }
+
+    private void RequestPrimaryFocus()
+    {
+        _focusPending = true;
+        StateHasChanged();
+    }
+}

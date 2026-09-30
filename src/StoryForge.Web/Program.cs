@@ -28,6 +28,8 @@ builder.Services.AddScoped<StoryForge.Web.FlowGraphFocusCoordinator>();
 // Singleton, not scoped — see UpdateCheckService's own comment: one GitHub check result shared by the
 // whole process, not one per browser tab/circuit.
 builder.Services.AddSingleton<UpdateCheckService>();
+// Singleton for the same reason — one per-machine cache file shared by every circuit (see its own comment).
+builder.Services.AddSingleton<StoryForge.Web.Audio.AudioWaveformCacheService>();
 
 // DetailedErrors surfaces the real reason in the browser console/reconnect UI instead of a bare
 // "connection closed", and CircuitDiagnosticsHandler below logs every open/close/error to a plain file so
@@ -78,6 +80,71 @@ app.MapGet("/api/portraits/{fileName}", (string fileName, AppSettings settings) 
     var png = StoryForge.Core.Portrait.PortraitThumbnailRenderer.RenderCroppedPng(
         filePath, settings.PortraitTopCutPercent, settings.PortraitBottomCutPercent);
     return Results.Bytes(png, "image/png");
+});
+
+// Streams one file from the game's own BGM/SFX folder for the BGM/音效 tabs' playback and browser-side
+// waveform decoding. Same Path.GetFileName re-derivation as the portrait endpoint above, plus the category
+// segment is mapped to a fixed folder (never used as a path itself), so only those two folders are
+// reachable. Range processing on so <audio> can seek/loop without re-downloading the whole file.
+app.MapGet("/api/audio/{category}/{fileName}", (string category, string fileName) =>
+{
+    StoryForge.Core.Audio.AudioCategory audioCategory;
+    if (category == "bgm")
+        audioCategory = StoryForge.Core.Audio.AudioCategory.Bgm;
+    else if (category == "sfx")
+        audioCategory = StoryForge.Core.Audio.AudioCategory.Sfx;
+    else
+        return Results.NotFound();
+
+    var folder = StoryForge.Core.Audio.AudioAssetScanner.GetFolderPath(
+        StoryForge.Core.ProjectPaths.ResolveUnityProjectRoot(), audioCategory);
+    var filePath = Path.Combine(folder, Path.GetFileName(fileName));
+    if (!File.Exists(filePath) || !StoryForge.Core.Audio.AudioAssetScanner.IsSupportedAudioFile(filePath))
+        return Results.NotFound();
+
+    var contentType = Path.GetExtension(filePath).ToLowerInvariant() switch
+    {
+        ".ogg" => "audio/ogg",
+        ".wav" => "audio/wav",
+        ".mp3" => "audio/mpeg",
+        ".flac" => "audio/flac",
+        ".m4a" or ".aac" => "audio/aac",
+        _ => "application/octet-stream",
+    };
+    return Results.File(filePath, contentType, enableRangeProcessing: true);
+});
+
+// The backed-up original of an adjusted clip (AudioOriginals/{BGM|SFX}/<guid>.<ext>), which the 調整音量
+// dialog previews from. Only a 32-hex GUID is accepted and it's only ever used as a file-name prefix
+// inside that one folder.
+app.MapGet("/api/audio-original/{category}/{guid}", (string category, string guid) =>
+{
+    StoryForge.Core.Audio.AudioCategory audioCategory;
+    if (category == "bgm")
+        audioCategory = StoryForge.Core.Audio.AudioCategory.Bgm;
+    else if (category == "sfx")
+        audioCategory = StoryForge.Core.Audio.AudioCategory.Sfx;
+    else
+        return Results.NotFound();
+
+    if (guid.Length != 32 || !guid.All(Uri.IsHexDigit))
+        return Results.NotFound();
+
+    var filePath = StoryForge.Core.Audio.AudioGainProcessor.FindOriginal(
+        StoryForge.Core.ProjectPaths.ResolveUnityProjectRoot(), audioCategory, guid);
+    if (filePath == null)
+        return Results.NotFound();
+
+    var contentType = Path.GetExtension(filePath).ToLowerInvariant() switch
+    {
+        ".ogg" => "audio/ogg",
+        ".wav" => "audio/wav",
+        ".mp3" => "audio/mpeg",
+        ".flac" => "audio/flac",
+        ".m4a" or ".aac" => "audio/aac",
+        _ => "application/octet-stream",
+    };
+    return Results.File(filePath, contentType, enableRangeProcessing: true);
 });
 
 app.MapRazorComponents<App>()

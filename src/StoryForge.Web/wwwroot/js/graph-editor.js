@@ -13,6 +13,8 @@ window.storyForgeGraph = (function () {
     let canvasResizeObserver = null; // held here so it isn't garbage-collected the moment init() returns
     let newNodeGuids = new Set(); // guids created client-side this session, not yet known to the server
     let initialNodeGuids = new Set(); // guids the server actually knows about, snapshotted at init()
+    let deletedBeforeFirstSaveGuids = new Set(); // new nodes removed before they ever joined the saved baseline
+    let restoringSnapshot = false; // suppresses normal remove notifications while undo/redo rebuilds the graph
     let selfRef = null; // DotNetObjectReference captured from init() — needed outside its own closure so
                          // instantiateNodeFromMenu can notify C# the moment a node is created, not just on
                          // selection change (see OnNodeCreated below)
@@ -225,20 +227,28 @@ window.storyForgeGraph = (function () {
     // sync the same way; every other field here is purely client-side until 存檔, so no other server call is
     // needed.
     function restoreSnapshot(fromState, toState) {
-        graph.clear();
-        nodesByGuid = new Map();
-        guidByNode = new Map();
+        restoringSnapshot = true;
+        try {
+            graph.clear();
+            nodesByGuid = new Map();
+            guidByNode = new Map();
 
-        buildGraphFromData(toState.nodes, toState.edges, toState.groups);
-        newNodeGuids = new Set(toState.newNodeGuids);
+            buildGraphFromData(toState.nodes, toState.edges, toState.groups);
+            newNodeGuids = new Set(toState.newNodeGuids);
+        } finally {
+            restoringSnapshot = false;
+        }
 
         const previouslyNew = new Set(fromState.newNodeGuids);
         const nowNew = new Set(toState.newNodeGuids);
         for (const guid of previouslyNew)
-            if (!nowNew.has(guid))
+            if (!nowNew.has(guid)) {
+                deletedBeforeFirstSaveGuids.add(guid);
                 selfRef?.invokeMethodAsync("OnNodeUndoRemoved", guid);
+            }
         for (const guid of nowNew)
             if (!previouslyNew.has(guid)) {
+                deletedBeforeFirstSaveGuids.delete(guid);
                 const nodeDto = toState.nodes.find(n => n.guid === guid);
                 if (nodeDto)
                     selfRef?.invokeMethodAsync("OnNodeCreated", guid, nodeDto.typeName, nodeDto.x, nodeDto.y);
@@ -1385,9 +1395,29 @@ window.storyForgeGraph = (function () {
         inputSlotsByType = new Map();
         newNodeGuids = new Set();
         initialNodeGuids = new Set(payload.nodes.map(n => n.guid));
+        deletedBeforeFirstSaveGuids = new Set();
         lastSearchQuery = null;
         lastSearchMatchGuids = [];
         lastSearchMatchIndex = -1;
+
+        // A newly-created node is inserted into the server-side live model immediately so its inspector
+        // and pipeline row work before the first save. If it is deleted before that first save, it appears
+        // in neither exportGraph.newNodes (no longer on the canvas) nor deletedNodeGuids (not part of the
+        // load-time baseline). Remove it from the live model now so a later save cannot resurrect it into
+        // session.json. Snapshot restore has its own exact before/after reconciliation and is excluded.
+        graph.onNodeRemoved = function (node) {
+            if (restoringSnapshot) return;
+
+            const guid = guidByNode.get(node);
+            if (!guid) return;
+
+            nodesByGuid.delete(guid);
+            guidByNode.delete(node);
+            if (newNodeGuids.delete(guid)) {
+                deletedBeforeFirstSaveGuids.add(guid);
+                selfRef?.invokeMethodAsync("OnUnsavedNodeRemoved", guid);
+            }
+        };
 
         registerNodeTypes(payload.nodeTypes);
         buildGraphFromData(payload.nodes, payload.edges, payload.groups);
@@ -1796,13 +1826,16 @@ window.storyForgeGraph = (function () {
             newNodes.push({ guid: guid, typeName: nodeDto.typeName, x: node.pos[0], y: node.pos[1] });
         }
 
-        // A node removed this session (Delete key, or LiteGraph's own native node-menu Remove) is simply
-        // absent from graph._nodes now — diffed against the guids the server actually knew about at load
-        // time (initialNodeGuids) rather than against currentPayload.nodes, since that list also grows to
-        // include this session's newNodes and a node created-then-deleted before ever being saved should
-        // just vanish silently, not round-trip to the server as a delete of something it never knew about.
+        // A node removed this session (Delete key, or LiteGraph's own native node-menu Remove) is absent
+        // from graph._nodes. Saved nodes are diffed against the last successful-save baseline. A node
+        // created and deleted before its first save is also sent explicitly: OnNodeCreated already put it
+        // in the server-side live model, so omitting it here could let an immediately-following save persist
+        // that invisible node before the asynchronous removal notification has been consumed.
         const stillPresentGuids = new Set(nodePositions.map(p => p.guid));
-        const deletedNodeGuids = [...initialNodeGuids].filter(guid => !stillPresentGuids.has(guid));
+        const deletedNodeGuids = [...new Set([
+            ...[...initialNodeGuids].filter(guid => !stillPresentGuids.has(guid)),
+            ...deletedBeforeFirstSaveGuids,
+        ])];
 
         // Only groups with a _clientId (known to the server already) round-trip here — a group created
         // this session via 新增群組 has none yet and is silently skipped server-side too (ApplyAndSave's
@@ -1824,6 +1857,25 @@ window.storyForgeGraph = (function () {
             nodePositions: nodePositions, edges: edges, newNodes: newNodes,
             deletedNodeGuids: deletedNodeGuids, groups: groups,
         };
+    }
+
+    // Called only after the server has persisted an export successfully. Nodes created during this browser
+    // session are now ordinary saved nodes, so a later deletion in the same session must be diffed against
+    // them. Without advancing this baseline, create -> save -> delete -> save silently misses the delete.
+    function markSaveSucceeded() {
+        if (!graph) return;
+
+        const liveGuids = new Set();
+        for (const node of graph._nodes) {
+            const guid = guidByNode.get(node);
+            if (guid) liveGuids.add(guid);
+        }
+
+        initialNodeGuids = liveGuids;
+        newNodeGuids.clear();
+        deletedBeforeFirstSaveGuids.clear();
+        if (currentPayload)
+            currentPayload.nodes = currentPayload.nodes.filter(node => liveGuids.has(node.guid));
     }
 
     function fitViewAndRedraw() {
@@ -1878,6 +1930,7 @@ window.storyForgeGraph = (function () {
 
     return {
         init: init,
+        markSaveSucceeded: markSaveSucceeded,
         exportGraph: exportGraph,
         fitView: fitViewAndRedraw,
         updateSettings: updateSettings,

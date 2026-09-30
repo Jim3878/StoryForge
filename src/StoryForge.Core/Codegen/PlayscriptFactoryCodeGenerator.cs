@@ -87,7 +87,6 @@ public static class PlayscriptFactoryCodeGenerator
         var currentPortrait = string.Empty;
         var currentFace = string.Empty;
         var dialogueOpened = false;
-        var rpgRoleEnabled = true;
         var choiceLabels = new HashSet<string>();
         var autoKey = 100;
 
@@ -115,9 +114,12 @@ public static class PlayscriptFactoryCodeGenerator
                 lines.Add($"            // {CodegenTextUtility.EscapeComment(note)}");
             }
 
-            if (functionLower == "norole")
+            // NoRole 只作用在它自己這一列（見 AGENTS.md）：這句台詞不顯示立繪，下一列有名字的台詞照常恢復 RpgRole。
+            var rpgRoleEnabled = functionLower != "norole";
+            if (!rpgRoleEnabled)
             {
-                rpgRoleEnabled = false;
+                if (!string.IsNullOrEmpty(currentPortrait))
+                    lines.Add("            ClearRpgRole();");
                 currentPortrait = string.Empty;
                 currentFace = string.Empty;
 
@@ -342,7 +344,6 @@ public static class PlayscriptFactoryCodeGenerator
     private static void ValidateSheetRows(string playscriptName, IReadOnlyList<string[]> rows, EnumLabelMaps enumLabelMaps)
     {
         var errors = new List<string>();
-        var rpgRoleEnabled = true;
 
         for (var i = 0; i < rows.Count; i++)
         {
@@ -356,12 +357,9 @@ public static class PlayscriptFactoryCodeGenerator
             var function = Cell(cells, ColFunction);
             var functionLower = function.ToLowerInvariant();
 
-            if (functionLower == "norole")
-            {
-                rpgRoleEnabled = false;
-                if (string.IsNullOrEmpty(name) && string.IsNullOrEmpty(text))
-                    continue;
-            }
+            var rpgRoleEnabled = functionLower != "norole";
+            if (!rpgRoleEnabled && string.IsNullOrEmpty(name) && string.IsNullOrEmpty(text))
+                continue;
 
             if (string.IsNullOrEmpty(function) && string.IsNullOrEmpty(text))
                 continue;
