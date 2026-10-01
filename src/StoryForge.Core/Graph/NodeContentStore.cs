@@ -24,7 +24,7 @@ public static class NodeContentStore
     // Only a 劇本 node represents a story beat — 劇本條件/公用開關/公用變數/AND/OR/... logic nodes are
     // condition sources, never narrative content, so they never get a NodeContentStore file. Shared with
     // GraphDocumentModel (deletion cleanup) and GraphEditorState (Web layer) so there's one source of truth.
-    public const string PlayscriptProcessNodeTypeName = "Definition.ProcessNode.PlayscriptProcessNode, MainAssemble";
+    public const string PlayscriptProcessNodeTypeName = "playscript";
 
     private const string FolderName = "Nodes";
 

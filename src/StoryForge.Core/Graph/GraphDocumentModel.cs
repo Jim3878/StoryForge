@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using StoryForge.Core.Changelist;
 using StoryForge.Core.Schemas;
 
@@ -13,6 +14,8 @@ public sealed class GraphNodeVm
     public float Width { get; set; } = 220;
     public float Height { get; set; } = 140;
     public Dictionary<string, object?> Fields { get; init; } = new();
+    public Dictionary<string, JToken> Extra { get; init; } = new();
+    public Dictionary<string, JToken> PositionExtra { get; init; } = new();
     public bool IsNew { get; init; }
     public bool IsMarkedForDeletion { get; set; }
 
@@ -53,6 +56,9 @@ public sealed class GraphGroupVm
     public float Height { get; set; } = EmptyPlaceholderHeight;
 
     public HashSet<string> MemberNodeGuids { get; init; } = new();
+    public Dictionary<string, JToken> Extra { get; init; } = new();
+    public Dictionary<string, JToken> PositionExtra { get; init; } = new();
+    public Dictionary<string, JToken> ColorExtra { get; init; } = new();
     public bool IsNew { get; init; }
     public bool IsMarkedForDeletion { get; set; }
 
@@ -73,8 +79,22 @@ public sealed class GraphEdgeVm
     public string? ToPortId { get; init; }
     public bool IsNew { get; init; }
     public bool IsMarkedForDeletion { get; set; }
+    public Dictionary<string, JToken> Extra { get; init; } = new();
 
     public string EdgeKey => $"{FromNodeGuid}.{FromPort}.{FromPortId}->{ToNodeGuid}.{ToPort}.{ToPortId}";
+}
+
+public sealed class GraphStickyNoteVm
+{
+    public required string Id { get; init; }
+    public string Title { get; set; } = string.Empty;
+    public string Content { get; set; } = string.Empty;
+    public float X { get; set; }
+    public float Y { get; set; }
+    public float Width { get; set; }
+    public float Height { get; set; }
+    public Dictionary<string, JToken> Extra { get; init; } = new();
+    public Dictionary<string, JToken> PositionExtra { get; init; } = new();
 }
 
 // A deep-cloned copy of a document's editable state, used as one entry in the undo/redo history.
@@ -92,6 +112,8 @@ public sealed class GraphDocumentModel
     public List<GraphNodeVm> Nodes { get; } = new();
     public List<GraphEdgeVm> Edges { get; } = new();
     public List<GraphGroupVm> Groups { get; } = new();
+    public List<GraphStickyNoteVm> StickyNotes { get; } = new();
+    public Dictionary<string, JToken> DocumentExtra { get; private set; } = new();
 
     public string GraphName { get; private set; } = string.Empty;
 
@@ -120,6 +142,175 @@ public sealed class GraphDocumentModel
         Schema = schema;
         Settings = settings;
     }
+
+    public static GraphDocumentModel LoadCanonical(CanonicalGraphDocument document,
+        CanonicalGraphDocument baseDocument, ProcessNodeSchemaDocument schema, AppSettings settings)
+    {
+        var model = new GraphDocumentModel(schema, settings)
+        {
+            GraphName = document.GraphId,
+            DocumentExtra = CloneExtra(document.Extra),
+        };
+        var baseNodes = baseDocument.Nodes.ToDictionary(node => node.Id, StringComparer.Ordinal);
+        var baseEdges = baseDocument.Edges.ToDictionary(edge => edge.Key, StringComparer.Ordinal);
+        var baseGroups = baseDocument.Groups.Select((group, index) => (group, index))
+            .ToDictionary(item => item.group.Id, StringComparer.Ordinal);
+
+        foreach (var node in document.Nodes)
+        {
+            baseNodes.TryGetValue(node.Id, out var baseline);
+            model.Nodes.Add(new GraphNodeVm
+            {
+                Guid = node.Id,
+                TypeName = node.Type,
+                X = node.Position.X,
+                Y = node.Position.Y,
+                Width = node.Position.Width,
+                Height = node.Position.Height,
+                Fields = node.Data.Properties().ToDictionary(property => property.Name,
+                    property => property.Value.ToObject<object>(), StringComparer.Ordinal),
+                Extra = CloneExtra(node.Extra),
+                PositionExtra = CloneExtra(node.Position.Extra),
+                IsNew = baseline == null,
+                BaselineX = baseline?.Position.X,
+                BaselineY = baseline?.Position.Y,
+            });
+        }
+
+        foreach (var edge in document.Edges)
+        {
+            model.Edges.Add(new GraphEdgeVm
+            {
+                FromNodeGuid = edge.FromNode,
+                FromPort = edge.FromPort,
+                FromPortId = edge.FromPortId,
+                ToNodeGuid = edge.ToNode,
+                ToPort = edge.ToPort,
+                ToPortId = edge.ToPortId,
+                Extra = CloneExtra(edge.Extra),
+                IsNew = !baseEdges.ContainsKey(edge.Key),
+            });
+        }
+
+        foreach (var group in document.Groups)
+        {
+            baseGroups.TryGetValue(group.Id, out var baseline);
+            var hasBaseline = baseline.group != null;
+            model.Groups.Add(new GraphGroupVm
+            {
+                ClientId = group.Id,
+                SourceIndex = hasBaseline ? baseline.index : null,
+                Title = group.Title,
+                ColorR = group.Color.R,
+                ColorG = group.Color.G,
+                ColorB = group.Color.B,
+                ColorA = group.Color.A,
+                X = group.Position.X,
+                Y = group.Position.Y,
+                Width = group.Position.Width,
+                Height = group.Position.Height,
+                MemberNodeGuids = new HashSet<string>(group.Nodes, StringComparer.Ordinal),
+                Extra = CloneExtra(group.Extra),
+                PositionExtra = CloneExtra(group.Position.Extra),
+                ColorExtra = CloneExtra(group.Color.Extra),
+                IsNew = !hasBaseline,
+                BaselineTitle = hasBaseline ? baseline.group.Title : null,
+                BaselineMemberNodeGuids = hasBaseline
+                    ? new HashSet<string>(baseline.group.Nodes, StringComparer.Ordinal)
+                    : null,
+            });
+        }
+
+        foreach (var note in document.StickyNotes)
+        {
+            model.StickyNotes.Add(new GraphStickyNoteVm
+            {
+                Id = note.Id,
+                Title = note.Title,
+                Content = note.Content,
+                X = note.Position.X,
+                Y = note.Position.Y,
+                Width = note.Position.Width,
+                Height = note.Position.Height,
+                Extra = CloneExtra(note.Extra),
+                PositionExtra = CloneExtra(note.Position.Extra),
+            });
+        }
+
+        model.MarkClean();
+        return model;
+    }
+
+    public CanonicalGraphDocument BuildCanonicalDocument()
+    {
+        var document = new CanonicalGraphDocument
+        {
+            GraphId = CanonicalGraphJson.GraphId,
+            Extra = CloneExtra(DocumentExtra),
+        };
+        foreach (var node in Nodes.Where(node => !node.IsMarkedForDeletion))
+        {
+            document.Nodes.Add(new CanonicalGraphNode
+            {
+                Id = node.Guid,
+                Type = node.TypeName,
+                Position = new CanonicalGraphRect
+                {
+                    X = node.X, Y = node.Y, Width = node.Width, Height = node.Height,
+                    Extra = CloneExtra(node.PositionExtra),
+                },
+                Data = JObject.FromObject(node.Fields),
+                Extra = CloneExtra(node.Extra),
+            });
+        }
+        foreach (var edge in Edges.Where(edge => !edge.IsMarkedForDeletion))
+        {
+            document.Edges.Add(new CanonicalGraphEdge
+            {
+                FromNode = edge.FromNodeGuid, FromPort = edge.FromPort, FromPortId = edge.FromPortId,
+                ToNode = edge.ToNodeGuid, ToPort = edge.ToPort, ToPortId = edge.ToPortId,
+                Extra = CloneExtra(edge.Extra),
+            });
+        }
+        foreach (var group in Groups.Where(group => !group.IsMarkedForDeletion))
+        {
+            document.Groups.Add(new CanonicalGraphGroup
+            {
+                Id = group.ClientId,
+                Title = group.Title,
+                Color = new CanonicalGraphColor
+                {
+                    R = group.ColorR, G = group.ColorG, B = group.ColorB, A = group.ColorA,
+                    Extra = CloneExtra(group.ColorExtra),
+                },
+                Position = new CanonicalGraphRect
+                {
+                    X = group.X, Y = group.Y, Width = group.Width, Height = group.Height,
+                    Extra = CloneExtra(group.PositionExtra),
+                },
+                Nodes = group.MemberNodeGuids.ToList(),
+                Extra = CloneExtra(group.Extra),
+            });
+        }
+        foreach (var note in StickyNotes)
+        {
+            document.StickyNotes.Add(new CanonicalGraphStickyNote
+            {
+                Id = note.Id, Title = note.Title, Content = note.Content,
+                Position = new CanonicalGraphRect
+                {
+                    X = note.X, Y = note.Y, Width = note.Width, Height = note.Height,
+                    Extra = CloneExtra(note.PositionExtra),
+                },
+                Extra = CloneExtra(note.Extra),
+            });
+        }
+        CanonicalGraphJson.Normalize(document, Schema);
+        return document;
+    }
+
+    private static Dictionary<string, JToken> CloneExtra(IEnumerable<KeyValuePair<string, JToken>> extra) =>
+        extra.ToDictionary(pair => pair.Key, pair => pair.Value.DeepClone(), StringComparer.Ordinal);
 
     public static GraphDocumentModel Load(
         PlayscriptGraphAiDocument document, ProcessNodeSchemaDocument schema, AppSettings settings,
@@ -774,6 +965,8 @@ public sealed class GraphDocumentModel
         Width = n.Width,
         Height = n.Height,
         Fields = new Dictionary<string, object?>(n.Fields),
+        Extra = CloneExtra(n.Extra),
+        PositionExtra = CloneExtra(n.PositionExtra),
         IsNew = n.IsNew,
         IsMarkedForDeletion = n.IsMarkedForDeletion,
         BaselineX = n.BaselineX,
@@ -790,6 +983,7 @@ public sealed class GraphDocumentModel
         ToPortId = e.ToPortId,
         IsNew = e.IsNew,
         IsMarkedForDeletion = e.IsMarkedForDeletion,
+        Extra = CloneExtra(e.Extra),
     };
 
     private static GraphGroupVm CloneGroup(GraphGroupVm g) => new()
@@ -806,6 +1000,9 @@ public sealed class GraphDocumentModel
         Width = g.Width,
         Height = g.Height,
         MemberNodeGuids = new HashSet<string>(g.MemberNodeGuids),
+        Extra = CloneExtra(g.Extra),
+        PositionExtra = CloneExtra(g.PositionExtra),
+        ColorExtra = CloneExtra(g.ColorExtra),
         IsNew = g.IsNew,
         IsMarkedForDeletion = g.IsMarkedForDeletion,
         BaselineTitle = g.BaselineTitle,
