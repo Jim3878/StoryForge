@@ -356,7 +356,23 @@ internal static class Program
         };
         startInfo.EnvironmentVariables["ASPNETCORE_URLS"] = ServerUrl;
 
-        return StartRedirected(startInfo, "server-output.log")!;
+        // 告訴後端：沒有任何瀏覽器連線一段時間後自行結束（見 StoryForge.Web 的 IdleShutdownService）。
+        // Chrome 視窗關閉後有時仍在背景執行，Launcher 等不到它結束時，靠這個收掉後端。
+        startInfo.EnvironmentVariables["STORYFORGE_EXIT_WHEN_NO_CLIENT"] = "1";
+
+        var server = StartRedirected(startInfo, "server-output.log")!;
+
+        // Launcher 以任何方式結束（含當掉、被強制結束）時，由 Windows 一併結束後端
+        try
+        {
+            KillOnCloseJob.Assign(server);
+        }
+        catch (Exception e)
+        {
+            LogError(e);
+        }
+
+        return server;
     }
 
     // Redirecting stdout/stderr without ever reading them deadlocks the child the moment it writes enough

@@ -76,7 +76,8 @@ internal static class AppUserModelId
         Marshal.ReleaseComObject(shell);
 
         var link = (IPersistFile)new ShellLinkCoClass();
-        link.Load(shortcutPath, 0 /* STGM_READ */);
+        // 必須用讀寫模式開啟：以唯讀（STGM_READ）載入後再 SetValue 會得到 STG_E_ACCESSDENIED
+        link.Load(shortcutPath, 2 /* STGM_READWRITE */);
 
         var store = (IPropertyStore)link;
         var relaunchCommand = $"\"{targetExePath}\"";
@@ -101,7 +102,10 @@ internal static class AppUserModelId
         public int pid;
     }
 
-    [StructLayout(LayoutKind.Explicit)]
+    // PROPVARIANT 在 64 位元是 24 bytes（vt + 3 個保留 WORD 共 8 bytes，加上 16 bytes 的聯合體）。
+    // 原本沒有指定 Size，只有 16 bytes：SetValue 讀、PropVariantClear 寫的都是 24 bytes，多出的 8 bytes
+    // 會寫進堆疊上不屬於它的記憶體，造成接不住的 AccessViolationException，讓 Launcher 每次閃退。
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
     private struct PropVariant : IDisposable
     {
         [FieldOffset(0)] public ushort vt;

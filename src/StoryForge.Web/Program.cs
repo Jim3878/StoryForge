@@ -52,6 +52,12 @@ builder.Services.Configure<HubOptions>(options =>
 });
 builder.Services.AddScoped<Microsoft.AspNetCore.Components.Server.Circuits.CircuitHandler, CircuitDiagnosticsHandler>();
 
+// 由 Launcher 啟動時：所有瀏覽器分頁都關閉一段時間後自行結束（見 IdleShutdownService）
+builder.Services.AddSingleton<StoryForge.Web.ClientConnectionTracker>();
+builder.Services.AddScoped<Microsoft.AspNetCore.Components.Server.Circuits.CircuitHandler,
+    StoryForge.Web.ClientConnectionCircuitHandler>();
+builder.Services.AddHostedService<StoryForge.Web.IdleShutdownService>();
+
 var app = builder.Build();
 
 // Configure the HTTP request pipeline.
