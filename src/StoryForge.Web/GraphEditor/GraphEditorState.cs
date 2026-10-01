@@ -232,14 +232,30 @@ public sealed class GraphEditorState
         // The canvas already recomputes each group's membership + tight bounding box live as nodes are
         // dragged in/out (graph-editor.js's recomputeGroupBounds, mirroring RecomputeGroupBounds below
         // exactly), so this just trusts that already-correct result rather than re-deriving it from a
-        // position diff. A group the client doesn't have a matching ClientId for yet (created this
-        // session via 新增群組, never round-tripped through 存檔 before) is silently skipped — same
-        // known v1 gap as new nodes had before OnNodeCreated, not yet wired up for groups.
+        // position diff.
+        //
+        // 畫布上的每個群組都有 ClientId（新增群組時就會產生），所以：匯出裡沒有的群組 = 在畫布上刪除了；
+        // 模型裡找不到的 ClientId = 這次新增的群組。標題與顏色由側邊欄修改，也一併寫回。
+        var exportedGroupIds = new HashSet<string>(export.Groups.Select(g => g.ClientId), StringComparer.Ordinal);
+        foreach (var removedGroup in _model.Groups
+                     .Where(g => !g.IsMarkedForDeletion && !exportedGroupIds.Contains(g.ClientId)).ToList())
+            _model.MarkGroupForDeletion(removedGroup.ClientId);
+
         foreach (var exportedGroup in export.Groups)
         {
-            var group = _model.FindGroup(exportedGroup.ClientId);
-            if (group == null)
+            if (string.IsNullOrEmpty(exportedGroup.ClientId))
                 continue;
+
+            var group = _model.FindGroup(exportedGroup.ClientId)
+                        ?? _model.AddGroup(exportedGroup.Title ?? string.Empty, exportedGroup.X, exportedGroup.Y, exportedGroup.ClientId);
+
+            group.Title = exportedGroup.Title ?? string.Empty;
+            if (TryParseHexColor(exportedGroup.Color, out var r, out var g, out var b))
+            {
+                group.ColorR = r;
+                group.ColorG = g;
+                group.ColorB = b;
+            }
 
             group.MemberNodeGuids.Clear();
             foreach (var guid in exportedGroup.MemberNodeGuids)
@@ -1016,6 +1032,26 @@ public sealed class GraphEditorState
         }
 
         return payload;
+    }
+
+    // ToHexColor 的反向：接受 #rrggbb 或 #rgb，轉成 0–1 的 RGB（透明度不在畫布上編輯，維持原值）
+    private static bool TryParseHexColor(string? hex, out float r, out float g, out float b)
+    {
+        r = g = b = 0;
+        if (string.IsNullOrEmpty(hex) || hex[0] != '#')
+            return false;
+
+        var digits = hex[1..];
+        if (digits.Length == 3)
+            digits = string.Concat(digits.Select(c => $"{c}{c}"));
+        if (digits.Length < 6 ||
+            !int.TryParse(digits[..6], System.Globalization.NumberStyles.HexNumber, null, out var value))
+            return false;
+
+        r = ((value >> 16) & 0xFF) / 255f;
+        g = ((value >> 8) & 0xFF) / 255f;
+        b = (value & 0xFF) / 255f;
+        return true;
     }
 
     private static string ToHexColor(float r, float g, float b)

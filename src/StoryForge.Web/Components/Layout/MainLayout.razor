@@ -90,12 +90,21 @@
     private string _fileStatus = string.Empty;
     private DotNetObjectReference<MainLayout>? _selfRef;
 
+    // 關閉視窗前提醒未存檔：伺服器端的未存修改（例如改劇本ID）每隔一段時間同步給瀏覽器，
+    // 因為 beforeunload 當下無法同步詢問伺服器。畫布上的變動由瀏覽器自己即時比對。
+    private static readonly TimeSpan UnsavedSyncInterval = TimeSpan.FromSeconds(2);
+    private System.Threading.Timer? _unsavedSyncTimer;
+    private bool? _lastPushedUnsaved;
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
         {
             _selfRef = DotNetObjectReference.Create(this);
             await JS.InvokeVoidAsync("storyForgeUi.bindSaveShortcut", _selfRef);
+            await JS.InvokeVoidAsync("storyForgeUi.bindUnsavedGuard");
+            _unsavedSyncTimer = new System.Threading.Timer(_ => _ = InvokeAsync(SyncUnsavedStateAsync), null,
+                UnsavedSyncInterval, UnsavedSyncInterval);
 
             // Once per app process (UpdateCheckService caches the result), not once per tab — see its own
             // comment. No background polling: if nothing's found now, the button just never appears this run.
@@ -157,6 +166,25 @@
         StateHasChanged();
         _saveResultDialog?.Show(report);
         await JS.InvokeVoidAsync("storyForgeUi.playSaveFeedback", report.Outcome.ToString());
+        await SyncUnsavedStateAsync();
+    }
+
+    // 在 circuit 的同步內容中執行（透過 InvokeAsync），避免和編輯操作同時讀寫流程圖模型
+    private async Task SyncUnsavedStateAsync()
+    {
+        try
+        {
+            var unsaved = GraphState.HasUnsavedChanges();
+            if (unsaved == _lastPushedUnsaved)
+                return;
+
+            _lastPushedUnsaved = unsaved;
+            await JS.InvokeVoidAsync("storyForgeUi.setServerUnsaved", unsaved);
+        }
+        catch
+        {
+            // 連線中斷或頁面正在關閉時略過，下一次同步會再試
+        }
     }
 
     // Ctrl/Cmd+S — bound globally in JS (see ui-draggable.js's bindSaveShortcut) rather than through
@@ -176,6 +204,7 @@
 
     public void Dispose()
     {
+        _unsavedSyncTimer?.Dispose();
         _selfRef?.Dispose();
     }
 }

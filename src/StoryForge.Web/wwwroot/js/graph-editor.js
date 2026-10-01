@@ -67,6 +67,34 @@ window.storyForgeGraph = (function () {
     // already receives) is both simpler and more precise than tracking window keydown/keyup separately.
     let lastMouseUpShiftKey = false;
 
+    // 點群組標題列（選取群組）時，LiteGraph 放開滑鼠會把群組與成員節點的座標四捨五入到整數，
+    // 單純點一下就會讓它們移動不到 1 像素、被當成未存修改。記下按下時的座標，放開時若滑鼠幾乎沒動
+    // （是點擊不是拖曳）就還原。
+    const GroupClickMaxMovePx = 4;
+    let pendingGroupClick = null;
+
+    function captureGroupClick(group, e) {
+        const nodes = new Set(group._nodes || []);
+        for (const guid of group._memberGuids || []) {
+            const node = nodesByGuid.get(guid);
+            if (node) nodes.add(node);
+        }
+
+        return {
+            x: e.clientX, y: e.clientY, group: group, groupPos: group.pos.slice(),
+            nodePositions: [...nodes].map(node => [node, node.pos.slice()]),
+        };
+    }
+
+    function restoreGroupClickPositions(click) {
+        click.group.pos[0] = click.groupPos[0];
+        click.group.pos[1] = click.groupPos[1];
+        for (const [node, pos] of click.nodePositions) {
+            node.pos[0] = pos[0];
+            node.pos[1] = pos[1];
+        }
+    }
+
     function patchCaptureShiftOnMouseUp() {
         const originalProcessMouseUp = LGraphCanvas.prototype.processMouseUp;
         LGraphCanvas.prototype.processMouseUp = function (e) {
@@ -89,7 +117,15 @@ window.storyForgeGraph = (function () {
                     this.deselectAllNodes();
             }
 
+            const groupClick = pendingGroupClick;
+            pendingGroupClick = null;
+
             const result = originalProcessMouseUp.call(this, e);
+            if (groupClick && Math.hypot(e.clientX - groupClick.x, e.clientY - groupClick.y) < GroupClickMaxMovePx) {
+                restoreGroupClickPositions(groupClick);
+                this.setDirty(true, true);
+            }
+
             commitUndoableChange();
             saveViewport();
             return result;
@@ -256,6 +292,7 @@ window.storyForgeGraph = (function () {
 
         canvas.deselectAllNodes();
         canvas.setDirty(true, true);
+        refreshSelectedGroup();
     }
 
     function registerNodeTypes(nodeTypes) {
@@ -450,6 +487,13 @@ window.storyForgeGraph = (function () {
             // "click a node, the inspector flashes and disappears" bug — masked by dragging because a real
             // drag's larger rectangle is resolved via getBounding() overlap instead of this single point.
             const nodeHit = this.graph.getNodeOnPos(point[0], point[1], this.visible_nodes, 5);
+
+            // 群組的標題列同時是拖曳群組的地方，點它就選取群組，在側邊欄編輯標題與顏色（和節點一致）
+            if (isLeftButton) {
+                const groupUnderPoint = nodeHit ? null : this.graph.getGroupOnPos(point[0], point[1]);
+                setSelectedGroup(groupUnderPoint && isOverGroupTitleBar(groupUnderPoint, point[0], point[1])
+                    ? groupUnderPoint : null);
+            }
             if (nodeHit) {
                 // LiteGraph's OWN native rewire gesture: clicking directly on an input dot that already
                 // has a link picks that link up and starts dragging its input end — same condition stock
@@ -529,8 +573,12 @@ window.storyForgeGraph = (function () {
             if (!groupHit)
                 return originalProcessMouseDown.call(this, forceCtrlKey(e));
 
-            if (isOverGroupTitleBar(groupHit, point[0], point[1]))
-                return originalProcessMouseDown.call(this, e);
+            if (isOverGroupTitleBar(groupHit, point[0], point[1])) {
+                const titleBarResult = originalProcessMouseDown.call(this, e);
+                if (isLeftButton)
+                    pendingGroupClick = captureGroupClick(groupHit, e);
+                return titleBarResult;
+            }
 
             this.graph.getGroupOnPos = () => null;
             try {
@@ -712,6 +760,8 @@ window.storyForgeGraph = (function () {
                         beginUndoableChange();
                         const group = new LiteGraph.LGraphGroup(" ");
                         group._displayTitle = "新群組";
+                        group._clientId = createGroupClientId();
+                        group.color = "#000000"; // 與 Unity 新建群組的預設色一致
                         group.pos = [worldPos[0], worldPos[1]];
                         group.size = [200, 100];
                         this.graph.add(group);
@@ -995,9 +1045,8 @@ window.storyForgeGraph = (function () {
         const group = canvasInstance.graph.getGroupOnPos(event.canvasX, event.canvasY);
         if (group) {
             items.push(null, {
-                content: "Edit Group",
-                has_submenu: true,
-                submenu: { title: "Group", extra: group, options: canvasInstance.getGroupMenuOptions(group) },
+                content: "刪除群組",
+                callback: () => deleteGroup(group),
             });
         }
         new LiteGraph.ContextMenu(items, { event: event, autoopen: true }, canvasInstance.getCanvasWindow());
@@ -1431,6 +1480,96 @@ window.storyForgeGraph = (function () {
             restoreViewportOrFitView();
             canvas.draw(true, true);
         });
+
+        // 剛載入的畫布就是「已存檔」的狀態，作為關閉視窗時判斷有沒有未存修改的基準
+        markCanvasClean();
+    }
+
+    // 畫布上未存檔的變動（移動節點、接線、刪節點）在按「存檔」前只存在瀏覽器裡。以 exportGraph 的內容當指紋，
+    // 和載入或存檔成功時的指紋比對。群組只比成員與標題：群組的位置大小會依成員重新計算，不代表使用者的修改。
+    let cleanCanvasFingerprint = null;
+
+    function canvasFingerprint() {
+        if (!graph || !currentPayload) return null;
+
+        const exported = exportGraph();
+        exported.groups = exported.groups.map(group => ({
+            clientId: group.clientId,
+            title: group.title,
+            color: group.color,
+            memberNodeGuids: [...group.memberNodeGuids].sort(),
+        }));
+        return JSON.stringify(exported);
+    }
+
+    // 目前在側邊欄顯示的群組（以 _clientId 記錄：復原／重做會重建群組物件，ID 不變）
+    let selectedGroupClientId = null;
+
+    function createGroupClientId() {
+        if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+        return "g-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+    }
+
+    function findGroupByClientId(clientId) {
+        return (graph && graph._groups || []).find(group => group._clientId === clientId) || null;
+    }
+
+    function groupInfo(group) {
+        return { clientId: group._clientId, title: group._displayTitle || "", color: group.color || "#335" };
+    }
+
+    function setSelectedGroup(group) {
+        const clientId = group && group._clientId ? group._clientId : null;
+        if (clientId === selectedGroupClientId) return;
+
+        selectedGroupClientId = clientId;
+        selfRef?.invokeMethodAsync("OnGroupSelectionChanged", clientId ? groupInfo(group) : null);
+    }
+
+    function refreshSelectedGroup() {
+        if (!selectedGroupClientId) return;
+
+        const group = findGroupByClientId(selectedGroupClientId);
+        if (!group) {
+            setSelectedGroup(null);
+            return;
+        }
+
+        selfRef?.invokeMethodAsync("OnGroupSelectionChanged", groupInfo(group));
+    }
+
+    // 側邊欄修改群組標題或顏色；可 Ctrl+Z 復原。title／color 傳 null 代表不改
+    function setGroupProperties(clientId, title, color) {
+        const group = findGroupByClientId(clientId);
+        if (!group) return false;
+
+        beginUndoableChange();
+        if (title !== null && title !== undefined) group._displayTitle = title;
+        if (color !== null && color !== undefined) group.color = color;
+        commitUndoableChange();
+        canvas.setDirty(true, true);
+        return true;
+    }
+
+    // 只刪除群組本身，群組裡的節點保留在畫布上
+    function deleteGroup(group) {
+        beginUndoableChange();
+        graph.remove(group);
+        commitUndoableChange();
+        if (group._clientId && group._clientId === selectedGroupClientId)
+            setSelectedGroup(null);
+        canvas.setDirty(true, true);
+        // 從右鍵選單觸發時焦點會留在選單上，拉回畫布讓 Ctrl+Z 立刻能復原
+        canvas.canvas.focus();
+    }
+
+    function markCanvasClean() {
+        cleanCanvasFingerprint = canvasFingerprint();
+    }
+
+    function hasCanvasChanges() {
+        const current = canvasFingerprint();
+        return current !== null && cleanCanvasFingerprint !== null && current !== cleanCanvasFingerprint;
     }
 
     // Ported from GraphDocumentModel.UpdateNodeDragLive — the C# original ran this continuously as a node
@@ -1876,6 +2015,9 @@ window.storyForgeGraph = (function () {
         deletedBeforeFirstSaveGuids.clear();
         if (currentPayload)
             currentPayload.nodes = currentPayload.nodes.filter(node => liveGuids.has(node.guid));
+
+        // 存檔後的畫布成為新的基準；必須在上面清掉 newNodeGuids 之後才記錄，否則指紋會包含已存檔的新節點
+        markCanvasClean();
     }
 
     function fitViewAndRedraw() {
@@ -1932,6 +2074,8 @@ window.storyForgeGraph = (function () {
         init: init,
         markSaveSucceeded: markSaveSucceeded,
         exportGraph: exportGraph,
+        hasCanvasChanges: hasCanvasChanges,
+        setGroupProperties: setGroupProperties,
         fitView: fitViewAndRedraw,
         updateSettings: updateSettings,
         updateNodeTitle: updateNodeTitle,

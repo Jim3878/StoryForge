@@ -68,6 +68,34 @@
                 }
             </div>
         }
+        else if (_selectedGroup != null)
+        {
+            <div class="graph-inspector-resize-handle" id="graph-inspector-resize-handle"></div>
+            <div class="graph-inspector" id="graph-inspector-panel">
+                <div class="graph-inspector-title">群組</div>
+                <div class="graph-inspector-guid">@_selectedGroup.ClientId</div>
+                <label class="graph-inspector-field">
+                    <span>標題</span>
+                    <input value="@_selectedGroup.Title" @onchange="OnGroupTitleChanged" />
+                </label>
+                <div class="graph-inspector-field">
+                    <span>顏色</span>
+                    <div class="graph-group-swatches">
+                        @foreach (var (name, hex) in GroupColorPresets)
+                        {
+                            <button class="graph-group-swatch @(IsCurrentGroupColor(hex) ? "selected" : "")"
+                                    title="@name" style="background:@hex" @onclick="() => SetGroupColor(hex)"></button>
+                        }
+                        <label class="graph-group-custom-color" title="自訂顏色">
+                            <input type="color" value="@ToColorInputValue(_selectedGroup.Color)"
+                                   @onchange="OnGroupCustomColorChanged" />
+                            自訂
+                        </label>
+                    </div>
+                </div>
+                <div class="graph-inspector-hint">在群組上按右鍵可以刪除群組（群組裡的節點會保留）。</div>
+            </div>
+        }
     </div>
     <div class="graph-bottom-status @(_loadFailed ? "failed" : _isLoading ? "loading" : "ready")"
          role="status" aria-live="polite">
@@ -152,6 +180,13 @@
     .graph-inspector-title { font-weight: bold; margin-bottom: 4px; word-break: break-all; }
     .graph-inspector-guid { font-size: 11px; opacity: 0.5; font-family: monospace; margin-bottom: 12px; word-break: break-all; }
     .graph-inspector-empty { opacity: 0.6; font-size: 13px; }
+    .graph-inspector-hint { opacity: 0.5; font-size: 12px; margin-top: 8px; line-height: 1.5; }
+    .graph-group-swatches { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .graph-group-swatch { width: 24px; height: 24px; padding: 0; border: 2px solid #4a4a4a; border-radius: 4px; cursor: pointer; }
+    .graph-group-swatch:hover { border-color: #888; }
+    .graph-group-swatch.selected { border-color: #fff; }
+    .graph-group-custom-color { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; opacity: 0.85; cursor: pointer; }
+    .graph-group-custom-color input[type=color] { width: 28px; height: 24px; padding: 0; border: 1px solid #444; background: none; cursor: pointer; }
     .graph-inspector-field { display: block; margin-bottom: 10px; font-size: 13px; }
     .graph-inspector-field span { display: block; margin-bottom: 4px; opacity: 0.8; }
     .graph-inspector-field input { width: 100%; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 6px; border-radius: 3px; }
@@ -190,7 +225,7 @@
 
         // ui-draggable.js's own _resizeInitialized guard makes this safe to call on every render while the
         // inspector is shown, not just the render that first shows it (editing a field re-renders too).
-        if (_selectedNodeGuid != null)
+        if (_selectedNodeGuid != null || _selectedGroup != null)
             await JS.InvokeVoidAsync("storyForgeUi.makeResizable", "graph-inspector-panel", "graph-inspector-resize-handle");
     }
 
@@ -267,6 +302,8 @@
     public void OnNodeSelectionChanged(string? guid)
     {
         _selectedNodeGuid = guid;
+        if (guid != null)
+            _selectedGroup = null;
         if (guid == null)
         {
             _selectedNodeFieldValues = new();
@@ -293,6 +330,74 @@
         }
 
         StateHasChanged();
+    }
+
+    // 群組側邊欄 ─────────────────────────────────────────────────────────────
+
+    public sealed class GroupSelectionDto
+    {
+        public string ClientId { get; set; } = string.Empty;
+        public string Title { get; set; } = string.Empty;
+        public string Color { get; set; } = string.Empty;
+    }
+
+    private static readonly (string Name, string Hex)[] GroupColorPresets =
+    {
+        ("預設（黑）", "#000000"), ("紅", "#a84a4a"), ("橘", "#b06634"), ("黃", "#b58b2a"), ("綠", "#4a8a4a"), ("青", "#3f8f8f"),
+        ("藍", "#3f789e"), ("紫", "#7a4fa1"), ("桃紅", "#a1309b"), ("灰", "#555555"),
+    };
+
+    private GroupSelectionDto? _selectedGroup;
+
+    // 點群組標題列時由 graph-editor.js 呼叫；info 為 null 代表取消群組選取
+    [JSInvokable]
+    public void OnGroupSelectionChanged(GroupSelectionDto? info)
+    {
+        _selectedGroup = info;
+        if (info != null)
+        {
+            _selectedNodeGuid = null;
+            _selectedNodeFieldValues = new();
+            _selectedNodeIdentityFields = new();
+            _selectedNodeTitle = string.Empty;
+            _nodeContent = null;
+        }
+
+        StateHasChanged();
+    }
+
+    private async Task OnGroupTitleChanged(ChangeEventArgs e)
+    {
+        if (_selectedGroup == null)
+            return;
+
+        var title = e.Value?.ToString()?.Trim() ?? string.Empty;
+        if (await JS.InvokeAsync<bool>("storyForgeGraph.setGroupProperties", _selectedGroup.ClientId, title, null))
+            _selectedGroup.Title = title;
+    }
+
+    private Task OnGroupCustomColorChanged(ChangeEventArgs e) => SetGroupColor(e.Value?.ToString() ?? string.Empty);
+
+    private async Task SetGroupColor(string hex)
+    {
+        if (_selectedGroup == null || string.IsNullOrEmpty(hex))
+            return;
+
+        if (await JS.InvokeAsync<bool>("storyForgeGraph.setGroupProperties", _selectedGroup.ClientId, null, hex))
+            _selectedGroup.Color = hex;
+    }
+
+    private bool IsCurrentGroupColor(string hex) =>
+        _selectedGroup != null && string.Equals(ToColorInputValue(_selectedGroup.Color), hex, StringComparison.OrdinalIgnoreCase);
+
+    // <input type="color"> 只接受 #rrggbb：把 #rgb 簡寫展開，其他格式（例如 rgba(...)）退回預設色
+    private static string ToColorInputValue(string? color)
+    {
+        if (string.IsNullOrEmpty(color) || color[0] != '#')
+            return "#335533";
+        if (color.Length == 4)
+            return $"#{color[1]}{color[1]}{color[2]}{color[2]}{color[3]}{color[3]}".ToLowerInvariant();
+        return color.Length >= 7 ? color[..7].ToLowerInvariant() : "#335533";
     }
 
     private string GetFieldValue(string fieldName) =>

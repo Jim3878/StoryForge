@@ -39,9 +39,10 @@ public sealed class GraphGroupVm
     public int? SourceIndex { get; init; }
 
     public string Title { get; set; } = "群組";
-    public float ColorR { get; set; } = 0.3f;
-    public float ColorG { get; set; } = 0.5f;
-    public float ColorB { get; set; } = 0.8f;
+    // 預設黑色、透明度 0.3，與 Unity GraphProcessor 新建群組的預設色一致
+    public float ColorR { get; set; } = 0f;
+    public float ColorG { get; set; } = 0f;
+    public float ColorB { get; set; } = 0f;
     public float ColorA { get; set; } = 0.3f;
 
     // Always derived from member node positions (see GraphDocumentModel.RecomputeGroupBounds) except
@@ -175,9 +176,9 @@ public sealed class GraphDocumentModel
                 ClientId = System.Guid.NewGuid().ToString("D"),
                 SourceIndex = i,
                 Title = title,
-                ColorR = group.Color?.R ?? 0.3f,
-                ColorG = group.Color?.G ?? 0.5f,
-                ColorB = group.Color?.B ?? 0.8f,
+                ColorR = group.Color?.R ?? 0f,
+                ColorG = group.Color?.G ?? 0f,
+                ColorB = group.Color?.B ?? 0f,
                 ColorA = group.Color?.A ?? 0.3f,
                 X = group.Position?.X ?? 0,
                 Y = group.Position?.Y ?? 0,
@@ -504,11 +505,12 @@ public sealed class GraphDocumentModel
         return Groups.FirstOrDefault(g => g.ClientId == clientId);
     }
 
-    public GraphGroupVm AddGroup(string title, float x, float y)
+    // clientId：畫布上新增群組時已經產生的 ID（存檔時沿用，之後才找得到同一個群組）；不指定則新產生一個
+    public GraphGroupVm AddGroup(string title, float x, float y, string? clientId = null)
     {
         var group = new GraphGroupVm
         {
-            ClientId = System.Guid.NewGuid().ToString("D"),
+            ClientId = string.IsNullOrEmpty(clientId) ? System.Guid.NewGuid().ToString("D") : clientId,
             SourceIndex = null,
             Title = title,
             X = x,

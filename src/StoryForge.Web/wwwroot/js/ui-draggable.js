@@ -162,6 +162,36 @@ window.storyForgeUi = (function () {
         }
     }
 
+    // 關閉視窗前提醒未存檔：畫布上的變動由 storyForgeGraph.hasCanvasChanges 即時比對；伺服器端的變動
+    // （例如改劇本ID）無法在 beforeunload 當下同步詢問伺服器，所以由 MainLayout 定期推送最新狀態過來。
+    // 提示文字由瀏覽器決定（「要離開網站嗎？系統可能不會儲存你所做的變更」），網頁無法自訂。
+    let serverHasUnsavedChanges = false;
+
+    function setServerUnsaved(value) {
+        serverHasUnsavedChanges = !!value;
+    }
+
+    function hasUnsavedChanges() {
+        if (serverHasUnsavedChanges) return true;
+        try {
+            return !!(window.storyForgeGraph && window.storyForgeGraph.hasCanvasChanges &&
+                window.storyForgeGraph.hasCanvasChanges());
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function bindUnsavedGuard() {
+        if (window._storyForgeUnsavedGuardBound) return;
+        window._storyForgeUnsavedGuardBound = true;
+
+        window.addEventListener("beforeunload", function (e) {
+            if (!hasUnsavedChanges()) return;
+            e.preventDefault();
+            e.returnValue = "";
+        });
+    }
+
     function bindSaveShortcut(dotNetRef) {
         if (window._storyForgeSaveShortcutBound) return;
         window._storyForgeSaveShortcutBound = true;
@@ -269,5 +299,6 @@ window.storyForgeUi = (function () {
         makeDraggable: makeDraggable, makeResizable: makeResizable, makeVResizable: makeVResizable,
         bindSaveShortcut: bindSaveShortcut, makeSortableList: makeSortableList,
         playSaveFeedback: playSaveFeedback,
+        setServerUnsaved: setServerUnsaved, bindUnsavedGuard: bindUnsavedGuard,
     };
 })();
