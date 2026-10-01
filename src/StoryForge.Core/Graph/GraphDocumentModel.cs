@@ -1,6 +1,5 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using StoryForge.Core.Changelist;
 using StoryForge.Core.Schemas;
 
 namespace StoryForge.Core.Graph;
@@ -117,10 +116,6 @@ public sealed class GraphDocumentModel
 
     public string GraphName { get; private set; } = string.Empty;
 
-    // SHA-256 of the raw AI YAML text this model was loaded from — carried into any changelist built
-    // from this model so Unity can detect at import time whether the graph changed since export.
-    public string BaseYamlHash { get; private set; } = string.Empty;
-
     private readonly Stack<GraphDocumentSnapshot> _undoStack = new();
     private readonly Stack<GraphDocumentSnapshot> _redoStack = new();
 
@@ -132,10 +127,8 @@ public sealed class GraphDocumentModel
     // cares about which playscript identities exist in the graph.
     public event Action? NodesChanged;
 
-    // Serialized fingerprint of the state as of the last load or local session save — HasUnsavedChanges
-    // just compares the current state against this, rather than tracking dirtiness on every mutation.
-    private string? _lastCleanSessionJson;
-    private string? _lastCleanConnectionsJson;
+    // 最後一次載入或存檔時的正規化 JSON，HasUnsavedChanges 只要和它比較
+    private string? _lastCleanJson;
 
     private GraphDocumentModel(ProcessNodeSchemaDocument schema, AppSettings settings)
     {
@@ -259,7 +252,7 @@ public sealed class GraphDocumentModel
                     X = node.X, Y = node.Y, Width = node.Width, Height = node.Height,
                     Extra = CloneExtra(node.PositionExtra),
                 },
-                Data = JObject.FromObject(node.Fields),
+                Data = BuildNodeData(node),
                 Extra = CloneExtra(node.Extra),
             });
         }
@@ -309,272 +302,43 @@ public sealed class GraphDocumentModel
         return document;
     }
 
+    // Unity 會把節點型別的每個資料欄位都寫出來：字串（null 也寫成 ""）與整數。這裡依 schema 產生同樣的內容，
+    // 側邊欄清空欄位（Fields 裡沒有這個 key）或用字串存的數字都會被轉成 Unity 的寫法。
+    private JObject BuildNodeData(GraphNodeVm node)
+    {
+        var schema = GetSchema(node.TypeName);
+        if (schema == null)
+            return JObject.FromObject(node.Fields);
+
+        var data = new JObject();
+        foreach (var field in schema.IdentityFields)
+        {
+            node.Fields.TryGetValue(field.FieldName, out var value);
+            data[field.FieldName] = field.FieldType == "System.Int32"
+                ? new JValue(ToInt(value))
+                : new JValue(value?.ToString() ?? string.Empty);
+        }
+
+        return data;
+    }
+
+    private static int ToInt(object? value) => value switch
+    {
+        null => 0,
+        int i => i,
+        long l => (int)l,
+        _ => int.TryParse(value.ToString(), out var parsed) ? parsed : 0,
+    };
+
     private static Dictionary<string, JToken> CloneExtra(IEnumerable<KeyValuePair<string, JToken>> extra) =>
         extra.ToDictionary(pair => pair.Key, pair => pair.Value.DeepClone(), StringComparer.Ordinal);
 
-    public static GraphDocumentModel Load(
-        PlayscriptGraphAiDocument document, ProcessNodeSchemaDocument schema, AppSettings settings,
-        string baseYamlHash)
-    {
-        var model = new GraphDocumentModel(schema, settings)
-        {
-            GraphName = document.GraphName ?? string.Empty,
-            BaseYamlHash = baseYamlHash,
-        };
+    // 未存修改：把目前狀態轉成正規化 JSON，和最後一次載入／存檔時的版本比較
+    public bool HasUnsavedChanges() => SerializeCanonical() != _lastCleanJson;
 
-        foreach (var node in document.Nodes)
-        {
-            var x = node.Position?.X ?? 0;
-            var y = node.Position?.Y ?? 0;
-            model.Nodes.Add(new GraphNodeVm
-            {
-                Guid = node.Id,
-                TypeName = node.Type,
-                X = x,
-                Y = y,
-                Width = node.Position?.Width > 0 ? node.Position.Width : 220,
-                Height = node.Position?.Height > 0 ? node.Position.Height : 140,
-                Fields = node.Data.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
-                BaselineX = x,
-                BaselineY = y,
-            });
-        }
+    public void MarkClean() => _lastCleanJson = SerializeCanonical();
 
-        foreach (var edge in document.Edges)
-        {
-            model.Edges.Add(new GraphEdgeVm
-            {
-                FromNodeGuid = edge.FromNode,
-                FromPort = edge.FromPort,
-                FromPortId = edge.FromPortId,
-                ToNodeGuid = edge.ToNode,
-                ToPort = edge.ToPort,
-                ToPortId = edge.ToPortId,
-            });
-        }
-
-        // GraphProcessor's own GroupView visually auto-fits to its members live in the Unity editor, but the
-        // serialized group.position/size only gets written back at specific trigger points — it can be stale
-        // relative to where the members actually are. So the loaded Position/Size is never trusted for layout;
-        // it's discarded in favor of a fresh RecomputeGroupBounds pass below, matching what Unity shows live.
-        for (var i = 0; i < document.Groups.Count; i++)
-        {
-            var group = document.Groups[i];
-            var title = string.IsNullOrEmpty(group.Title) ? "群組" : group.Title!;
-            var memberGuids = new HashSet<string>(group.InnerNodeGuids);
-            var vm = new GraphGroupVm
-            {
-                ClientId = System.Guid.NewGuid().ToString("D"),
-                SourceIndex = i,
-                Title = title,
-                ColorR = group.Color?.R ?? 0f,
-                ColorG = group.Color?.G ?? 0f,
-                ColorB = group.Color?.B ?? 0f,
-                ColorA = group.Color?.A ?? 0.3f,
-                X = group.Position?.X ?? 0,
-                Y = group.Position?.Y ?? 0,
-                MemberNodeGuids = memberGuids,
-                BaselineTitle = title,
-                BaselineMemberNodeGuids = new HashSet<string>(memberGuids),
-            };
-            model.Groups.Add(vm);
-            model.RecomputeGroupBounds(vm);
-        }
-
-        model.MarkClean();
-        return model;
-    }
-
-    // Resumes an editing session from a local save file instead of Unity's exported YAML — used when the
-    // app finds a saved session on startup. Trusts the session's own IsNew/IsMarkedForDeletion/baseline
-    // fields verbatim rather than re-deriving anything, since it's meant to reproduce exactly the state
-    // that was saved.
-    public static GraphDocumentModel LoadFromSession(
-        GraphSessionDocument session, GraphConnectionsDocument connections, ProcessNodeSchemaDocument schema,
-        AppSettings settings)
-    {
-        var model = new GraphDocumentModel(schema, settings)
-        {
-            GraphName = session.GraphName,
-            BaseYamlHash = session.BaseYamlHash,
-        };
-
-        foreach (var node in session.Nodes)
-        {
-            // A session file saved before move-tracking existed has no BaselineX/Y at all (both come back
-            // null here) — falling back to the node's current position as its baseline can't recover
-            // movement that already happened before this fix, but it stops every existing node from being
-            // permanently unable to have movement detected ever again; any further move from here on is
-            // tracked correctly.
-            var baselineX = node.IsNew ? (float?)null : node.BaselineX ?? node.X;
-            var baselineY = node.IsNew ? (float?)null : node.BaselineY ?? node.Y;
-
-            model.Nodes.Add(new GraphNodeVm
-            {
-                Guid = node.Guid,
-                TypeName = node.TypeName,
-                X = node.X,
-                Y = node.Y,
-                Width = node.Width,
-                Height = node.Height,
-                Fields = new Dictionary<string, object?>(node.Fields),
-                IsNew = node.IsNew,
-                IsMarkedForDeletion = node.IsMarkedForDeletion,
-                BaselineX = baselineX,
-                BaselineY = baselineY,
-            });
-        }
-
-        foreach (var edge in connections.Edges)
-        {
-            model.Edges.Add(new GraphEdgeVm
-            {
-                FromNodeGuid = edge.FromNodeGuid,
-                FromPort = edge.FromPort,
-                FromPortId = edge.FromPortId,
-                ToNodeGuid = edge.ToNodeGuid,
-                ToPort = edge.ToPort,
-                ToPortId = edge.ToPortId,
-                IsNew = edge.IsNew,
-                IsMarkedForDeletion = edge.IsMarkedForDeletion,
-            });
-        }
-
-        foreach (var group in session.Groups)
-        {
-            model.Groups.Add(new GraphGroupVm
-            {
-                ClientId = group.ClientId,
-                SourceIndex = group.SourceIndex,
-                Title = group.Title,
-                ColorR = group.ColorR,
-                ColorG = group.ColorG,
-                ColorB = group.ColorB,
-                ColorA = group.ColorA,
-                X = group.X,
-                Y = group.Y,
-                Width = group.Width,
-                Height = group.Height,
-                MemberNodeGuids = new HashSet<string>(group.MemberNodeGuids),
-                IsNew = group.IsNew,
-                IsMarkedForDeletion = group.IsMarkedForDeletion,
-                BaselineTitle = group.BaselineTitle,
-                BaselineMemberNodeGuids = group.BaselineMemberNodeGuids == null
-                    ? null
-                    : new HashSet<string>(group.BaselineMemberNodeGuids),
-            });
-        }
-
-        model.MarkClean();
-        return model;
-    }
-
-    public GraphSessionDocument CreateSessionDocument()
-    {
-        return new GraphSessionDocument
-        {
-            SavedAtUtc = DateTime.UtcNow,
-            GraphName = GraphName,
-            BaseYamlHash = BaseYamlHash,
-            Nodes = Nodes.Select(n => new GraphSessionNode
-            {
-                Guid = n.Guid,
-                TypeName = n.TypeName,
-                X = n.X,
-                Y = n.Y,
-                Width = n.Width,
-                Height = n.Height,
-                Fields = new Dictionary<string, object?>(n.Fields),
-                IsNew = n.IsNew,
-                IsMarkedForDeletion = n.IsMarkedForDeletion,
-                BaselineX = n.BaselineX,
-                BaselineY = n.BaselineY,
-            }).ToList(),
-            Groups = Groups.Select(g => new GraphSessionGroup
-            {
-                ClientId = g.ClientId,
-                SourceIndex = g.SourceIndex,
-                Title = g.Title,
-                ColorR = g.ColorR,
-                ColorG = g.ColorG,
-                ColorB = g.ColorB,
-                ColorA = g.ColorA,
-                X = g.X,
-                Y = g.Y,
-                Width = g.Width,
-                Height = g.Height,
-                MemberNodeGuids = g.MemberNodeGuids.ToList(),
-                IsNew = g.IsNew,
-                IsMarkedForDeletion = g.IsMarkedForDeletion,
-                BaselineTitle = g.BaselineTitle,
-                BaselineMemberNodeGuids = g.BaselineMemberNodeGuids?.ToList(),
-            }).ToList(),
-        };
-    }
-
-    // Sibling of CreateSessionDocument — see GraphConnectionsDocument's own comment for why edges are
-    // serialized into their own document/file instead of being part of the one above.
-    public GraphConnectionsDocument CreateConnectionsDocument()
-    {
-        return new GraphConnectionsDocument
-        {
-            SavedAtUtc = DateTime.UtcNow,
-            Edges = Edges.Select(e => new GraphSessionEdge
-            {
-                FromNodeGuid = e.FromNodeGuid,
-                FromPort = e.FromPort,
-                FromPortId = e.FromPortId,
-                ToNodeGuid = e.ToNodeGuid,
-                ToPort = e.ToPort,
-                ToPortId = e.ToPortId,
-                IsNew = e.IsNew,
-                IsMarkedForDeletion = e.IsMarkedForDeletion,
-            }).ToList(),
-        };
-    }
-
-    // Cheap dirty-check: re-serializes the current state and compares it against the fingerprint captured
-    // at the last load or local save, rather than tracking dirtiness through every individual mutation.
-    // Checked against both documents now that edges live apart from nodes/groups — an edge-only change
-    // (e.g. a rewired wire, no node moved) must still count as unsaved.
-    public bool HasUnsavedChanges()
-    {
-        return SerializeForFingerprint(CreateSessionDocument()) != _lastCleanSessionJson ||
-               SerializeForFingerprint(CreateConnectionsDocument()) != _lastCleanConnectionsJson;
-    }
-
-    public void MarkClean()
-    {
-        _lastCleanSessionJson = SerializeForFingerprint(CreateSessionDocument());
-        _lastCleanConnectionsJson = SerializeForFingerprint(CreateConnectionsDocument());
-    }
-
-    private static string SerializeForFingerprint(GraphSessionDocument document)
-    {
-        // SavedAtUtc always differs between calls and isn't part of what "unsaved changes" means — excluded
-        // by serializing a copy with it zeroed out rather than by hand-writing a separate comparator.
-        var normalized = new GraphSessionDocument
-        {
-            Version = document.Version,
-            SavedAtUtc = default,
-            GraphName = document.GraphName,
-            BaseYamlHash = document.BaseYamlHash,
-            Nodes = document.Nodes,
-            Groups = document.Groups,
-        };
-        return JsonConvert.SerializeObject(normalized);
-    }
-
-    private static string SerializeForFingerprint(GraphConnectionsDocument document)
-    {
-        var normalized = new GraphConnectionsDocument
-        {
-            Version = document.Version,
-            SavedAtUtc = default,
-            Edges = document.Edges,
-        };
-        return JsonConvert.SerializeObject(normalized);
-    }
+    public string SerializeCanonical() => CanonicalGraphJson.Serialize(BuildCanonicalDocument(), Schema);
 
     public ProcessNodeTypeSchema? GetSchema(string typeName)
     {
@@ -598,7 +362,7 @@ public sealed class GraphDocumentModel
         };
 
         foreach (var field in schema.IdentityFields)
-            node.Fields[field.FieldName] = string.Empty;
+            node.Fields[field.FieldName] = field.FieldType == "System.Int32" ? 0 : string.Empty;
 
         Nodes.Add(node);
         NodesChanged?.Invoke();
@@ -730,9 +494,18 @@ public sealed class GraphDocumentModel
     // allowance. A still-empty group keeps whatever placeholder position/size it was created with.
     public void RecomputeGroupBounds(GraphGroupVm group)
     {
+        var bounds = ComputeGroupBounds(group);
+        if (bounds != null)
+            (group.X, group.Y, group.Width, group.Height) = bounds.Value;
+    }
+
+    // 依成員算出群組應有的範圍，不修改群組本身。Unity 檔案裡存的群組範圍常常是舊的（Unity 顯示時會自動框住成員），
+    // 畫布顯示用這個值；沒有成員時為 null。
+    public (float X, float Y, float Width, float Height)? ComputeGroupBounds(GraphGroupVm group)
+    {
         var members = Nodes.Where(n => group.MemberNodeGuids.Contains(n.Guid)).ToList();
         if (members.Count == 0)
-            return;
+            return null;
 
         var minX = members.Min(n => n.X);
         var minY = members.Min(n => n.Y);
@@ -742,10 +515,7 @@ public sealed class GraphDocumentModel
         var padding = Settings.Padding;
         var titleBarHeight = Settings.TitleBarHeight;
 
-        group.X = minX - padding;
-        group.Y = minY - titleBarHeight;
-        group.Width = maxX - minX + padding * 2f;
-        group.Height = maxY - minY + titleBarHeight + padding;
+        return (minX - padding, minY - titleBarHeight, maxX - minX + padding * 2f, maxY - minY + titleBarHeight + padding);
     }
 
     // A node joins a group once its own center point lands inside the group's box — a plain overlap test
@@ -1007,172 +777,5 @@ public sealed class GraphDocumentModel
         IsMarkedForDeletion = g.IsMarkedForDeletion,
         BaselineTitle = g.BaselineTitle,
         BaselineMemberNodeGuids = g.BaselineMemberNodeGuids == null ? null : new HashSet<string>(g.BaselineMemberNodeGuids),
-    };
-
-    // Projects the current session's edits (IsNew/IsMarkedForDeletion nodes and edges, plus groups whose
-    // title or membership differ from their as-loaded baseline) into a standalone changelist document —
-    // the only thing the standalone tool ever writes for Unity to import back.
-    public GraphChangelistDocument BuildChangelist()
-    {
-        var doc = new GraphChangelistDocument
-        {
-            CreatedAtUtc = DateTime.UtcNow,
-            GraphName = GraphName,
-            BaseYamlHash = BaseYamlHash,
-        };
-
-        foreach (var node in Nodes.Where(n => n.IsNew && !n.IsMarkedForDeletion))
-        {
-            doc.AddedNodes.Add(new GraphChangelistNode
-            {
-                Guid = node.Guid,
-                Type = node.TypeName,
-                X = node.X,
-                Y = node.Y,
-                Width = node.Width,
-                Height = node.Height,
-                Data = new Dictionary<string, object?>(node.Fields),
-            });
-        }
-
-        foreach (var node in Nodes.Where(n => n.IsMarkedForDeletion && !n.IsNew))
-            doc.DeletedNodeGuids.Add(node.Guid);
-
-        foreach (var node in Nodes.Where(n => !n.IsNew && !n.IsMarkedForDeletion))
-        {
-            if (node.BaselineX == null || node.BaselineY == null)
-                continue;
-            if (node.X == node.BaselineX.Value && node.Y == node.BaselineY.Value)
-                continue;
-
-            doc.ModifiedNodes.Add(new GraphChangelistNodeMove
-            {
-                Guid = node.Guid,
-                X = node.X,
-                Y = node.Y,
-            });
-        }
-
-        foreach (var edge in Edges.Where(e => e.IsNew && !e.IsMarkedForDeletion))
-            doc.AddedEdges.Add(ToChangelistEdge(edge));
-
-        foreach (var edge in Edges.Where(e => e.IsMarkedForDeletion && !e.IsNew))
-            doc.DeletedEdges.Add(ToChangelistEdge(edge));
-
-        foreach (var group in Groups.Where(g => g.IsNew && !g.IsMarkedForDeletion))
-        {
-            doc.AddedGroups.Add(new GraphChangelistGroup
-            {
-                Title = group.Title,
-                ColorR = group.ColorR,
-                ColorG = group.ColorG,
-                ColorB = group.ColorB,
-                ColorA = group.ColorA,
-                X = group.X,
-                Y = group.Y,
-                Width = group.Width,
-                Height = group.Height,
-                MemberNodeGuids = group.MemberNodeGuids.ToList(),
-            });
-        }
-
-        foreach (var group in Groups.Where(g => g.SourceIndex != null && g.IsMarkedForDeletion))
-            doc.DeletedGroupSourceIndices.Add(group.SourceIndex!.Value);
-
-        foreach (var group in Groups.Where(g => g.SourceIndex != null && !g.IsMarkedForDeletion))
-        {
-            var titleChanged = group.Title != group.BaselineTitle;
-            var membersChanged = group.BaselineMemberNodeGuids == null ||
-                                  !group.MemberNodeGuids.SetEquals(group.BaselineMemberNodeGuids);
-            if (!titleChanged && !membersChanged)
-                continue;
-
-            doc.ModifiedGroups.Add(new GraphChangelistGroupModification
-            {
-                SourceIndex = group.SourceIndex!.Value,
-                Title = group.Title,
-                MemberNodeGuids = group.MemberNodeGuids.ToList(),
-            });
-        }
-
-        return doc;
-    }
-
-    // Full snapshot of the current session's live state (every node/edge/group, not just what changed) —
-    // used by the "整批匯出" flow so Unity always overwrites its graph from this as the single source of
-    // truth, instead of relying on a diff against a possibly-stale baseline (see BuildChangelist above,
-    // which still exists only to drive the human-readable review list, not what gets written to disk).
-    public PlayscriptGraphAiDocument BuildFullDocument()
-    {
-        var doc = new PlayscriptGraphAiDocument
-        {
-            Version = 1,
-            GraphName = GraphName,
-        };
-
-        foreach (var node in Nodes.Where(n => !n.IsMarkedForDeletion))
-        {
-            doc.Nodes.Add(new PlayscriptGraphAiNode
-            {
-                Id = node.Guid,
-                Type = node.TypeName,
-                Position = new PlayscriptGraphAiPosition
-                {
-                    X = node.X,
-                    Y = node.Y,
-                    Width = node.Width,
-                    Height = node.Height,
-                },
-                Data = node.Fields.ToDictionary(kv => kv.Key, kv => kv.Value!),
-            });
-        }
-
-        foreach (var edge in Edges.Where(e => !e.IsMarkedForDeletion))
-            doc.Edges.Add(ToAiEdge(edge));
-
-        foreach (var group in Groups.Where(g => !g.IsMarkedForDeletion))
-        {
-            doc.Groups.Add(new PlayscriptGraphAiGroup
-            {
-                Title = group.Title,
-                Color = new PlayscriptGraphAiColor
-                {
-                    R = group.ColorR,
-                    G = group.ColorG,
-                    B = group.ColorB,
-                    A = group.ColorA,
-                },
-                Position = new PlayscriptGraphAiPosition
-                {
-                    X = group.X,
-                    Y = group.Y,
-                    Width = group.Width,
-                    Height = group.Height,
-                },
-                InnerNodeGuids = group.MemberNodeGuids.ToList(),
-            });
-        }
-
-        return doc;
-    }
-
-    private static PlayscriptGraphAiEdge ToAiEdge(GraphEdgeVm edge) => new()
-    {
-        FromNode = edge.FromNodeGuid,
-        FromPort = edge.FromPort,
-        FromPortId = edge.FromPortId,
-        ToNode = edge.ToNodeGuid,
-        ToPort = edge.ToPort,
-        ToPortId = edge.ToPortId,
-    };
-
-    private static GraphChangelistEdge ToChangelistEdge(GraphEdgeVm edge) => new()
-    {
-        FromNode = edge.FromNodeGuid,
-        FromPort = edge.FromPort,
-        FromPortId = edge.FromPortId,
-        ToNode = edge.ToNodeGuid,
-        ToPort = edge.ToPort,
-        ToPortId = edge.ToPortId,
     };
 }

@@ -1,24 +1,9 @@
 using Newtonsoft.Json;
-using YamlDotNet.Serialization;
-using YamlDotNet.Serialization.NamingConventions;
 
 namespace StoryForge.Core.Schemas;
 
 public static class DocumentLoader
 {
-    private static readonly IDeserializer YamlDeserializer = new DeserializerBuilder()
-        .WithNamingConvention(CamelCaseNamingConvention.Instance)
-        .IgnoreUnmatchedProperties()
-        .WithDuplicateKeyChecking()
-        .Build();
-
-    public static PlayscriptGraphAiDocument LoadGraphDocument(string yamlFilePath)
-    {
-        var yaml = File.ReadAllText(yamlFilePath);
-        return YamlDeserializer.Deserialize<PlayscriptGraphAiDocument>(yaml)
-               ?? new PlayscriptGraphAiDocument();
-    }
-
     public static ProcessNodeSchemaDocument LoadNodeSchemaDocument(string jsonFilePath)
     {
         var json = File.ReadAllText(jsonFilePath);
@@ -27,7 +12,7 @@ public static class DocumentLoader
 
         // Unity's auxiliary schema predates the canonical graph format and still exports assembly-qualified
         // CLR names. StoryForge's model uses the stable JSON type ids exclusively; converting at this one
-        // boundary keeps CLR implementation names out of draft files, node menus, and content bookkeeping.
+        // boundary keeps CLR implementation names out of blueprint files, node menus, and content bookkeeping.
         foreach (var nodeType in document.NodeTypes)
             nodeType.TypeName = ToCanonicalTypeId(nodeType.TypeName);
         return document;

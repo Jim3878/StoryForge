@@ -9,7 +9,8 @@
 <div class="graph-page">
     <div class="graph-toolbar">
         <button @onclick="FitView">縮放至全部</button>
-        <button @onclick="RequestExportToUnity" title="存檔並匯出快照，供 Unity 自動套用到即時流程圖">匯出至Unity</button>
+        <button @onclick="RequestImportFromUnity" title="用 Unity 的流程圖覆蓋藍圖（藍圖會先備份）">從Unity匯入</button>
+        <button @onclick="RequestExportToUnity" title="存檔後和 Unity 的流程圖合併，寫入 Unity 專案">匯出至Unity</button>
         <input class="graph-search-box" placeholder="搜尋劇本名稱..."
                value="@_searchQuery" @oninput="e => _searchQuery = e.Value?.ToString() ?? string.Empty"
                @onkeydown="OnSearchKeyDown" />
@@ -104,18 +105,169 @@
     </div>
 </div>
 
-@if (_pendingExportToUnity)
+@if (_importPreview != null)
 {
     <div class="graph-modal-backdrop">
         <div class="graph-modal">
-            <h3>匯出至 Unity</h3>
-            <p>
-                會先存檔目前流程圖，再匯出一份快照到 Unity 專案。Unity 端會在數秒內自動偵測並整批覆蓋即時的流程圖
-                （若 Unity 目前沒開啟，會等下次開啟時自動套用）。確定要匯出嗎？
-            </p>
+            <h3>從Unity匯入</h3>
+            @if (_importPreview.Error != null)
+            {
+                <p>無法讀取 Unity 的流程圖：@_importPreview.Error</p>
+                <div class="graph-modal-actions">
+                    <button @onclick="CancelImportFromUnity">確定</button>
+                </div>
+            }
+            else
+            {
+                <p>會用 Unity 的流程圖覆蓋藍圖。</p>
+                @if (_importPreview.LostChanges.Count > 0 || _importCanvasUnsaved)
+                {
+                    <p class="graph-modal-warning">以下還沒匯出的修改會消失（藍圖會先備份到「AI劇本\備份」）：</p>
+                    <ul class="graph-modal-list">
+                        @foreach (var line in _importPreview.LostChanges)
+                        {
+                            <li>@line</li>
+                        }
+                        @if (_importCanvasUnsaved)
+                        {
+                            <li>畫布上還沒存檔的修改</li>
+                        }
+                    </ul>
+                }
+                else if (_importPreview.AlreadyUpToDate)
+                {
+                    <p>藍圖已經和 Unity 相同。</p>
+                }
+                <div class="graph-modal-actions">
+                    <button @onclick="CancelImportFromUnity">取消</button>
+                    <button @onclick="ConfirmImportFromUnity">確定匯入</button>
+                </div>
+            }
+        </div>
+    </div>
+}
+
+@if (_exportPlan != null)
+{
+    <div class="graph-modal-backdrop">
+        <div class="graph-modal graph-modal-wide">
+            <h3>匯出至Unity@(_exportPlan.Conflicts.Count > 0 ? $"：有 {_exportPlan.Conflicts.Count} 個衝突" : "")</h3>
+            @if (_exportPlan.Error != null)
+            {
+                <p>匯出前的存檔或讀取失敗：@_exportPlan.Error</p>
+                <div class="graph-modal-actions">
+                    <button @onclick="CancelExportToUnity">確定</button>
+                </div>
+            }
+            else
+            {
+                <p>已先存檔。@(_exportPlan.RemoteChanges.Count > 0 ? "Unity 在上次同步後也有修改，會自動合併：" : "")</p>
+                @if (_exportPlan.RemoteChanges.Count > 0)
+                {
+                    <div class="graph-modal-section">Unity 的修改（會保留）</div>
+                    <ul class="graph-modal-list">
+                        @foreach (var line in _exportPlan.RemoteChanges)
+                        {
+                            <li>@line</li>
+                        }
+                    </ul>
+                }
+                <div class="graph-modal-section">你的修改（會寫入）</div>
+                <ul class="graph-modal-list">
+                    @if (_exportPlan.LocalChanges.Count == 0)
+                    {
+                        <li>（沒有）</li>
+                    }
+                    @foreach (var line in _exportPlan.LocalChanges)
+                    {
+                        <li>@line</li>
+                    }
+                </ul>
+                @if (_exportPlan.AutoResolvedCount > 0)
+                {
+                    <p class="graph-modal-note">@_exportPlan.AutoResolvedCount 個項目雙方都移動了位置，採用 StoryForge 的位置。</p>
+                }
+                @if (_exportPlan.Conflicts.Count > 0)
+                {
+                    <table class="graph-conflict-table">
+                        <thead>
+                            <tr><th>項目</th><th>欄位</th><th>Unity</th><th>StoryForge</th></tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var conflict in _exportPlan.Conflicts)
+                            {
+                                var key = conflict.EntityKey;
+                                @for (var i = 0; i < conflict.Fields.Count; i++)
+                                {
+                                    var field = conflict.Fields[i];
+                                    <tr>
+                                        @if (i == 0)
+                                        {
+                                            <td rowspan="@conflict.Fields.Count">@conflict.Label</td>
+                                        }
+                                        <td>@field.Field</td>
+                                        <td>@field.Unity</td>
+                                        <td>@field.StoryForge</td>
+                                    </tr>
+                                }
+                                <tr class="graph-conflict-choice">
+                                    <td colspan="2"></td>
+                                    <td>
+                                        <label><input type="radio" name="@key" checked="@(GetSide(key) == GraphMergeSide.Remote)"
+                                                      @onchange="() => SetSide(key, GraphMergeSide.Remote)" /> 用 Unity</label>
+                                    </td>
+                                    <td>
+                                        <label><input type="radio" name="@key" checked="@(GetSide(key) == GraphMergeSide.Local)"
+                                                      @onchange="() => SetSide(key, GraphMergeSide.Local)" /> 用 StoryForge</label>
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                    <div class="graph-modal-note">
+                        <button @onclick="() => SetAllSides(GraphMergeSide.Remote)">全部用 Unity</button>
+                        <button @onclick="() => SetAllSides(GraphMergeSide.Local)">全部用 StoryForge</button>
+                    </div>
+                }
+                @if (_exportPlan.ValidationErrors.Count > 0)
+                {
+                    <p class="graph-modal-warning">合併結果無法通過檢查，不能匯出：</p>
+                    <ul class="graph-modal-list">
+                        @foreach (var line in _exportPlan.ValidationErrors.Take(20))
+                        {
+                            <li>@line</li>
+                        }
+                    </ul>
+                }
+                else if (_exportPlan.NothingToExport)
+                {
+                    <p>Unity 的檔案已經是這個版本，不需要寫入。</p>
+                }
+                <p class="graph-modal-note">寫入前會把 Unity 原檔備份到「AI劇本\備份」。</p>
+                <div class="graph-modal-actions">
+                    <button @onclick="CancelExportToUnity">取消</button>
+                    <button @onclick="ConfirmExportToUnity" disabled="@(_exportPlan.ValidationErrors.Count > 0)">
+                        @(_exportPlan.Conflicts.Count > 0 || _exportPlan.RemoteChanges.Count > 0 ? "合併並匯出" : "匯出")
+                    </button>
+                </div>
+            }
+        </div>
+    </div>
+}
+
+@if (_syncResult != null)
+{
+    <div class="graph-modal-backdrop">
+        <div class="graph-modal">
+            <h3>@_syncResult.Title</h3>
+            <ul class="graph-modal-list">
+                @foreach (var line in _syncResult.Details)
+                {
+                    <li>@line</li>
+                }
+            </ul>
             <div class="graph-modal-actions">
-                <button @onclick="CancelExportToUnity">取消</button>
-                <button @onclick="ConfirmExportToUnity">確定匯出</button>
+                <button @onclick="() => _syncResult = null">確定</button>
             </div>
         </div>
     </div>
@@ -141,6 +293,17 @@
         display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
     }
     .graph-modal h3 { margin: 0; }
+    .graph-modal p { margin: 0; }
+    .graph-modal-wide { max-width: 860px; max-height: 85vh; overflow: auto; }
+    .graph-modal-section { font-weight: bold; font-size: 13px; }
+    .graph-modal-list { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.6; word-break: break-all; }
+    .graph-modal-warning { color: #e8b86a; }
+    .graph-modal-note { font-size: 12px; opacity: 0.8; display: flex; gap: 8px; align-items: center; }
+    .graph-conflict-table { border-collapse: collapse; font-size: 13px; width: 100%; }
+    .graph-conflict-table th, .graph-conflict-table td { border: 1px solid #3a3a3a; padding: 4px 8px; text-align: left; vertical-align: top; word-break: break-all; }
+    .graph-conflict-table th { background: #2e2e2e; }
+    .graph-conflict-choice td { border-top: none; background: #222; }
+    .graph-conflict-choice label { cursor: pointer; white-space: nowrap; }
     .graph-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
     .graph-body { position: relative; flex: 1 1 auto; display: flex; min-height: 0; }
     .graph-loading-shield { position: absolute; inset: 0; z-index: 20; cursor: wait; background: rgba(0,0,0,0.04); }
@@ -499,29 +662,83 @@
         StateHasChanged();
     }
 
-    private bool _pendingExportToUnity;
+    // 從Unity匯入 ─────────────────────────────────────────────────────────
 
-    private void RequestExportToUnity()
+    private ImportFromUnityPreview? _importPreview;
+    private bool _importCanvasUnsaved;
+
+    private async Task RequestImportFromUnity()
     {
-        _pendingExportToUnity = true;
+        _importCanvasUnsaved = State.HasUnsavedChanges() ||
+                               await JS.InvokeAsync<bool>("storyForgeGraph.hasCanvasChanges");
+        _importPreview = State.PrepareImportFromUnity();
+    }
+
+    private void CancelImportFromUnity() => _importPreview = null;
+
+    private async Task ConfirmImportFromUnity()
+    {
+        _importPreview = null;
+        State.ImportFromUnity();
+        await FinishSyncAsync();
+    }
+
+    // 匯出至Unity ─────────────────────────────────────────────────────────
+
+    private ExportToUnityPlan? _exportPlan;
+    private readonly Dictionary<string, GraphMergeSide> _exportResolutions = new();
+
+    // 先存檔（取得畫布目前的內容），再準備合併，給使用者確認
+    private async Task RequestExportToUnity()
+    {
+        var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
+        _exportPlan = State.PrepareExportToUnity(export);
+        _exportResolutions.Clear();
+        if (_exportPlan.Error == null)
+        {
+            await JS.InvokeVoidAsync("storyForgeGraph.markSaveSucceeded");
+            foreach (var conflict in _exportPlan.Conflicts)
+                _exportResolutions[conflict.EntityKey] = GraphMergeSide.Local;
+        }
+    }
+
+    private GraphMergeSide GetSide(string entityKey) =>
+        _exportResolutions.TryGetValue(entityKey, out var side) ? side : GraphMergeSide.Local;
+
+    private void SetSide(string entityKey, GraphMergeSide side) => _exportResolutions[entityKey] = side;
+
+    private void SetAllSides(GraphMergeSide side)
+    {
+        foreach (var key in _exportResolutions.Keys.ToList())
+            _exportResolutions[key] = side;
     }
 
     private void CancelExportToUnity()
     {
-        _pendingExportToUnity = false;
+        _exportPlan = null;
+        State.CancelExportToUnity();
     }
 
-    // Mirrors MainLayout's own 存檔 (Save) — pulls the canvas's current node positions/edges/groups via the
-    // same JS interop call — before handing off to GraphEditorState.ExportToUnity, so the exported snapshot
-    // always reflects what's on screen rather than whatever was last saved.
     private async Task ConfirmExportToUnity()
     {
-        _pendingExportToUnity = false;
-        var export = await JS.InvokeAsync<GraphEditorExport>("storyForgeGraph.exportGraph");
-        State.ExportToUnity(export);
-        if (State.LastSaveReport?.SaveSucceeded == true)
-            await JS.InvokeVoidAsync("storyForgeGraph.markSaveSucceeded");
+        _exportPlan = null;
+        State.ExportToUnity(new Dictionary<string, GraphMergeSide>(_exportResolutions));
+        await FinishSyncAsync();
+    }
+
+    // 匯入、匯出成功後藍圖已經換成新版本，重新載入所有分頁（流程圖、劇本管線狀態等）再顯示結果
+    private SaveReport? _syncResult;
+
+    private async Task FinishSyncAsync()
+    {
+        var report = State.LastSaveReport;
+        if (report?.SaveSucceeded == true)
+            await ReloadCoordinator.RequestReloadAsync();
+
+        _syncResult = report;
         StateHasChanged();
+        if (report != null)
+            await JS.InvokeVoidAsync("storyForgeUi.playSaveFeedback", report.Outcome.ToString());
     }
 
     private async Task FitView()

@@ -5,7 +5,7 @@ namespace StoryForge.Core.Graph;
 // One JSON file per 劇本 (PlayscriptProcessNode) story node — memo plus future narrative-detail fields
 // (conflict/change/characters/location) an external AI tool fills in directly, living under
 // AppSettings.ExternalDataFolder\Nodes\<chapter>\<name>.json. Deliberately separate from
-// GraphSessionDocument/GraphConnectionsDocument: those are pure canvas/logic structure the app itself
+// the flow graph blueprint (blueprint.json): that is pure canvas/logic structure the app itself
 // owns and edits through the canvas; this is authored content meant to be opened and edited directly by
 // an external AI tool, one small file per story beat instead of one field buried inside a huge graph file.
 public sealed class NodeContentEntry

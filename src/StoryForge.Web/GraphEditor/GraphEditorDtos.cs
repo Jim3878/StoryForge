@@ -153,3 +153,41 @@ public sealed class NodeTitleInfoDto
     public string Title { get; set; } = string.Empty;
     public bool HasIdentityTitle { get; set; }
 }
+
+// 「從Unity匯入」確認框的內容：藍圖裡還沒匯出、匯入後會被覆蓋掉的修改
+public sealed class ImportFromUnityPreview
+{
+    public string? Error { get; set; }
+    public List<string> LostChanges { get; set; } = new();
+
+    // 藍圖已經和 Unity 的版本相同
+    public bool AlreadyUpToDate { get; set; }
+}
+
+// 「匯出至Unity」確認框的內容：雙方各自的修改摘要、需要逐筆選擇的衝突、合併結果的檢查錯誤
+public sealed class ExportToUnityPlan
+{
+    public string? Error { get; set; }
+    public List<string> RemoteChanges { get; set; } = new();
+    public List<string> LocalChanges { get; set; } = new();
+    public List<ExportConflictDto> Conflicts { get; set; } = new();
+    public int AutoResolvedCount { get; set; }
+    public List<string> ValidationErrors { get; set; } = new();
+
+    // 合併結果和 Unity 目前的檔案相同
+    public bool NothingToExport { get; set; }
+}
+
+public sealed class ExportConflictDto
+{
+    public string EntityKey { get; set; } = string.Empty;
+    public string Label { get; set; } = string.Empty;
+    public List<ExportConflictFieldDto> Fields { get; set; } = new();
+}
+
+public sealed class ExportConflictFieldDto
+{
+    public string Field { get; set; } = string.Empty;
+    public string Unity { get; set; } = string.Empty;
+    public string StoryForge { get; set; } = string.Empty;
+}

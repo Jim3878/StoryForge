@@ -3,7 +3,6 @@ using Microsoft.VisualBasic.FileIO;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using StoryForge.Core;
-using StoryForge.Core.Changelist;
 using StoryForge.Core.Graph;
 using StoryForge.Core.Pipeline;
 using StoryForge.Core.Schemas;
@@ -11,8 +10,9 @@ using StoryForge.Core.Schemas;
 namespace StoryForge.Web.GraphEditor;
 
 // Scoped per user circuit (registered AddScoped in Program.cs) — one browser tab, one loaded graph.
-// Mirrors ProcessGraphPanel's own LoadGraph/SaveSession from the old WinForms tool, minus undo/redo and
-// the Unity-changelist export, which haven't been ported to this canvas yet.
+// 流程圖的讀寫：StoryForge 自己的存檔是「藍圖」（blueprint.json，內含目前的流程圖 graph 與上次和 Unity 同步時的
+// baseGraph），格式和 Unity 的 PlayscriptProcessor.json 完全相同。存檔只寫藍圖；「從Unity匯入」用 Unity 的版本覆蓋藍圖；
+// 「匯出至Unity」以 baseGraph 為基準三方合併後寫入 Unity 的檔案。這個類別只讀寫檔案，不執行任何 git 操作。
 public sealed class GraphEditorState
 {
     // Only a 劇本 node represents a story beat — 劇本條件/公用開關/公用變數/AND/OR/... logic nodes are
@@ -20,10 +20,26 @@ public sealed class GraphEditorState
     // NodeContentStore itself so Core (GraphDocumentModel's deletion cleanup) and this class agree.
     private const string PlayscriptProcessNodeTypeName = NodeContentStore.PlayscriptProcessNodeTypeName;
 
+    private const string BlueprintFileName = "blueprint.json";
+    private const string BackupFolderName = "備份";
+
     private readonly AppSettings _appSettings;
-    private string? _sessionPath;
-    private string? _connectionsPath;
+    private string? _blueprintPath;
+    private string? _unityGraphPath;
     private GraphDocumentModel? _model;
+
+    // 目前畫布上每個群組顯示的範圍（載入時依成員重新計算，存檔時更新）。畫布回傳的範圍和它相同 = 使用者沒有動到
+    // 這個群組，存檔時保留檔案裡原本的範圍，避免 Unity 的舊範圍被改寫而產生差異。
+    private readonly Dictionary<string, (float X, float Y, float Width, float Height)> _canvasGroupBounds = new();
+
+    // 上次從 Unity 匯入或匯出至 Unity 時的 Unity 版本
+    private CanonicalGraphDocument? _baseGraph;
+
+    // 匯出確認期間的狀態：確認時 Unity 的檔案必須和準備時相同，否則要重新準備
+    private string? _pendingExportUnityText;
+
+    // 匯入／匯出後會重新載入整個流程圖（LoadGraph 會覆寫狀態列），這段訊息接在載入結果前面
+    private string? _statusPrefix;
 
     public GraphEditorState(AppSettings appSettings)
     {
@@ -32,11 +48,19 @@ public sealed class GraphEditorState
 
     public string? StatusMessage { get; private set; }
 
-    // 最近一次存檔（存檔、只存模型、匯出至 Unity）的結果，給存檔完成的彈窗與提示音使用
+    // 最近一次存檔（存檔、只存模型、匯入、匯出）的結果，給存檔完成的彈窗與提示音使用
     public SaveReport? LastSaveReport { get; private set; }
+
+    // 已存檔的藍圖和上次同步的 Unity 版本不同（不含畫布上還沒存檔的修改）
+    public bool HasUnexportedChanges { get; private set; }
+
+    // Unity 的檔案在上次匯入／匯出後被改過（載入、存檔、匯入、匯出時檢查）
+    public bool UnityHasNewVersion { get; private set; }
 
     public GraphEditorPayload LoadGraph()
     {
+        var prefix = _statusPrefix;
+        _statusPrefix = null;
         try
         {
             DiagnosticsLog.Write(
@@ -48,69 +72,48 @@ public sealed class GraphEditorState
             var schemaJsonPath = Path.Combine(assetsRoot, "06.Definition", "PlayscriptOfflineExport",
                 "ProcessNodeSchema.json");
             if (!File.Exists(schemaJsonPath))
-                throw new FileNotFoundException("找不到節點 Schema，請先在 Unity 按「編輯器/劇本流程圖/匯出節點Schema」。", schemaJsonPath);
+                throw new FileNotFoundException("找不到節點 Schema，請先在 Unity 按「編輯器/劇本/匯出劇本節點Schema」。", schemaJsonPath);
 
             var schemaDocument = DocumentLoader.LoadNodeSchemaDocument(schemaJsonPath);
 
             Directory.CreateDirectory(_appSettings.ExternalDataFolder);
             NodeFileIndex.Rebuild(_appSettings.ExternalDataFolder);
-            _sessionPath = Path.Combine(_appSettings.ExternalDataFolder, "session.json");
-            _connectionsPath = Path.Combine(_appSettings.ExternalDataFolder, "connections.json");
+            _blueprintPath = Path.Combine(_appSettings.ExternalDataFolder, BlueprintFileName);
+            _unityGraphPath = Path.Combine(assetsRoot, "06.Definition", "PlayscriptGraphJsonDefinition",
+                "PlayscriptProcessor.json");
 
-            if (File.Exists(_sessionPath))
+            if (File.Exists(_blueprintPath))
             {
-                var (session, connections) = LoadSessionAndConnections(_sessionPath, _connectionsPath);
-                _model = GraphDocumentModel.LoadFromSession(session, connections, schemaDocument, _appSettings);
-                StatusMessage = $"已從本機存檔繼續：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
-                StatusMessage += DescribeContentFileState();
-                return ToPayload(_model);
+                var blueprint = CanonicalGraphJson.ParseBlueprint(File.ReadAllText(_blueprintPath));
+                _baseGraph = blueprint.BaseGraph;
+                _model = GraphDocumentModel.LoadCanonical(blueprint.Graph, blueprint.BaseGraph, schemaDocument,
+                    _appSettings);
+                StatusMessage = $"已載入藍圖：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
+            }
+            else
+            {
+                // 還沒有藍圖（第一次使用）：直接從 Unity 的版本開始，第一次存檔時才會建立藍圖
+                var unityGraph = ReadUnityGraph();
+                _baseGraph = unityGraph;
+                _model = GraphDocumentModel.LoadCanonical(unityGraph, unityGraph, schemaDocument, _appSettings);
+                StatusMessage = $"尚無藍圖，已從 Unity 載入：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
             }
 
-            // One-time migration: before 角色卡/世界書/流程圖 all became the real save location under
-            // AppSettings.ExternalDataFolder, the flow graph's resume file lived at
-            // %LocalAppData%\StoryForge\ instead — pick it up from there once and persist forward to the
-            // new location, rather than silently falling through to a fresh Unity-YAML load and losing
-            // every local edit that was never round-tripped back to Unity.
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var oldSessionPath = Path.Combine(localAppData, "StoryForge", "session.json");
-            var oldConnectionsPath = Path.Combine(localAppData, "StoryForge", "connections.json");
-            if (File.Exists(oldSessionPath))
-            {
-                var (session, connections) = LoadSessionAndConnections(oldSessionPath, oldConnectionsPath);
-                _model = GraphDocumentModel.LoadFromSession(session, connections, schemaDocument, _appSettings);
-                PersistModel();
-                StatusMessage = $"已從舊位置搬移本機存檔：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
-                StatusMessage += DescribeContentFileState();
-                return ToPayload(_model);
-            }
-
-            var graphYamlPath = Path.Combine(assetsRoot, "06.Definition", "PlayscriptGraphYamlDefinition",
-                "PlayscriptProcessor.yaml");
-            if (!File.Exists(graphYamlPath))
-                throw new FileNotFoundException("找不到流程圖 YAML，請先在 Unity 的流程圖視窗按「匯出至外部工具」。", graphYamlPath);
-
-            var graphYamlText = File.ReadAllText(graphYamlPath);
-            var baseYamlHash = GraphHashUtility.ComputeHash(graphYamlText);
-            var graphDocument = DocumentLoader.LoadGraphDocument(graphYamlPath);
-
-            _model = GraphDocumentModel.Load(graphDocument, schemaDocument, _appSettings, baseYamlHash);
-            StatusMessage = $"已載入：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
-            StatusMessage += DescribeContentFileState();
-            return ToPayload(_model);
+            RefreshSyncState(_model.BuildCanonicalDocument());
+            StatusMessage = prefix + StatusMessage + DescribeSyncState() + DescribeContentFileState();
+            return ToPayload();
         }
         catch (Exception e)
         {
-            StatusMessage = $"載入失敗：{e.Message}";
+            StatusMessage = prefix + $"載入失敗：{e.Message}";
             return new GraphEditorPayload();
         }
     }
 
-    // Applies what the canvas actually lets a user change in this first pass — node positions and
-    // connections — onto the live model, then saves it the same way ProcessGraphPanel's own SaveSession
-    // did (a local resume file, not a changelist for Unity yet).
+    // 存檔：把畫布的內容套用到模型，只寫入藍圖，不碰 Unity 的檔案
     public void ApplyAndSave(GraphEditorExport export)
     {
-        if (_model == null || _sessionPath == null || _connectionsPath == null)
+        if (_model == null)
         {
             LastSaveReport = new SaveReport(SaveOutcome.Failure, "存檔失敗", new[] { "流程圖尚未載入，請先切換到流程圖分頁或按「讀取」。" });
             return;
@@ -121,9 +124,10 @@ public sealed class GraphEditorState
             ApplyExportDiff(export);
 
             var renameCollisions = SyncRenamedScriptFiles();
-            PersistModel();
+            PersistBlueprint();
 
-            StatusMessage = $"已存檔：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
+            StatusMessage = $"已存檔：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組" +
+                            DescribeSyncState();
             AppendRenameCollisionWarning(renameCollisions);
             LastSaveReport = BuildSaveReport("已存檔", renameCollisions);
         }
@@ -134,49 +138,336 @@ public sealed class GraphEditorState
         }
     }
 
-    // Same canvas-sync-then-save flow as ApplyAndSave above, plus a full-document snapshot dropped into
-    // Unity's own hand-off folder — mirrors the legacy WinForms tool's 匯出變更清單 (ChangelistReviewForm.
-    // ExportAndClose), which writes the exact same {timestamp}-graphsnapshot.json shape to the exact same
-    // "<UnityProjectRoot>/PlayscriptOfflineTool/Changelists/" folder that Unity's own
-    // PlayscriptGraphChangelistAutoImporter (Assets/Editor/EditorWindow/PlayscriptGraph, polls every few
-    // seconds) already watches and fully overwrites the live graph from. StoryForge never talks to Unity
-    // directly — if the Editor isn't currently running, the file just waits there until it is, so this can
-    // only confirm the snapshot was written, never that Unity actually applied it.
-    public void ExportToUnity(GraphEditorExport export)
+    // 從Unity匯入的確認內容：藍圖裡會被覆蓋掉、還沒匯出的修改
+    public ImportFromUnityPreview PrepareImportFromUnity()
     {
-        if (_model == null || _sessionPath == null || _connectionsPath == null)
+        if (_model == null || _baseGraph == null)
+            return new ImportFromUnityPreview { Error = "流程圖尚未載入。" };
+
+        try
+        {
+            var unityGraph = ReadUnityGraph();
+            var current = _model.BuildCanonicalDocument();
+            return new ImportFromUnityPreview
+            {
+                LostChanges = CanonicalGraphJson.DescribeChanges(_baseGraph, current, _model.Schema).ToList(),
+                AlreadyUpToDate = CanonicalGraphJson.Equivalent(unityGraph, current, _model.Schema),
+            };
+        }
+        catch (Exception e)
+        {
+            return new ImportFromUnityPreview { Error = e.Message };
+        }
+    }
+
+    // 用 Unity 的版本覆蓋藍圖。覆蓋前若藍圖和 Unity 不同，先把藍圖備份起來。呼叫端之後要重新載入流程圖。
+    public void ImportFromUnity()
+    {
+        if (_model == null || _blueprintPath == null)
+        {
+            LastSaveReport = new SaveReport(SaveOutcome.Failure, "從Unity匯入失敗", new[] { "流程圖尚未載入。" });
             return;
+        }
+
+        try
+        {
+            var unityGraph = ReadUnityGraph();
+            var details = new List<string>();
+            if (File.Exists(_blueprintPath) &&
+                !CanonicalGraphJson.Equivalent(_model.BuildCanonicalDocument(), unityGraph, _model.Schema))
+            {
+                var backupPath = Backup(_blueprintPath, "blueprint");
+                details.Add($"原本的藍圖已備份：{backupPath}");
+            }
+
+            WriteBlueprint(unityGraph, unityGraph);
+            details.Insert(0, $"{unityGraph.Nodes.Count} 節點、{unityGraph.Edges.Count} 連線、{unityGraph.Groups.Count} 群組");
+            _statusPrefix = "已從Unity匯入；";
+            LastSaveReport = new SaveReport(SaveOutcome.Success, "已從Unity匯入", details);
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"從Unity匯入失敗：{e.Message}";
+            LastSaveReport = new SaveReport(SaveOutcome.Failure, "從Unity匯入失敗", new[] { e.Message });
+        }
+    }
+
+    // 匯出至Unity 第一步：先存檔（套用畫布並寫入藍圖），再和 Unity 目前的檔案三方合併，回傳要給使用者確認的內容
+    public ExportToUnityPlan PrepareExportToUnity(GraphEditorExport export)
+    {
+        _pendingExportUnityText = null;
+        if (_model == null || _baseGraph == null || _unityGraphPath == null)
+            return new ExportToUnityPlan { Error = "流程圖尚未載入。" };
 
         try
         {
             ApplyExportDiff(export);
+            SyncRenamedScriptFiles();
+            PersistBlueprint();
 
-            var renameCollisions = SyncRenamedScriptFiles();
-            PersistModel();
+            var unityText = File.ReadAllText(_unityGraphPath);
+            var unityGraph = CanonicalGraphJson.Parse(unityText);
+            var local = _model.BuildCanonicalDocument();
+            var schema = _model.Schema;
+            var plan = new ExportToUnityPlan
+            {
+                RemoteChanges = CanonicalGraphJson.DescribeChanges(_baseGraph, unityGraph, schema).ToList(),
+                LocalChanges = CanonicalGraphJson.DescribeChanges(_baseGraph, local, schema).ToList(),
+            };
 
-            var projectRoot = ProjectPaths.ResolveUnityProjectRoot();
-            var changelistFolder = Path.Combine(projectRoot, "PlayscriptOfflineTool", "Changelists");
-            Directory.CreateDirectory(changelistFolder);
+            var merge = CanonicalGraphJson.Merge(_baseGraph, local, unityGraph, schema);
+            plan.AutoResolvedCount = merge.AutoResolved.Select(c => c.EntityKey).Distinct().Count();
+            plan.Conflicts = merge.Conflicts
+                .GroupBy(c => c.EntityKey)
+                .Select(g => DescribeConflict(g.Key, g.ToList(), _baseGraph, local, unityGraph))
+                .ToList();
 
-            var fullDocument = _model.BuildFullDocument();
-            var fileName = $"{DateTime.Now:yyyyMMdd-HHmmss}-graphsnapshot.json";
-            File.WriteAllText(Path.Combine(changelistFolder, fileName),
-                JsonConvert.SerializeObject(fullDocument, Formatting.Indented));
+            if (merge.Graph != null)
+            {
+                plan.NothingToExport = CanonicalGraphJson.Equivalent(merge.Graph, unityGraph, schema);
+                plan.ValidationErrors = CanonicalGraphJson.Validate(merge.Graph, schema).Errors;
+            }
 
-            StatusMessage = $"已存檔並匯出快照至 Unity（{fileName}），將於 Unity 開啟時自動套用：" +
-                            $"{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
-            AppendRenameCollisionWarning(renameCollisions);
-            LastSaveReport = BuildSaveReport("已存檔並匯出快照至 Unity", renameCollisions,
-                $"快照：{Path.Combine(changelistFolder, fileName)}");
+            _pendingExportUnityText = unityText;
+            return plan;
         }
         catch (Exception e)
         {
-            StatusMessage = $"匯出至 Unity 失敗：{e.Message}";
-            LastSaveReport = new SaveReport(SaveOutcome.Failure, "匯出至 Unity 失敗", new[] { e.Message });
+            return new ExportToUnityPlan { Error = e.Message };
         }
     }
 
-    // The node/edge/group diff itself, shared by ApplyAndSave and ExportToUnity — everything downstream of
+    // 匯出至Unity 第二步：照使用者對每個衝突的選擇合併，備份 Unity 原檔後寫入。成功後藍圖的 graph 與 baseGraph
+    // 都變成寫入的版本（包含 Unity 那邊的修改），呼叫端要重新載入流程圖。
+    public void ExportToUnity(IReadOnlyDictionary<string, GraphMergeSide> resolutions)
+    {
+        const string failTitle = "匯出至Unity失敗";
+        if (_model == null || _baseGraph == null || _unityGraphPath == null || _pendingExportUnityText == null)
+        {
+            LastSaveReport = new SaveReport(SaveOutcome.Failure, failTitle, new[] { "請重新按「匯出至Unity」。" });
+            return;
+        }
+
+        try
+        {
+            var unityText = File.ReadAllText(_unityGraphPath);
+            if (!string.Equals(unityText, _pendingExportUnityText, StringComparison.Ordinal))
+            {
+                LastSaveReport = new SaveReport(SaveOutcome.Failure, failTitle,
+                    new[] { "確認期間 Unity 的流程圖檔案又被修改了，這次沒有寫入。請重新按「匯出至Unity」。" });
+                return;
+            }
+
+            var schema = _model.Schema;
+            var unityGraph = CanonicalGraphJson.Parse(unityText);
+            var merge = CanonicalGraphJson.Merge(_baseGraph, _model.BuildCanonicalDocument(), unityGraph, schema,
+                resolutions);
+            if (!merge.Succeeded)
+            {
+                LastSaveReport = new SaveReport(SaveOutcome.Failure, failTitle,
+                    new[] { $"還有 {merge.Conflicts.Select(c => c.EntityKey).Distinct().Count()} 個衝突沒有選擇。" });
+                return;
+            }
+
+            var validation = CanonicalGraphJson.Validate(merge.Graph!, schema);
+            if (!validation.IsValid)
+            {
+                LastSaveReport = new SaveReport(SaveOutcome.Failure, failTitle,
+                    new[] { "合併結果無法通過檢查，這次沒有寫入：" }.Concat(validation.Errors.Take(20)).ToList());
+                return;
+            }
+
+            var details = new List<string>
+            {
+                $"{merge.Graph!.Nodes.Count} 節點、{merge.Graph.Edges.Count} 連線、{merge.Graph.Groups.Count} 群組",
+                $"寫入：{_unityGraphPath}",
+            };
+
+            var mergedText = CanonicalGraphJson.Serialize(merge.Graph, schema);
+            if (string.Equals(mergedText, unityText, StringComparison.Ordinal))
+            {
+                details.Add("Unity 的檔案已經是這個版本，沒有變更。");
+            }
+            else
+            {
+                details.Add($"Unity 原檔已備份：{Backup(_unityGraphPath, "PlayscriptProcessor")}");
+                CanonicalGraphJson.WriteAtomic(_unityGraphPath, mergedText);
+            }
+
+            WriteBlueprint(merge.Graph, merge.Graph);
+            _pendingExportUnityText = null;
+            _statusPrefix = "已匯出至Unity；";
+            LastSaveReport = new SaveReport(SaveOutcome.Success, "已匯出至Unity", details);
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"匯出至Unity失敗：{e.Message}";
+            LastSaveReport = new SaveReport(SaveOutcome.Failure, failTitle, new[] { e.Message });
+        }
+    }
+
+    public void CancelExportToUnity() => _pendingExportUnityText = null;
+
+    private CanonicalGraphDocument ReadUnityGraph()
+    {
+        if (_unityGraphPath == null || !File.Exists(_unityGraphPath))
+            throw new FileNotFoundException("找不到 Unity 的流程圖 JSON。", _unityGraphPath);
+
+        return CanonicalGraphJson.Parse(File.ReadAllText(_unityGraphPath));
+    }
+
+    // 把檔案複製到 AI劇本\備份\，檔名加上時間；回傳備份路徑
+    private string Backup(string sourcePath, string name)
+    {
+        var folder = Path.Combine(_appSettings.ExternalDataFolder, BackupFolderName);
+        Directory.CreateDirectory(folder);
+        var backupPath = Path.Combine(folder, $"{name}-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+        File.Copy(sourcePath, backupPath, true);
+        return backupPath;
+    }
+
+    // 載入、存檔時更新「藍圖有未匯出的修改」與「Unity 有新版本」
+    private void RefreshSyncState(CanonicalGraphDocument savedGraph)
+    {
+        if (_model == null || _baseGraph == null)
+            return;
+
+        HasUnexportedChanges = !CanonicalGraphJson.Equivalent(savedGraph, _baseGraph, _model.Schema);
+        try
+        {
+            UnityHasNewVersion = !CanonicalGraphJson.Equivalent(ReadUnityGraph(), _baseGraph, _model.Schema);
+        }
+        catch
+        {
+            UnityHasNewVersion = false;
+        }
+    }
+
+    private string DescribeSyncState()
+    {
+        var parts = new List<string>();
+        if (HasUnexportedChanges)
+            parts.Add("藍圖有未匯出的修改");
+        if (UnityHasNewVersion)
+            parts.Add("Unity 有新版本，可按「從Unity匯入」");
+        return parts.Count == 0 ? string.Empty : "；" + string.Join("；", parts);
+    }
+
+    private void PersistBlueprint()
+    {
+        if (_model == null || _baseGraph == null)
+            return;
+
+        var graph = _model.BuildCanonicalDocument();
+        WriteBlueprint(graph, _baseGraph);
+        _model.MarkClean();
+        RefreshSyncState(graph);
+    }
+
+    private void WriteBlueprint(CanonicalGraphDocument graph, CanonicalGraphDocument baseGraph)
+    {
+        var blueprint = new GraphBlueprintDocument { Graph = graph, BaseGraph = baseGraph };
+        CanonicalGraphJson.WriteAtomic(_blueprintPath!, CanonicalGraphJson.SerializeBlueprint(blueprint, _model?.Schema));
+        _baseGraph = baseGraph;
+    }
+
+    // 衝突項目給使用者看的名稱與雙方內容
+    private ExportConflictDto DescribeConflict(string entityKey, List<GraphMergeConflict> conflicts,
+        CanonicalGraphDocument baseGraph, CanonicalGraphDocument local, CanonicalGraphDocument remote)
+    {
+        var dto = new ExportConflictDto { EntityKey = entityKey, Label = DescribeEntity(entityKey, baseGraph, local, remote) };
+        var colorAdded = false;
+        foreach (var conflict in conflicts)
+        {
+            var field = conflict.Path.Length > entityKey.Length ? conflict.Path[(entityKey.Length + 1)..] : string.Empty;
+
+            // 群組顏色的 r/g/b/a 合成一列，用色碼顯示
+            if (field.StartsWith("color", StringComparison.Ordinal) && entityKey.StartsWith("$.groups[", StringComparison.Ordinal))
+            {
+                if (colorAdded)
+                    continue;
+
+                colorAdded = true;
+                var id = entityKey["$.groups[".Length..^1];
+                dto.Fields.Add(new ExportConflictFieldDto
+                {
+                    Field = "顏色",
+                    Unity = DescribeGroupColor(remote, id),
+                    StoryForge = DescribeGroupColor(local, id),
+                });
+                continue;
+            }
+
+            dto.Fields.Add(new ExportConflictFieldDto
+            {
+                Field = DescribeField(field),
+                Unity = DescribeValue(conflict.Remote),
+                StoryForge = DescribeValue(conflict.Local),
+            });
+        }
+
+        return dto;
+    }
+
+    private static string DescribeField(string field) => field switch
+    {
+        "" => "整個項目",
+        "title" => "標題",
+        "nodes" => "成員",
+        "content" => "內容",
+        _ when field.StartsWith("data.", StringComparison.Ordinal) => field["data.".Length..],
+        _ => field,
+    };
+
+    private static string DescribeGroupColor(CanonicalGraphDocument document, string groupId)
+    {
+        var group = document.Groups.FirstOrDefault(g => g.Id == groupId);
+        return group == null ? "（刪除）" : ToHexColor(group.Color.R, group.Color.G, group.Color.B);
+    }
+
+    private string DescribeEntity(string entityKey, params CanonicalGraphDocument[] documents)
+    {
+        var open = entityKey.IndexOf('[');
+        var id = open >= 0 ? entityKey[(open + 1)..^1] : entityKey;
+        if (entityKey.StartsWith("$.nodes[", StringComparison.Ordinal))
+            return "節點 " + DescribeNode(id, documents);
+        if (entityKey.StartsWith("$.groups[", StringComparison.Ordinal))
+            return "群組 " + (documents.SelectMany(d => d.Groups).FirstOrDefault(g => g.Id == id)?.Title ?? id);
+        if (entityKey.StartsWith("$.stickyNotes[", StringComparison.Ordinal))
+            return "便利貼 " + (documents.SelectMany(d => d.StickyNotes).FirstOrDefault(n => n.Id == id)?.Title ?? id);
+        if (entityKey.StartsWith("$.edges[", StringComparison.Ordinal))
+        {
+            var arrow = id.IndexOf("->", StringComparison.Ordinal);
+            var from = arrow > 0 ? id[..id.IndexOf('.')] : id;
+            var to = arrow > 0 ? id[(arrow + 2)..id.IndexOf('.', arrow)] : string.Empty;
+            return $"連線 {DescribeNode(from, documents)} → {DescribeNode(to, documents)}";
+        }
+
+        return entityKey;
+    }
+
+    private string DescribeNode(string id, CanonicalGraphDocument[] documents)
+    {
+        var node = documents.SelectMany(d => d.Nodes).FirstOrDefault(n => n.Id == id);
+        if (node == null)
+            return id;
+
+        var identity = node.Data.Value<string>("playscriptId") ?? node.Data.Value<string>("flagId");
+        if (!string.IsNullOrEmpty(identity))
+            return identity;
+
+        var schema = _model?.GetSchema(node.Type);
+        return string.IsNullOrEmpty(schema?.DisplayName) ? node.Type : schema.DisplayName;
+    }
+
+    private static string DescribeValue(JToken? token) => token switch
+    {
+        null => "（刪除）",
+        JValue value => value.Value?.ToString() ?? "（空）",
+        _ => "（修改）",
+    };
+
+    // The node/edge/group diff itself, shared by ApplyAndSave and PrepareExportToUnity — everything downstream of
     // "apply the canvas's export onto the live model" (persisting, status messages, snapshot export) is
     // each caller's own concern.
     private void ApplyExportDiff(GraphEditorExport export)
@@ -250,7 +541,9 @@ public sealed class GraphEditorState
                         ?? _model.AddGroup(exportedGroup.Title ?? string.Empty, exportedGroup.X, exportedGroup.Y, exportedGroup.ClientId);
 
             group.Title = exportedGroup.Title ?? string.Empty;
-            if (TryParseHexColor(exportedGroup.Color, out var r, out var g, out var b))
+            if (!string.Equals(exportedGroup.Color, ToHexColor(group.ColorR, group.ColorG, group.ColorB),
+                    StringComparison.OrdinalIgnoreCase) &&
+                TryParseHexColor(exportedGroup.Color, out var r, out var g, out var b))
             {
                 group.ColorR = r;
                 group.ColorG = g;
@@ -261,14 +554,16 @@ public sealed class GraphEditorState
             foreach (var guid in exportedGroup.MemberNodeGuids)
                 group.MemberNodeGuids.Add(guid);
 
-            group.X = exportedGroup.X;
-            group.Y = exportedGroup.Y;
-            group.Width = exportedGroup.Width;
-            group.Height = exportedGroup.Height;
+            var exportedBounds = (exportedGroup.X, exportedGroup.Y, exportedGroup.Width, exportedGroup.Height);
+            if (!_canvasGroupBounds.TryGetValue(group.ClientId, out var shownBounds) ||
+                !SameBounds(shownBounds, exportedBounds))
+                (group.X, group.Y, group.Width, group.Height) = exportedBounds;
+
+            _canvasGroupBounds[group.ClientId] = exportedBounds;
         }
     }
 
-    // Persists the live model to session.json as-is, with no canvas export to reconcile — used after a
+    // Persists the live model to blueprint.json as-is, with no canvas export to reconcile — used after a
     // field-only mutation (UpdateNodeField, e.g. from an AI-workspace import) that never goes through
     // ApplyAndSave's node/edge/group diffing, so those edits aren't silently lost until the user happens
     // to open the 流程圖 tab and press 存檔 themselves.
@@ -277,8 +572,9 @@ public sealed class GraphEditorState
         try
         {
             var renameCollisions = SyncRenamedScriptFiles();
-            PersistModel();
-            StatusMessage = $"已存檔：{_model?.Nodes.Count} 節點、{_model?.Edges.Count} 連線、{_model?.Groups.Count} 群組";
+            PersistBlueprint();
+            StatusMessage = $"已存檔：{_model?.Nodes.Count} 節點、{_model?.Edges.Count} 連線、{_model?.Groups.Count} 群組" +
+                            DescribeSyncState();
             AppendRenameCollisionWarning(renameCollisions);
             LastSaveReport = BuildSaveReport("已存檔", renameCollisions);
         }
@@ -293,24 +589,6 @@ public sealed class GraphEditorState
     {
         if (renameCollisions.Count > 0)
             StatusMessage += $"；{renameCollisions.Count} 個劇本檔改名失敗（目標名稱已有其他內容檔）：{string.Join("、", renameCollisions)}";
-    }
-
-    private void PersistModel()
-    {
-        if (_model == null || _sessionPath == null || _connectionsPath == null)
-            return;
-
-        var directory = Path.GetDirectoryName(_sessionPath);
-        if (!string.IsNullOrEmpty(directory))
-            Directory.CreateDirectory(directory);
-
-        var sessionDocument = _model.CreateSessionDocument();
-        File.WriteAllText(_sessionPath, JsonConvert.SerializeObject(sessionDocument, Formatting.Indented));
-
-        var connectionsDocument = _model.CreateConnectionsDocument();
-        File.WriteAllText(_connectionsPath, JsonConvert.SerializeObject(connectionsDocument, Formatting.Indented));
-
-        _model.MarkClean();
     }
 
     // 載入時附在狀態列的內容檔狀態：檔名待同步（節點在別處改了名）、孤兒內容檔（流程圖上已無對應節點）、
@@ -392,7 +670,7 @@ public sealed class GraphEditorState
         var details = new List<string>
         {
             $"{_model!.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組",
-            $"存檔位置：{_sessionPath}",
+            $"存檔位置：{_blueprintPath}",
         };
         if (extraLine != null)
             details.Add(extraLine);
@@ -581,31 +859,6 @@ public sealed class GraphEditorState
         }
     }
 
-    // Reads a graph's node/group document plus its sibling connections document from disk, tolerating a
-    // pre-split save (no connections file yet, edges still embedded inline under the session document's
-    // own "Edges" key) by pulling them out of there instead — used both for the normal load path and for
-    // the one-time migration off the old %LocalAppData% location, which is exactly this same shape.
-    private static (GraphSessionDocument Session, GraphConnectionsDocument Connections) LoadSessionAndConnections(
-        string sessionPath, string connectionsPath)
-    {
-        var sessionRoot = JObject.Parse(File.ReadAllText(sessionPath));
-        var session = sessionRoot.ToObject<GraphSessionDocument>() ?? new GraphSessionDocument();
-
-        GraphConnectionsDocument connections;
-        if (File.Exists(connectionsPath))
-        {
-            connections = JsonConvert.DeserializeObject<GraphConnectionsDocument>(File.ReadAllText(connectionsPath))
-                          ?? new GraphConnectionsDocument();
-        }
-        else
-        {
-            var legacyEdges = sessionRoot["Edges"]?.ToObject<List<GraphSessionEdge>>() ?? new List<GraphSessionEdge>();
-            connections = new GraphConnectionsDocument { SavedAtUtc = session.SavedAtUtc, Edges = legacyEdges };
-        }
-
-        return (session, connections);
-    }
-
     // One node queued for 建立劇本檔: either ready to sync immediately (no plain-path collision) or stuck
     // behind an orphaned file — content from some other, no-longer-live node's guid still occupying the
     // plain path — that needs the user's explicit go-ahead before ScriptFileSyncPlan.Ready's write would
@@ -623,7 +876,7 @@ public sealed class GraphEditorState
     // still declares it, but that's a Unity-side mistake outside this tool's reach to fix). It now lives
     // only in its own NodeContentStore file, so syncing both seeds a brand-new file from whatever's still in
     // Fields (once) and strips the key out of Fields going forward so it doesn't linger duplicated in
-    // session.json. The only caller is PipelineStatusPanel's own 建立劇本檔 button (not flow-graph
+    // blueprint.json. The only caller is PipelineStatusPanel's own 建立劇本檔 button (not flow-graph
     // load/save) — that panel owns the row-checkbox selection in its grid, so this only touches nodes whose
     // playscriptId is in selectedPlayscriptNames, matching whatever rows the user currently has checked
     // there.
@@ -946,8 +1199,14 @@ public sealed class GraphEditorState
         };
     }
 
-    private static GraphEditorPayload ToPayload(GraphDocumentModel model)
+    private static bool SameBounds((float X, float Y, float Width, float Height) a,
+        (float X, float Y, float Width, float Height) b) =>
+        Math.Abs(a.X - b.X) < 0.01f && Math.Abs(a.Y - b.Y) < 0.01f &&
+        Math.Abs(a.Width - b.Width) < 0.01f && Math.Abs(a.Height - b.Height) < 0.01f;
+
+    private GraphEditorPayload ToPayload()
     {
+        var model = _model!;
         DiagnosticsLog.Write(
             $"ToPayload: model.Settings.NodeFrozenTextSize={model.Settings.NodeFrozenTextSize}, " +
             $"model.Settings instance={model.Settings.GetHashCode()}");
@@ -1016,16 +1275,20 @@ public sealed class GraphEditorState
             });
         }
 
+        // 群組範圍和 Unity 顯示時一樣依成員重新計算（檔案裡存的常常是舊範圍）；沒有成員時用檔案裡的範圍
+        _canvasGroupBounds.Clear();
         foreach (var group in model.Groups.Where(g => !g.IsMarkedForDeletion))
         {
+            var bounds = model.ComputeGroupBounds(group) ?? (group.X, group.Y, group.Width, group.Height);
+            _canvasGroupBounds[group.ClientId] = bounds;
             payload.Groups.Add(new GroupDto
             {
                 ClientId = group.ClientId,
                 Title = group.Title,
-                X = group.X,
-                Y = group.Y,
-                Width = group.Width,
-                Height = group.Height,
+                X = bounds.X,
+                Y = bounds.Y,
+                Width = bounds.Width,
+                Height = bounds.Height,
                 Color = ToHexColor(group.ColorR, group.ColorG, group.ColorB),
                 MemberNodeGuids = group.MemberNodeGuids.ToList(),
             });

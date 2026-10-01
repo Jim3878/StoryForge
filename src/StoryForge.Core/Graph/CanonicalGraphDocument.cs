@@ -87,9 +87,11 @@ public sealed class CanonicalGraphColor
     [JsonExtensionData] public IDictionary<string, JToken> Extra { get; set; } = new Dictionary<string, JToken>();
 }
 
-public sealed class GraphDraftDocument
+// StoryForge 的流程圖存檔（藍圖）：graph 是目前編輯中的流程圖，baseGraph 是上次從 Unity 匯入或匯出至 Unity 時的
+// Unity 版本，用來判斷有沒有未匯出的修改，以及匯出時三方合併的基準
+public sealed class GraphBlueprintDocument
 {
-    [JsonProperty("baseGraph", Order = 1)] public CanonicalGraphDocument BaseGraph { get; set; } = new();
-    [JsonProperty("graph", Order = 2)] public CanonicalGraphDocument Graph { get; set; } = new();
+    [JsonProperty("graph", Order = 1)] public CanonicalGraphDocument Graph { get; set; } = new();
+    [JsonProperty("baseGraph", Order = 2)] public CanonicalGraphDocument BaseGraph { get; set; } = new();
     [JsonExtensionData] public IDictionary<string, JToken> Extra { get; set; } = new Dictionary<string, JToken>();
 }
