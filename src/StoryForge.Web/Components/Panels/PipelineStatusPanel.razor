@@ -9,12 +9,14 @@
 
 <div class="ps-page">
     <div class="ps-toolbar">
-        <button @onclick="Refresh">重新整理</button>
+        <button @onclick="Refresh" disabled="@State.IsRefreshing">重新整理</button>
         <button @onclick="BuildNodeFiles">建立劇本檔</button>
         <button @onclick="DownloadSheetScripts" disabled="@State.IsSheetScriptDownloadRunning">下載Sheet劇本</button>
         <button @onclick="RequestUpload" disabled="@(State.IsUploadRunning || _selectedNames.Count == 0)">上傳補完到Sheet</button>
         <button @onclick="ExportCSharp" disabled="@(State.IsCSharpExportRunning || _selectedNames.Count == 0)">匯出成C#</button>
         <button @onclick="DownloadSheet">讀取Sheet資料</button>
+        <button @onclick="WriteBackGuidePathMemos" disabled="@(State.IsGuidePathWriteBackRunning || State.IsRefreshing)"
+                title="把 AI 在 GuidePathPoints.json 填的引導點 Memo 寫回 Company.ldtk（LDtk 必須先關閉）">寫回LDtk引導點Memo</button>
         <details class="ps-chapter-filter">
             <summary>章節篩選 (@_selectedChapters.Count/@AllChapters.Count)</summary>
             <div class="ps-chapter-filter-menu">
@@ -28,7 +30,7 @@
             </div>
         </details>
         <input class="ps-search" placeholder="搜尋劇本名稱..." @bind="_searchText" @bind:event="oninput" />
-        <span class="ps-status">@State.StatusMessage</span>
+        <span class="ps-status">@(_copyNameFeedback ?? State.StatusMessage)</span>
     </div>
     @if (State.IsSheetScriptDownloadRunning)
     {
@@ -106,10 +108,20 @@
                 }
             </tbody>
         </table>
-        @if (State.Rows.Count == 0)
+        @if (State.Rows.Count == 0 && !State.IsRefreshing)
         {
             <div class="ps-empty">流程圖裡還沒有任何有劇本名稱的節點</div>
         }
+    </div>
+    <div class="ps-bottom-status @(State.RefreshFailed ? "failed" : State.IsRefreshing ? "loading" : "ready")"
+         role="status" aria-live="polite">
+        <span class="ps-status-dot"></span>
+        @if (State.IsRefreshing)
+        {
+            <span class="ps-bottom-progress"><span class="ps-bottom-progress-fill" style="width:@(RefreshProgressPercent)%"></span></span>
+            <span>(@State.RefreshStep/@PipelineStatusState.RefreshStepTotal)</span>
+        }
+        <span class="ps-bottom-text">@State.RefreshStageText</span>
     </div>
 </div>
 
@@ -118,10 +130,30 @@
     <div class="ps-context-menu-backdrop" @onclick="CloseContextMenu"
          @oncontextmenu="CloseContextMenu" @oncontextmenu:preventDefault="true"></div>
     <div class="ps-context-menu" style="left:@(_contextMenuX)px; top:@(_contextMenuY)px">
+        <button @onclick="CopyPlayscriptNameFromMenu">複製劇本名稱</button>
         <button disabled="@(!contextMenuRow.HasLocalScriptFile)" @onclick="OpenLocalScriptFileFromMenu">開啟本地劇本檔</button>
         <button disabled="@(!contextMenuRow.IsOnGraph)" @onclick="JumpToGraphNodeFromMenu">跳到劇情節點</button>
         <button disabled="@(!contextMenuRow.IsOnCSharp)" @onclick="OpenCSharpFileFromMenu">開啟C#檔</button>
         <button disabled="@(!contextMenuRow.IsOnLdtk)" @onclick="LocateInLdtkFromMenu">定位到LDtk</button>
+    </div>
+}
+
+@if (!_hideGuidePathConflicts && State.GuidePathConflicts.Count > 0)
+{
+    var guideConflict = State.GuidePathConflicts[0];
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>引導點 Memo 衝突（還有 @State.GuidePathConflicts.Count 筆）</h3>
+            <p>這個引導點的 Memo 在 LDtk 和 AI 的 GuidePathPoints.json 兩邊都被改過，要保留哪一邊？</p>
+            <p>@guideConflict.Level @(guideConflict.Key ?? "") <code>@guideConflict.Iid</code></p>
+            <p>LDtk：@(guideConflict.LdtkMemo ?? "（空白）")</p>
+            <p>AI 檔案：@(guideConflict.FileMemo ?? "（空白）")</p>
+            <div class="ps-modal-actions">
+                <button @onclick="() => State.ResolveGuidePathConflict(guideConflict, keepFile: true)">保留 AI 檔案的</button>
+                <button @onclick="() => State.ResolveGuidePathConflict(guideConflict, keepFile: false)">保留 LDtk 的</button>
+                <button @onclick="() => _hideGuidePathConflicts = true">稍後再處理</button>
+            </div>
+        </div>
     </div>
 }
 
@@ -178,6 +210,32 @@
                 {
                     <button @onclick='() => ResolveCSharpExportConflict(SheetScriptConflictChoice.OverwriteRemaining)'>覆蓋接下來的 @cSharpConflict.RemainingConflictCount 個檔案</button>
                     <button @onclick='() => ResolveCSharpExportConflict(SheetScriptConflictChoice.SkipRemaining)'>略過接下來的 @cSharpConflict.RemainingConflictCount 個檔案</button>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+@if (State.PendingPlayPlayscriptWarning is { } playWarning)
+{
+    <div class="ps-modal-backdrop">
+        <div class="ps-modal">
+            <h3>PlayPlayscript 的目標劇本有問題</h3>
+            <p>劇本「@playWarning.PlayscriptName」裡的 PlayPlayscript：</p>
+            <div class="ps-result-list">
+                @foreach (var problem in playWarning.Problems)
+                {
+                    <div class="ps-result-row">@problem</div>
+                }
+            </div>
+            <p class="ps-conflict-warning">照樣匯出的話，C# 會原樣寫入這個名稱；如果目標劇本之後也沒建立，Unity 執行到這一行時會找不到劇本。</p>
+            <div class="ps-modal-actions">
+                <button @onclick='() => ResolvePlayPlayscriptWarning(SheetScriptConflictChoice.OverwriteOne)'>照樣匯出</button>
+                <button @onclick='() => ResolvePlayPlayscriptWarning(SheetScriptConflictChoice.SkipOne)'>略過這個劇本</button>
+                @if (playWarning.RemainingWarningCount > 0)
+                {
+                    <button @onclick='() => ResolvePlayPlayscriptWarning(SheetScriptConflictChoice.OverwriteRemaining)'>接下來的 @playWarning.RemainingWarningCount 個也照樣匯出</button>
+                    <button @onclick='() => ResolvePlayPlayscriptWarning(SheetScriptConflictChoice.SkipRemaining)'>略過接下來的 @playWarning.RemainingWarningCount 個</button>
                 }
             </div>
         </div>
@@ -329,6 +387,19 @@
     .ps-unknown { text-align: center; opacity: 0.35; }
     .ps-empty { padding: 16px; opacity: 0.6; font-size: 13px; }
     .ps-select-col { width: 28px; text-align: center; }
+
+    .ps-bottom-status {
+        flex: 0 0 24px; display: flex; align-items: center; gap: 7px; padding: 0 10px;
+        box-sizing: border-box; background: #171717; color: #aaa; border-top: 1px solid #333; font-size: 12px;
+    }
+    .ps-status-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: #5f9f62; }
+    .ps-bottom-status.loading .ps-status-dot { background: #d2a43c; animation: ps-status-pulse 1s ease-in-out infinite; }
+    .ps-bottom-status.failed { color: #e49a9a; }
+    .ps-bottom-status.failed .ps-status-dot { background: #d75a5a; }
+    @@keyframes ps-status-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+    .ps-bottom-progress { flex: 0 0 160px; height: 6px; border-radius: 3px; background: #333; overflow: hidden; }
+    .ps-bottom-progress-fill { display: block; height: 100%; background: #d2a43c; transition: width 0.15s ease-out; }
+    .ps-bottom-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .ps-progress-wrap { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: #1e1e1e; border-bottom: 1px solid #333; }
     .ps-progress-bar { flex: 1 1 auto; height: 8px; border-radius: 4px; background: #333; overflow: hidden; }
@@ -506,6 +577,9 @@
     private double SheetScriptProgressPercent =>
         State.SheetScriptQueueTotal == 0 ? 0 : 100.0 * State.SheetScriptProcessedCount / State.SheetScriptQueueTotal;
 
+    private double RefreshProgressPercent =>
+        100.0 * State.RefreshStep / PipelineStatusState.RefreshStepTotal;
+
     private double UploadProgressPercent =>
         State.UploadQueueTotal == 0 ? 0 : 100.0 * State.UploadProcessedCount / State.UploadQueueTotal;
 
@@ -527,31 +601,27 @@
         State.OnSheetScriptProgress += OnSheetScriptProgress;
         State.OnUploadProgress += OnUploadProgress;
         State.OnCSharpExportProgress += OnCSharpExportProgress;
+        State.OnRefreshProgress += OnRefreshProgress;
     }
 
-    // Deferred to firstRender rather than done in OnInitialized: GraphEditorState's model (this panel's
-    // 流程圖 column source, via PipelineStatusState.Refresh -> GetPlayscriptIdentities) is only populated by
-    // FlowGraphPanel's own LoadAndInit, which itself runs from OnAfterRenderAsync — OnInitialized for every
-    // always-mounted panel (see Home.razor) runs before any of them reach OnAfterRenderAsync, so refreshing
-    // here instead would always see an empty/not-yet-loaded graph. Relies on Home.razor mounting
-    // <FlowGraphPanel /> before <PipelineStatusPanel /> so its OnAfterRenderAsync (and thus LoadAndInit's
-    // synchronous LoadGraph() call, which runs before that method's own first await) has already populated
-    // the model by the time this one runs.
+    // Deferred to firstRender rather than done in OnInitialized so the page renders first. RefreshAsync
+    // itself waits for GraphEditorState.FirstLoadCompleted before scanning, since this panel's 流程圖
+    // column comes from the graph model FlowGraphPanel's own LoadAndInit populates.
     //
     // Re-armed on every render (init() itself destroys any previous instance first) rather than only on
     // firstRender — a reorder's own StateHasChanged() re-renders the header row, and the freshly-rendered
     // <tr> needs SortableJS wired to it again for the next drag to work.
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        _selfRef ??= DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("storyForgeColumnSort.init", "ps-header-row", _selfRef);
+
         if (firstRender)
         {
-            State.Refresh();
+            await State.RefreshAsync();
             SyncChapterSelection();
             StateHasChanged();
         }
-
-        _selfRef ??= DotNetObjectReference.Create(this);
-        await JS.InvokeVoidAsync("storyForgeColumnSort.init", "ps-header-row", _selfRef);
     }
 
     // Wired to the global 讀取 toolbar button (MainLayout) via ReloadCoordinator, same as the other three
@@ -559,7 +629,7 @@
     // stale data and the user had to remember to also press this tab's own 重新整理 button every time.
     private async Task OnReload()
     {
-        State.Refresh();
+        await State.RefreshAsync();
         SyncChapterSelection();
         await InvokeAsync(StateHasChanged);
     }
@@ -585,13 +655,31 @@
         State.OnSheetScriptProgress -= OnSheetScriptProgress;
         State.OnUploadProgress -= OnUploadProgress;
         State.OnCSharpExportProgress -= OnCSharpExportProgress;
+        State.OnRefreshProgress -= OnRefreshProgress;
         _selfRef?.Dispose();
     }
 
-    private void Refresh()
+    // "稍後再處理" on the guide-path conflict dialog — it comes back on the next refresh / write-back.
+    private bool _hideGuidePathConflicts;
+
+    private async Task WriteBackGuidePathMemos()
     {
-        State.Refresh();
+        _hideGuidePathConflicts = false;
+        await State.WriteBackGuidePathMemosAsync();
+    }
+
+    private async Task Refresh()
+    {
+        _hideGuidePathConflicts = false;
+        await State.RefreshAsync();
         SyncChapterSelection();
+    }
+
+    // Fired at every RefreshAsync stage boundary — re-renders the bottom status bar mid-refresh rather
+    // than only once the whole scan settles.
+    private void OnRefreshProgress()
+    {
+        InvokeAsync(StateHasChanged);
     }
 
     private async Task DownloadSheet()
@@ -603,9 +691,9 @@
     // 建立劇本檔 — writes NodeContentStore/NodeScriptTableStore's .json/.md files for every 劇本 node whose
     // playscript name is currently checked in the row-selection checkboxes, not the chapter filter (which
     // only controls what's visible/checkable here).
-    private void BuildNodeFiles()
+    private async Task BuildNodeFiles()
     {
-        State.BuildNodeContentFiles(_selectedNames);
+        await State.BuildNodeContentFilesAsync(_selectedNames);
     }
 
     private async Task DownloadSheetScripts()
@@ -650,6 +738,11 @@
         await State.ResolveCSharpExportConflictAsync(choice);
     }
 
+    private async Task ResolvePlayPlayscriptWarning(SheetScriptConflictChoice choice)
+    {
+        await State.ResolvePlayPlayscriptWarningAsync(choice);
+    }
+
     private void OpenPendingCSharpExportFile()
     {
         State.OpenPendingCSharpExportFile();
@@ -688,9 +781,9 @@
         await State.ResolveSheetScriptConflictAsync(choice);
     }
 
-    private void ResolveScriptFileConflict(SheetScriptConflictChoice choice)
+    private async Task ResolveScriptFileConflict(SheetScriptConflictChoice choice)
     {
-        State.ResolveScriptFileConflict(choice);
+        await State.ResolveScriptFileConflictAsync(choice);
     }
 
     private void CloseResults()
@@ -821,6 +914,36 @@
     private void CloseContextMenu()
     {
         _contextMenuRow = null;
+    }
+
+    // 「複製劇本名稱」的結果暫時蓋在工具列狀態文字上，3 秒後恢復顯示原本的狀態
+    private string? _copyNameFeedback;
+
+    private async Task CopyPlayscriptNameFromMenu()
+    {
+        if (_contextMenuRow is not { } row)
+            return;
+
+        CloseContextMenu();
+        try
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", row.PlayscriptName);
+            _copyNameFeedback = $"已複製：{row.PlayscriptName}";
+        }
+        catch (Exception)
+        {
+            _copyNameFeedback = "複製失敗，瀏覽器不允許寫入剪貼簿";
+        }
+
+        var shown = _copyNameFeedback;
+        _ = Task.Delay(TimeSpan.FromSeconds(3)).ContinueWith(_ => InvokeAsync(() =>
+        {
+            if (_copyNameFeedback == shown)
+            {
+                _copyNameFeedback = null;
+                StateHasChanged();
+            }
+        }));
     }
 
     private void OpenLocalScriptFileFromMenu()

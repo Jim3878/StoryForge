@@ -23,7 +23,7 @@ public sealed class StoryOutlineSettings
     {
         var path = GetFilePath(dataFolder);
         if (!File.Exists(path))
-            return MigrateFromLegacyLocations(dataFolder);
+            return new StoryOutlineSettings();
 
         try
         {
@@ -44,33 +44,6 @@ public sealed class StoryOutlineSettings
             Directory.CreateDirectory(directory);
 
         File.WriteAllText(path, JsonConvert.SerializeObject(this, Formatting.Indented));
-    }
-
-    // One-time migration for a machine that already had this file at its old home — the Unity project,
-    // where every version of this tool up to the node/save-location redesign kept it, tracked in git.
-    // (An older fallback also migrated a legacy AiReferencePrompt/AiWritingGuidelines value here, but that
-    // field no longer exists — see the type-level comment.)
-    private static StoryOutlineSettings MigrateFromLegacyLocations(string dataFolder)
-    {
-        try
-        {
-            var projectRoot = ProjectPaths.ResolveUnityProjectRoot();
-            var oldProjectPath = Path.Combine(projectRoot, "Assets", "06.Definition",
-                "PlayscriptOfflineToolData", "StoryOutline.json");
-            if (File.Exists(oldProjectPath))
-            {
-                var migrated = JsonConvert.DeserializeObject<StoryOutlineSettings>(File.ReadAllText(oldProjectPath))
-                                ?? new StoryOutlineSettings();
-                migrated.Save(dataFolder);
-                return migrated;
-            }
-        }
-        catch
-        {
-            // Best-effort — worst case the user retypes it in the 世界書 panel.
-        }
-
-        return new StoryOutlineSettings();
     }
 
     private static string GetFilePath(string dataFolder)

@@ -1,3 +1,4 @@
+using Newtonsoft.Json.Linq;
 using System.Diagnostics;
 using StoryForge.Core;
 using StoryForge.Core.Codegen;
@@ -80,6 +81,15 @@ public sealed class CSharpExportConflict
     public int RemainingConflictCount { get; init; }
 }
 
+// 「匯出成C#」時，這個劇本的 PlayPlayscript 目標劇本格式不對或找不到 — 批次暫停，等使用者決定照樣匯出或略過
+// （沿用 SheetScriptConflictChoice：Overwrite = 照樣匯出，Skip = 略過）。
+public sealed class PlayPlayscriptWarning
+{
+    public string PlayscriptName { get; init; } = string.Empty;
+    public IReadOnlyList<string> Problems { get; init; } = Array.Empty<string>();
+    public int RemainingWarningCount { get; init; }
+}
+
 // Scoped per circuit. LDtk/C# are plain local-file scans, re-run on every Refresh(). The Sheet source
 // needs its own local xlsx (Assets/11.Other/Sheet/Playscript/PlaylistIndex.xlsx) — there's no such file
 // until DownloadSheetAsync has been run at least once, mirroring the original tool's own 下載Sheet flow.
@@ -154,6 +164,13 @@ public sealed class PipelineStatusState
     // root is fixed per project) rather than re-resolved on every queue item drained.
     private EnumLabelMaps? _cSharpExportEnumLabelMaps;
     private string? _cSharpExportOutputRoot;
+    private PlayscriptAudioClips? _cSharpExportAudioClips;
+    private LdtkTransportIndex? _cSharpExportTransports;
+
+    // Conflicts from the last GuidePathPoints.json refresh or write-back; the panel lists them for one-by-one
+    // resolution. Empty when there are none.
+    public IReadOnlyList<GuidePathMemoConflict> GuidePathConflicts { get; private set; } = Array.Empty<GuidePathMemoConflict>();
+    public bool IsGuidePathWriteBackRunning { get; private set; }
 
     public PipelineStatusState(GraphEditorState graphState, AppSettings appSettings)
     {
@@ -221,35 +238,91 @@ public sealed class PipelineStatusState
     // Non-null while "匯出成C#" is paused waiting for the user to resolve an existing-.cs-file conflict.
     public CSharpExportConflict? PendingCSharpExportConflict { get; private set; }
 
-    public void Refresh()
+    // Non-null while "匯出成C#" is paused asking whether to export despite a questionable PlayPlayscript target.
+    public PlayPlayscriptWarning? PendingPlayPlayscriptWarning { get; private set; }
+    private ConflictAutoMode _playPlayscriptWarningAutoMode;
+    private const string PlayPlayscriptSkipReason = "使用者選擇略過（PlayPlayscript 的目標劇本有問題）";
+
+    // Refresh progress for the panel's bottom status bar — the LDtk parse alone (an ~8 MB JSON) used to
+    // freeze the whole circuit with no feedback. Each stage's disk IO now runs on the thread pool; anything
+    // touching GraphEditorState's live model stays on the circuit's own sync context (it isn't thread-safe).
+    public bool IsRefreshing { get; private set; }
+    public bool RefreshFailed { get; private set; }
+    public string RefreshStageText { get; private set; } = "尚未讀取";
+    public int RefreshStep { get; private set; }
+    public const int RefreshStepTotal = 6;
+    public Action? OnRefreshProgress { get; set; }
+
+    private void ReportRefreshStage(int step, string text)
     {
+        RefreshStep = step;
+        RefreshStageText = text;
+        OnRefreshProgress?.Invoke();
+    }
+
+    public async Task RefreshAsync()
+    {
+        if (IsRefreshing)
+            return;
+
+        IsRefreshing = true;
+        RefreshFailed = false;
         try
         {
+            // 啟動時流程圖分頁也在載入：先讓它跑完（第 4 步也需要它的劇本名稱），之後就是立即完成的 Task
+            if (!_graphState.FirstLoadCompleted.IsCompleted)
+            {
+                ReportRefreshStage(0, "等待流程圖載入完成……");
+                await _graphState.FirstLoadCompleted;
+            }
+
+            ReportRefreshStage(0, "正在解析 Unity 專案路徑……");
             _projectRoot = ProjectPaths.ResolveUnityProjectRoot();
             var assetsRoot = Path.Combine(_projectRoot, "Assets");
 
+            ReportRefreshStage(1, "正在讀取 LDtk 關卡資料……");
             _ldtkPath = Path.Combine(assetsRoot, "12.Custom", "Company.ldtk");
-            _ldtkLocations = File.Exists(_ldtkPath)
-                ? LdtkPlayscriptScanner.ScanFileEntries(_ldtkPath)
-                : new();
             var ldtkPath = _ldtkPath;
+            var (ldtkRoot, ldtkLocations) = await Task.Run(() =>
+            {
+                var root = File.Exists(ldtkPath) ? JObject.Parse(File.ReadAllText(ldtkPath)) : null;
+                return (root, root != null ? LdtkPlayscriptScanner.ScanRootEntries(root) : new());
+            });
+            _ldtkLocations = ldtkLocations;
             var ldtkNames = _ldtkLocations.Keys.ToHashSet(StringComparer.Ordinal);
 
+            ReportRefreshStage(2, "正在掃描 C# 劇本工廠……");
             var factoryFolder = Path.Combine(assetsRoot, "12.Custom", "PlayscriptFactory");
-            var cSharpNames = CSharpFactoryScanner.ScanFolder(factoryFolder);
+            var cSharpNames = await Task.Run(() => CSharpFactoryScanner.ScanFolder(factoryFolder));
 
+            ReportRefreshStage(3, "正在讀取 Sheet 索引……");
             var sheetPath = Path.Combine(assetsRoot, GooglePlayscriptSheetClient.GooglePlayscriptFolder,
                 GooglePlayscriptSheetClient.GooglePlayscriptFileName);
             var hasSheetFile = File.Exists(sheetPath);
-            _sheetEntries = hasSheetFile ? GooglePlayscriptSheetClient.LoadEntries(sheetPath) : new();
+            _sheetEntries = hasSheetFile
+                ? await Task.Run(() => GooglePlayscriptSheetClient.LoadEntries(sheetPath))
+                : new();
 
+            ReportRefreshStage(4, "正在比對流程圖……");
             var graphNames = _graphState.GetPlayscriptIdentities().ToList();
-
             var infos = PlayscriptPipelineComparer.Compare(
                 ldtkNames, graphNames, _sheetEntries.Keys, cSharpNames);
+            var nodeGuids = infos.Select(info => _graphState.FindNodeGuidForPlayscript(info.PlayscriptName)).ToList();
+
+            // "本地劇本" — resolves the exact (possibly guid-suffixed, for a leftover file predating this fix)
+            // path for whichever live node currently owns this playscript name, so a real file never reads as
+            // missing just because it isn't sitting at the plain name. A name with no live node at all (the row is
+            // a leftover-file-only case) falls back to the plain-path-only check, matching its own row semantics.
+            ReportRefreshStage(5, $"正在檢查 {infos.Count} 個本地劇本檔……");
+            var externalFolder = _appSettings.ExternalDataFolder;
+            var hasLocalScript = await Task.Run(() => infos
+                .Select((info, i) => nodeGuids[i] is { } guid
+                    ? NodeScriptTableStore.HasFileAt(externalFolder, info.PlayscriptName, guid)
+                    : NodeScriptTableStore.HasFile(externalFolder, info.PlayscriptName))
+                .ToList());
 
             Rows = infos
-                .Select(info => new PipelineStatusRow
+                .Select((info, i) => new PipelineStatusRow
                 {
                     Chapter = info.Chapter,
                     PlayscriptName = info.PlayscriptName,
@@ -259,22 +332,41 @@ public sealed class PipelineStatusState
                     HasSheetFile = _sheetEntries.TryGetValue(info.PlayscriptName, out var entry) &&
                                    entry.SpreadsheetLink != null && !entry.IsMarkedEmpty,
                     IsOnCSharp = info.IsOnCSharp,
-                    HasLocalScriptFile = HasLocalScriptFile(info.PlayscriptName),
+                    HasLocalScriptFile = hasLocalScript[i],
                 })
                 .ToList();
 
             var missing = new List<string>();
             if (!File.Exists(ldtkPath)) missing.Add("找不到LDtk檔案");
+            if (ldtkRoot != null)
+            {
+                ReportRefreshStage(6, $"正在寫出 {LdtkTransportIndex.ExportFileName}……");
+                var transportExportError = await Task.Run(() => TryWriteTransportExport(ldtkRoot));
+                if (transportExportError != null) missing.Add(transportExportError);
+                var guidePathMessage = await Task.Run(() => TryExportGuidePathMemos(ldtkRoot));
+                if (guidePathMessage != null) missing.Add(guidePathMessage);
+            }
+            var nameListExportError = await Task.Run(() => TryWriteNameListExport(_projectRoot));
+            if (nameListExportError != null) missing.Add(nameListExportError);
             if (!hasSheetFile) missing.Add("Sheet尚未下載");
             var suffix = missing.Count > 0 ? $"；{string.Join("，", missing)}" : string.Empty;
 
             StatusMessage = $"共 {Rows.Count} 個劇本名稱（LDtk={ldtkNames.Count}, 流程圖={graphNames.Count}, " +
                             $"Sheet={_sheetEntries.Count}, C#={cSharpNames.Count}）{suffix}";
+            RefreshStageText = $"讀取完成：{StatusMessage}";
         }
         catch (Exception e)
         {
             Rows = new();
             StatusMessage = $"讀取失敗：{e.Message}";
+            RefreshFailed = true;
+            RefreshStageText = StatusMessage;
+        }
+        finally
+        {
+            RefreshStep = RefreshStepTotal;
+            IsRefreshing = false;
+            OnRefreshProgress?.Invoke();
         }
     }
 
@@ -284,7 +376,7 @@ public sealed class PipelineStatusState
     // A selected name whose plain-path file belongs to a different (no-longer-live) node's guid is queued
     // into PendingScriptFileConflict for the user to explicitly overwrite or skip, rather than silently
     // suffixed or silently skipped — see GraphEditorState.PlanNodeContentFilesSync's own comment.
-    public void BuildNodeContentFiles(IReadOnlyCollection<string> selectedPlayscriptNames)
+    public async Task BuildNodeContentFilesAsync(IReadOnlyCollection<string> selectedPlayscriptNames)
     {
         var plan = _graphState.PlanNodeContentFilesSync(selectedPlayscriptNames);
         _scriptFileSyncedCount = _graphState.SyncNodeContentFiles(plan.Ready);
@@ -295,10 +387,10 @@ public sealed class PipelineStatusState
         _scriptFileConflictAutoMode = ConflictAutoMode.None;
         PendingScriptFileConflict = null;
 
-        DrainScriptFileConflictQueue();
+        await DrainScriptFileConflictQueueAsync();
     }
 
-    public void ResolveScriptFileConflict(SheetScriptConflictChoice choice)
+    public async Task ResolveScriptFileConflictAsync(SheetScriptConflictChoice choice)
     {
         if (_scriptFileConflictQueue.Count == 0)
             return;
@@ -323,10 +415,10 @@ public sealed class PipelineStatusState
         }
 
         PendingScriptFileConflict = null;
-        DrainScriptFileConflictQueue();
+        await DrainScriptFileConflictQueueAsync();
     }
 
-    private void DrainScriptFileConflictQueue()
+    private async Task DrainScriptFileConflictQueueAsync()
     {
         while (_scriptFileConflictQueue.Count > 0)
         {
@@ -357,7 +449,7 @@ public sealed class PipelineStatusState
 
         PendingScriptFileConflict = null;
         SetBuildStatusMessage();
-        Refresh();
+        await RefreshAsync();
     }
 
     private void SetBuildStatusMessage()
@@ -365,18 +457,6 @@ public sealed class PipelineStatusState
         StatusMessage = _scriptFileSyncedCount > 0
             ? $"已建立/同步 {_scriptFileSyncedCount} 個劇本節點的檔案"
             : "勾選的列內沒有可建立檔案的劇本節點";
-    }
-
-    // "本地劇本" — resolves the exact (possibly guid-suffixed, for a leftover file predating this fix)
-    // path for whichever live node currently owns this playscript name, so a real file never reads as
-    // missing just because it isn't sitting at the plain name. A name with no live node at all (the row is
-    // a leftover-file-only case) falls back to the plain-path-only check, matching its own row semantics.
-    private bool HasLocalScriptFile(string playscriptName)
-    {
-        var guid = _graphState.FindNodeGuidForPlayscript(playscriptName);
-        return guid != null
-            ? NodeScriptTableStore.HasFileAt(_appSettings.ExternalDataFolder, playscriptName, guid)
-            : NodeScriptTableStore.HasFile(_appSettings.ExternalDataFolder, playscriptName);
     }
 
     // Entry point for the "下載Sheet劇本" button — every checked row is queued regardless of whether it has
@@ -524,7 +604,7 @@ public sealed class PipelineStatusState
         IsSheetScriptDownloadRunning = false;
         SheetScriptCurrentName = null;
         SheetScriptResults = failures;
-        Refresh();
+        await RefreshAsync();
         OnSheetScriptProgress?.Invoke();
     }
 
@@ -551,7 +631,7 @@ public sealed class PipelineStatusState
             StatusMessage = "正在下載 Google Sheet...";
             var assetsRoot = Path.Combine(_projectRoot, "Assets");
             await GooglePlayscriptSheetClient.DownloadAsync(assetsRoot);
-            Refresh();
+            await RefreshAsync();
         }
         catch (Exception e)
         {
@@ -674,7 +754,7 @@ public sealed class PipelineStatusState
         IsUploadRunning = false;
         UploadCurrentName = null;
         UploadResults = failures;
-        Refresh();
+        await RefreshAsync();
         OnUploadProgress?.Invoke();
     }
 
@@ -717,6 +797,11 @@ public sealed class PipelineStatusState
         var enumDocument = DocumentLoader.LoadEnumLabelMapDocument(enumMapPath);
         _cSharpExportEnumLabelMaps = EnumLabelMaps.FromDocument(enumDocument);
         _cSharpExportOutputRoot = Path.Combine(assetsRoot, "12.Custom", "PlayscriptFactory");
+        _cSharpExportAudioClips = PlayscriptAudioClips.Scan(_projectRoot);
+        // Re-read here rather than reusing Refresh()'s copy, so the iid checks see the .ldtk as it is right now.
+        // Left null when the file is missing — only rows that actually use LevelTransport/DoorLevelTransport fail.
+        var exportLdtkPath = Path.Combine(assetsRoot, "12.Custom", "Company.ldtk");
+        _cSharpExportTransports = File.Exists(exportLdtkPath) ? LdtkTransportIndex.LoadFile(exportLdtkPath) : null;
 
         var excludedForNoContent = new List<string>();
         _cSharpExportQueue.Clear();
@@ -737,7 +822,9 @@ public sealed class PipelineStatusState
             return excludedForNoContent;
 
         _cSharpExportConflictAutoMode = ConflictAutoMode.None;
+        _playPlayscriptWarningAutoMode = ConflictAutoMode.None;
         PendingCSharpExportConflict = null;
+        PendingPlayPlayscriptWarning = null;
         CSharpExportResults = null;
         IsCSharpExportRunning = true;
         CSharpExportQueueTotal = _cSharpExportQueue.Count;
@@ -751,7 +838,8 @@ public sealed class PipelineStatusState
 
     public async Task ResolveCSharpExportConflictAsync(SheetScriptConflictChoice choice)
     {
-        if (_pendingCSharpExportItem == null || _pendingCSharpExportOutput == null || CSharpExportResults != null)
+        if (PendingCSharpExportConflict == null || _pendingCSharpExportItem == null || _pendingCSharpExportOutput == null
+            || CSharpExportResults != null)
             return;
 
         var item = _pendingCSharpExportItem;
@@ -782,6 +870,65 @@ public sealed class PipelineStatusState
 
         CSharpExportProcessedCount++;
         await DrainCSharpExportQueueAsync(failures);
+    }
+
+    public async Task ResolvePlayPlayscriptWarningAsync(SheetScriptConflictChoice choice)
+    {
+        if (PendingPlayPlayscriptWarning == null || _pendingCSharpExportItem == null || _pendingCSharpExportOutput == null
+            || CSharpExportResults != null)
+            return;
+
+        var item = _pendingCSharpExportItem;
+        var output = _pendingCSharpExportOutput;
+        _pendingCSharpExportItem = null;
+        _pendingCSharpExportOutput = null;
+        PendingPlayPlayscriptWarning = null;
+
+        var failures = _currentCSharpExportFailures ?? new List<SheetScriptFailure>();
+        if (choice is SheetScriptConflictChoice.OverwriteRemaining or SheetScriptConflictChoice.SkipRemaining)
+            _playPlayscriptWarningAutoMode = choice == SheetScriptConflictChoice.OverwriteRemaining
+                ? ConflictAutoMode.OverwriteRemaining
+                : ConflictAutoMode.SkipRemaining;
+
+        if (choice is SheetScriptConflictChoice.OverwriteOne or SheetScriptConflictChoice.OverwriteRemaining)
+        {
+            // 照樣匯出：接著走一般的寫檔流程，可能又停在「C#檔案已存在」的詢問
+            if (FinishCSharpExportItem(item, output, _cSharpExportOutputRoot!, failures))
+                return;
+        }
+        else
+        {
+            failures.Add(new SheetScriptFailure { PlayscriptName = item.PlayscriptName, Reason = PlayPlayscriptSkipReason });
+            CSharpExportProcessedCount++;
+        }
+
+        await DrainCSharpExportQueueAsync(failures);
+    }
+
+    // PlayPlayscript 目標劇本的檢查：要是「章節/劇本」格式，而且流程圖或 Sheet 索引裡要有這個劇本。
+    // 空白的參數在產生器那邊就已經是錯誤，不會走到這裡。
+    private List<string> FindPlayPlayscriptProblems(IReadOnlyList<string[]> rows)
+    {
+        var targets = PlayscriptFactoryCodeGenerator.FindPlayPlayscriptTargets(rows);
+        var problems = new List<string>();
+        if (targets.Count == 0)
+            return problems;
+
+        var known = _graphState.GetPlayscriptIdentities()
+            .Select(PlayscriptNaming.Normalize)
+            .Concat(_sheetEntries.Keys)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var (row, target) in targets)
+        {
+            if (string.IsNullOrEmpty(target))
+                continue;
+            if (!PlayscriptNaming.IsValidChapterPlayscriptName(target))
+                problems.Add($"第 {row} 列：「{target}」不是「章節/劇本」格式");
+            else if (!known.Contains(target))
+                problems.Add($"第 {row} 列：找不到劇本「{target}」（流程圖和 Sheet 索引裡都沒有）");
+        }
+        return problems;
     }
 
     public void DismissCSharpExportResults()
@@ -842,6 +989,156 @@ public sealed class PipelineStatusState
     // signals "this is the dev-mode Electron launch, which needs the '.' arg AND that working directory to
     // resolve it against" — a real packaged LDtk.exe needs neither, so AppSettings leaving it blank skips
     // both rather than needing a separate on/off setting for the same thing.
+    // LdtkTransports.json for the AI filling playscript sheets (see LdtkTransportIndex). A failure here only
+    // gets reported in the status line — it must never take the pipeline table down with it.
+    private string? TryWriteTransportExport(JObject ldtkRoot)
+    {
+        try
+        {
+            if (!Directory.Exists(_appSettings.ExternalDataFolder))
+                return $"外部資料夾不存在，未寫出 {LdtkTransportIndex.ExportFileName}";
+
+            LdtkTransportIndex.FromRoot(ldtkRoot).WriteExportIfChanged(_appSettings.ExternalDataFolder);
+            return null;
+        }
+        catch (Exception e)
+        {
+            return $"寫出 {LdtkTransportIndex.ExportFileName} 失敗：{e.Message}";
+        }
+    }
+
+    // GuidePathPoints.json (see GuidePathMemoSync). Returns a status-line note: an error, or how many AI memo
+    // edits are waiting for 寫回LDtk / are in conflict. Like the exports around it, it never fails the refresh.
+    private string? TryExportGuidePathMemos(JObject ldtkRoot)
+    {
+        try
+        {
+            if (!Directory.Exists(_appSettings.ExternalDataFolder))
+                return $"外部資料夾不存在，未寫出 {GuidePathMemoSync.ExportFileName}";
+
+            var result = GuidePathMemoSync.Export(ldtkRoot, _appSettings.ExternalDataFolder);
+            GuidePathConflicts = result.Conflicts;
+            return DescribeGuidePathState(result.PendingCount, result.Conflicts.Count);
+        }
+        catch (Exception e)
+        {
+            return $"寫出 {GuidePathMemoSync.ExportFileName} 失敗：{e.Message}";
+        }
+    }
+
+    private static string? DescribeGuidePathState(int pending, int conflicts)
+    {
+        var parts = new List<string>();
+        if (pending > 0) parts.Add($"{pending} 筆引導點 Memo 待寫回 LDtk");
+        if (conflicts > 0) parts.Add($"{conflicts} 筆引導點 Memo 衝突");
+        return parts.Count > 0 ? string.Join("，", parts) : null;
+    }
+
+    // The 寫回LDtk button. Refuses while LDtk is running: it keeps the project in memory and would silently
+    // overwrite these edits on its next save.
+    public async Task WriteBackGuidePathMemosAsync()
+    {
+        if (IsGuidePathWriteBackRunning)
+            return;
+
+        if (_projectRoot == null)
+        {
+            StatusMessage = "請先按重新整理一次。";
+            return;
+        }
+
+        if (IsLdtkRunning())
+        {
+            StatusMessage = "LDtk 還開著，請先存檔並關閉 LDtk 再寫回（否則 LDtk 下次存檔會把寫回的內容蓋掉）。";
+            return;
+        }
+
+        IsGuidePathWriteBackRunning = true;
+        try
+        {
+            var ldtkPath = Path.Combine(_projectRoot, "Assets", "12.Custom", "Company.ldtk");
+            var folder = _appSettings.ExternalDataFolder;
+            var result = await Task.Run(() => GuidePathMemoSync.WriteBack(ldtkPath, folder));
+            GuidePathConflicts = result.Conflicts;
+            StatusMessage = $"已寫回 {result.WrittenCount} 筆引導點 Memo 到 LDtk" +
+                            (result.Conflicts.Count > 0 ? $"；{result.Conflicts.Count} 筆衝突未寫回，請逐筆選擇要保留哪一邊" : "") + "。";
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"寫回引導點 Memo 失敗：{e.Message}";
+        }
+        finally
+        {
+            IsGuidePathWriteBackRunning = false;
+        }
+    }
+
+    // keepFile: the AI file's memo wins (written by the next 寫回LDtk); otherwise LDtk's memo is copied into the file.
+    public void ResolveGuidePathConflict(GuidePathMemoConflict conflict, bool keepFile)
+    {
+        try
+        {
+            GuidePathMemoSync.ResolveConflict(conflict, keepFile, _appSettings.ExternalDataFolder);
+            GuidePathConflicts = GuidePathConflicts.Where(c => c.Iid != conflict.Iid).ToList();
+            StatusMessage = keepFile
+                ? "已保留 AI 檔案的 Memo，按「寫回LDtk」即可寫入。"
+                : $"已把 LDtk 的 Memo 寫進 {GuidePathMemoSync.ExportFileName}。";
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"處理衝突失敗：{e.Message}";
+        }
+    }
+
+    // Matches the packaged LDtk.exe by name, and the dev-mode Electron launch by its exact executable path
+    // (AppSettings.LdtkExecutablePath) so an unrelated Electron app doesn't count.
+    private bool IsLdtkRunning()
+    {
+        if (Process.GetProcessesByName("LDtk").Length > 0)
+            return true;
+
+        var exePath = _appSettings.LdtkExecutablePath;
+        if (string.IsNullOrEmpty(exePath))
+            return false;
+
+        foreach (var process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exePath)))
+        {
+            try
+            {
+                if (string.Equals(process.MainModule?.FileName, Path.GetFullPath(exePath), StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch (Exception)
+            {
+                // Access denied on another user's / elevated process — not ours to worry about.
+            }
+        }
+
+        return false;
+    }
+
+    // PlayscriptNames.json (see PlayscriptNameListExport) — same "report, never fail the table" rule as above.
+    private string? TryWriteNameListExport(string projectRoot)
+    {
+        try
+        {
+            if (!Directory.Exists(_appSettings.ExternalDataFolder))
+                return $"外部資料夾不存在，未寫出 {PlayscriptNameListExport.ExportFileName}";
+
+            var enumMapPath = PlayscriptNameListExport.EnumMapPath(projectRoot);
+            if (!File.Exists(enumMapPath))
+                return $"找不到 Enum 對照表，未寫出 {PlayscriptNameListExport.ExportFileName}";
+
+            PlayscriptNameListExport.WriteIfChanged(
+                DocumentLoader.LoadEnumLabelMapDocument(enumMapPath), _appSettings.ExternalDataFolder);
+            return null;
+        }
+        catch (Exception e)
+        {
+            return $"寫出 {PlayscriptNameListExport.ExportFileName} 失敗：{e.Message}";
+        }
+    }
+
     public void LocateInLdtk(string playscriptName)
     {
         if (_ldtkPath == null || !_ldtkLocations.TryGetValue(playscriptName, out var location))
@@ -896,6 +1193,8 @@ public sealed class PipelineStatusState
         _currentCSharpExportFailures = failures;
         var enumLabelMaps = _cSharpExportEnumLabelMaps!;
         var outputRoot = _cSharpExportOutputRoot!;
+        var audioClips = _cSharpExportAudioClips!;
+        var transports = _cSharpExportTransports;
 
         while (_cSharpExportQueue.Count > 0)
         {
@@ -911,7 +1210,7 @@ public sealed class PipelineStatusState
             GeneratedPlayscriptOutput output;
             try
             {
-                output = PlayscriptFactoryCodeGenerator.Generate(item.PlayscriptName, item.Rows, enumLabelMaps, outputRoot);
+                output = PlayscriptFactoryCodeGenerator.Generate(item.PlayscriptName, item.Rows, enumLabelMaps, audioClips, transports, outputRoot);
             }
             catch (Exception e)
             {
@@ -921,72 +1220,106 @@ public sealed class PipelineStatusState
                 continue;
             }
 
-            if (!File.Exists(output.OutputPath))
+            // PlayPlayscript 的目標劇本格式不對或找不到：不直接當失敗，先停下來問使用者要不要照樣匯出
+            if (FindPlayPlayscriptProblems(item.Rows) is { Count: > 0 } problems)
             {
-                PlayscriptFactoryCodeGenerator.WriteGeneratedOutput(output);
-                CSharpExportProcessedCount++;
-                OnCSharpExportProgress?.Invoke();
-                continue;
-            }
-
-            // 劇本代號重複 — PlayscriptNameParser.Parse's ClassName drops a filename's last "_"-segment, so
-            // two playscripts sharing everything up to that segment (e.g. "ReN100_s10_黑警雙人組閒話" and
-            // "ReN100_s10_慎次閒話") collide onto the identical class name/output path. The existing file at
-            // this path belongs to whichever of them was exported most recently, not necessarily this one —
-            // a normal overwrite-confirm here would silently destroy that OTHER playscript's only C# output,
-            // which is a data-loss class this batch treats as a hard failure rather than a choice, unlike an
-            // ordinary "I'm regenerating my own file" conflict just below. TryReadPlayscriptName returning
-            // null (not one of this generator's own outputs, or an unrecognized format) falls through to the
-            // normal conflict flow instead — there's no way to tell it's a collision in that case.
-            var existingPlayscriptName = CSharpFactoryScanner.TryReadPlayscriptName(output.OutputPath);
-            if (existingPlayscriptName != null &&
-                !string.Equals(existingPlayscriptName, item.PlayscriptName, StringComparison.Ordinal))
-            {
-                failures.Add(new SheetScriptFailure
+                if (_playPlayscriptWarningAutoMode == ConflictAutoMode.SkipRemaining)
                 {
-                    PlayscriptName = item.PlayscriptName,
-                    Reason = $"劇本代號重複，跟「{existingPlayscriptName}」算出同一個C#類別名稱，兩者無法各自擁有一份C#檔案",
-                });
-                CSharpExportProcessedCount++;
-                OnCSharpExportProgress?.Invoke();
-                continue;
+                    failures.Add(new SheetScriptFailure { PlayscriptName = item.PlayscriptName, Reason = PlayPlayscriptSkipReason });
+                    CSharpExportProcessedCount++;
+                    OnCSharpExportProgress?.Invoke();
+                    continue;
+                }
+
+                if (_playPlayscriptWarningAutoMode != ConflictAutoMode.OverwriteRemaining)
+                {
+                    _pendingCSharpExportItem = item;
+                    _pendingCSharpExportOutput = output;
+                    PendingPlayPlayscriptWarning = new PlayPlayscriptWarning
+                    {
+                        PlayscriptName = item.PlayscriptName,
+                        Problems = problems,
+                        RemainingWarningCount = _cSharpExportQueue.Count(queued => FindPlayPlayscriptProblems(queued.Rows).Count > 0),
+                    };
+                    OnCSharpExportProgress?.Invoke();
+                    return;
+                }
             }
 
-            if (_cSharpExportConflictAutoMode == ConflictAutoMode.OverwriteRemaining)
-            {
-                PlayscriptFactoryCodeGenerator.WriteGeneratedOutput(output);
-                CSharpExportProcessedCount++;
-                OnCSharpExportProgress?.Invoke();
-                continue;
-            }
-
-            if (_cSharpExportConflictAutoMode == ConflictAutoMode.SkipRemaining)
-            {
-                failures.Add(new SheetScriptFailure { PlayscriptName = item.PlayscriptName, Reason = "使用者選擇略過（本機已有產生過的C#檔案）" });
-                CSharpExportProcessedCount++;
-                OnCSharpExportProgress?.Invoke();
-                continue;
-            }
-
-            // Paused here — CSharpExportProcessedCount deliberately not bumped yet; ResolveCSharpExportConflictAsync
-            // does that once the user actually decides, so the progress bar doesn't advance past a choice
-            // that hasn't been made.
-            _pendingCSharpExportItem = item;
-            _pendingCSharpExportOutput = output;
-            PendingCSharpExportConflict = new CSharpExportConflict
-            {
-                PlayscriptName = item.PlayscriptName,
-                RemainingConflictCount = CountRemainingCSharpExportConflicts(outputRoot),
-            };
-            OnCSharpExportProgress?.Invoke();
-            return;
+            if (FinishCSharpExportItem(item, output, outputRoot, failures))
+                return;
         }
 
         IsCSharpExportRunning = false;
         CSharpExportCurrentName = null;
         CSharpExportResults = failures;
-        Refresh();
+        await RefreshAsync();
         OnCSharpExportProgress?.Invoke();
+    }
+
+    // 產生完程式碼之後的收尾：寫檔、劇本代號重複、檔案已存在的覆蓋詢問。回傳 true 表示停在覆蓋詢問等使用者決定。
+    private bool FinishCSharpExportItem(CSharpExportQueueItem item, GeneratedPlayscriptOutput output, string outputRoot,
+        List<SheetScriptFailure> failures)
+    {
+        if (!File.Exists(output.OutputPath))
+        {
+            PlayscriptFactoryCodeGenerator.WriteGeneratedOutput(output);
+            CSharpExportProcessedCount++;
+            OnCSharpExportProgress?.Invoke();
+            return false;
+        }
+
+        // 劇本代號重複 — PlayscriptNameParser.Parse's ClassName drops a filename's last "_"-segment, so
+        // two playscripts sharing everything up to that segment (e.g. "ReN100_s10_黑警雙人組閒話" and
+        // "ReN100_s10_慎次閒話") collide onto the identical class name/output path. The existing file at
+        // this path belongs to whichever of them was exported most recently, not necessarily this one —
+        // a normal overwrite-confirm here would silently destroy that OTHER playscript's only C# output,
+        // which is a data-loss class this batch treats as a hard failure rather than a choice, unlike an
+        // ordinary "I'm regenerating my own file" conflict just below. TryReadPlayscriptName returning
+        // null (not one of this generator's own outputs, or an unrecognized format) falls through to the
+        // normal conflict flow instead — there's no way to tell it's a collision in that case.
+        var existingPlayscriptName = CSharpFactoryScanner.TryReadPlayscriptName(output.OutputPath);
+        if (existingPlayscriptName != null &&
+            !string.Equals(existingPlayscriptName, item.PlayscriptName, StringComparison.Ordinal))
+        {
+            failures.Add(new SheetScriptFailure
+            {
+                PlayscriptName = item.PlayscriptName,
+                Reason = $"劇本代號重複，跟「{existingPlayscriptName}」算出同一個C#類別名稱，兩者無法各自擁有一份C#檔案",
+            });
+            CSharpExportProcessedCount++;
+            OnCSharpExportProgress?.Invoke();
+            return false;
+        }
+
+        if (_cSharpExportConflictAutoMode == ConflictAutoMode.OverwriteRemaining)
+        {
+            PlayscriptFactoryCodeGenerator.WriteGeneratedOutput(output);
+            CSharpExportProcessedCount++;
+            OnCSharpExportProgress?.Invoke();
+            return false;
+        }
+
+        if (_cSharpExportConflictAutoMode == ConflictAutoMode.SkipRemaining)
+        {
+            failures.Add(new SheetScriptFailure { PlayscriptName = item.PlayscriptName, Reason = "使用者選擇略過（本機已有產生過的C#檔案）" });
+            CSharpExportProcessedCount++;
+            OnCSharpExportProgress?.Invoke();
+            return false;
+        }
+
+        // Paused here — CSharpExportProcessedCount deliberately not bumped yet; ResolveCSharpExportConflictAsync
+        // does that once the user actually decides, so the progress bar doesn't advance past a choice
+        // that hasn't been made.
+        _pendingCSharpExportItem = item;
+        _pendingCSharpExportOutput = output;
+        PendingCSharpExportConflict = new CSharpExportConflict
+        {
+            PlayscriptName = item.PlayscriptName,
+            RemainingConflictCount = CountRemainingCSharpExportConflicts(outputRoot),
+        };
+        OnCSharpExportProgress?.Invoke();
+        return true;
     }
 
     // Pure local-file check over whatever's still queued, used only to show an accurate "N" on the conflict

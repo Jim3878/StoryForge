@@ -25,7 +25,7 @@
 <div class="app-menubar">
     <span class="app-menubar-brand">StoryForge</span>
     <span class="app-menubar-group">
-        <button class="app-menubar-item" @onclick="Save">存檔</button>
+        <button class="app-menubar-item" @onclick="Save" disabled="@_saving">@(_saving ? "存檔中…" : "存檔")</button>
         <button class="app-menubar-item" @onclick="Load">讀取</button>
     </span>
     <button class="app-menubar-item" @onclick="() => _settingsDialog?.Open()">設定</button>
@@ -63,6 +63,7 @@
     .app-menubar-group { display: flex; gap: 4px; padding-right: 8px; border-right: 1px solid #333; }
     .app-menubar-item { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 3px 10px; border-radius: 3px; cursor: pointer; }
     .app-menubar-item:hover { background: #333; }
+    .app-menubar-item:disabled { opacity: 0.6; cursor: wait; }
     .app-menubar-status { margin-left: auto; opacity: 0.8; font-size: 12px; }
     .app-menubar-update {
         background: #4a7a2a; color: #fff; border: 1px solid #6a9a3a; padding: 3px 10px; border-radius: 3px;
@@ -126,7 +127,29 @@
     // save on every edit already. storyForgeGraph.exportGraph is a plain global JS function (set up once
     // by FlowGraphPanel's own init(), not scoped to that component instance), so calling it from here
     // works regardless of which tab is currently visible — the canvas element itself is always mounted.
+    // 存檔中：按鈕立刻變成「存檔中…」讓使用者知道有收到；期間再按（或 Ctrl+S）一律忽略，不會排隊重複存
+    private bool _saving;
+
     private async Task Save()
+    {
+        if (_saving)
+            return;
+
+        _saving = true;
+        StateHasChanged();
+        await Task.Yield();
+        try
+        {
+            await SaveCore();
+        }
+        finally
+        {
+            _saving = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task SaveCore()
     {
         SaveReport report;
         try
@@ -158,7 +181,7 @@
                     "請重新讀取後再繼續編輯，避免下一次刪除判斷錯誤。",
                 }).ToList();
                 report = new SaveReport(SaveOutcome.Warning, report.Title + "（有警告）", details,
-                    report.OrphanFiles);
+                    report.OrphanFiles, report.RenameCollisions);
                 _fileStatus = "存檔已寫入，但前端狀態更新失敗；請重新讀取";
             }
         }

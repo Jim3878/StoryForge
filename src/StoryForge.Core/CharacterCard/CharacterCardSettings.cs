@@ -83,7 +83,7 @@ public sealed class CharacterCardSettings
         CharacterCardSettings settings;
         if (!File.Exists(path))
         {
-            settings = MigrateFromLegacyLocations(dataFolder);
+            settings = MigrateFromLegacySettings(dataFolder);
         }
         else
         {
@@ -166,31 +166,9 @@ public sealed class CharacterCardSettings
         File.WriteAllText(path, JsonConvert.SerializeObject(this, Formatting.Indented));
     }
 
-    // One-time migration for a machine that already had this file at its old home — either the Unity
-    // project (where every version of this tool up to the node/save-location redesign kept it, tracked in
-    // git) or, further back still, the per-machine AppSettings-based roster from before CharacterCardSettings
-    // existed at all. Tried in that order; whichever hits first wins and is copied into the new folder.
-    private static CharacterCardSettings MigrateFromLegacyLocations(string dataFolder)
+    // One-time migration from the older per-machine AppSettings roster.
+    private static CharacterCardSettings MigrateFromLegacySettings(string dataFolder)
     {
-        try
-        {
-            var projectRoot = ProjectPaths.ResolveUnityProjectRoot();
-            var oldProjectPath = Path.Combine(projectRoot, "Assets", "06.Definition",
-                "PlayscriptOfflineToolData", "CharacterCards.json");
-            if (File.Exists(oldProjectPath))
-            {
-                var migrated = JsonConvert.DeserializeObject<CharacterCardSettings>(File.ReadAllText(oldProjectPath))
-                                ?? new CharacterCardSettings();
-                if (migrated.Cards.Count > 0)
-                    migrated.Save(dataFolder);
-                return migrated;
-            }
-        }
-        catch
-        {
-            // Best-effort — fall through to the older AppSettings-based migration below.
-        }
-
         var result = new CharacterCardSettings();
 
         try

@@ -132,7 +132,20 @@ from up to 4 sources into `PlayscriptPipelineInfo` rows (`IsOnLdtk`/`IsOnGraph`/
 `PipelineStatusState.Refresh()` always scans LDtk (`Ldtk/LdtkPlayscriptScanner`) and C# factory source
 (`CSharpSource/CSharpFactoryScanner`) live from disk on every refresh (pure local file reads); the Sheet
 source only exists once `DownloadSheetAsync()` has fetched `GooglePlayscriptSheetClient`'s xlsx export at
-least once — there's no sheet data until that button has been pressed.
+least once — there's no sheet data until that button has been pressed. The same refresh also writes
+`LdtkTransports.json` (`Ldtk/LdtkTransportIndex`) into `AppSettings.ExternalDataFolder` — a condensed list of
+every Transport/TransportTarget (plus the keyed guide-path points `SetGuidePath` accepts) so an AI filling a playscript sheet can look up `LevelTransport`/
+`DoorLevelTransport` iids without reading the 8 MB `.ldtk`; it's only rewritten when its content changed,
+since that folder is a git repo. Likewise `PlayscriptNames.json` (`Codegen/PlayscriptNameListExport`): the closed
+名字/表情 lists the codegen accepts (`DialogName`/`Portrait`/`Face`/`ChatName` labels from the Unity-exported
+`PlayscriptEnumLabelMaps.json`), which `AGENTS.md` tells the AI it must pick names from.
+
+The same refresh also writes `GuidePathPoints.json` (`Ldtk/GuidePathMemoSync`): every LDtk guide-path point with
+its `Memo` field, which the AI may edit. Edits go back into `Company.ldtk` only via the manual 寫回LDtk引導點Memo
+button (refused while LDtk is running — it would overwrite them from memory), as an in-place text patch of just
+those fields' `__value`/`realEditorValues`, never a re-serialization of the 8 MB file. Which side changed is
+decided three-way against a per-machine base in `%LocalAppData%\StoryForge\guide-path-memo-base.json`; a memo
+changed on both sides is a conflict the panel asks the user to resolve.
 
 ### Playscript factory codegen: "參數" column convention
 `PlayscriptFactoryCodeGenerator` (`StoryForge.Core/Codegen`) turns each spreadsheet row's `功能` (function)
@@ -145,7 +158,9 @@ forward, not just a preference. A function needing more than one such value (e.g
 into `參數` as `value1;value2` (semicolon-separated — see `SplitParameterValues`) rather than splitting
 across columns. `OpenCg`/`Diff` are grandfathered with a `參數`-first/`台詞`-fallback (`GetParameter`) purely
 for backward compatibility with sheets authored before `參數` existed — that fallback pattern should not be
-copied for new functions.
+copied for new functions. `OpenCg`/`Diff` also take an optional `;備註` (`TrySplitValueAndMemo`), emitted as
+`Gallery().SetMemo(...)` — a runtime no-op the Unity CG import tool reads to print on placeholder images; unlike
+`SplitParameterValues`, more than one half-width `;` is an error.
 
 Whenever a `功能` value is added, removed, or has its argument column(s) changed in
 `PlayscriptFactoryCodeGenerator` (both `GenerateCode` and its matching check in `ValidateSheetRows`), two
@@ -155,10 +170,10 @@ other places must be updated in the same change, not left for later:
    actually filling in a playscript spreadsheet reads (see the comment atop `NodeScriptTableStore.cs`).
 2. The `功能` column's dropdown (Data validation) on the live "劇本檔範本" Google Sheet template itself —
    without this, the sheet still offers/accepts the old value and rejects the new one when someone actually
-   types it in. On that sheet the dropdown has been observed saved as two separate data-validation rules
-   covering `E2` and `E3:E1000` rather than one rule over the whole column (apparently never consolidated) —
-   until that's cleaned up, editing the dropdown means opening the rule from a cell in each of those two
-   ranges and applying the same edit to both, or the two ranges will drift out of sync again.
+   types it in. The template is spreadsheet `1zVINkxB3WddSm-2xiMEV1ExbhyNcWAlQJu-unuqTtDc` (two older,
+   unused copies with the same name also exist in Drive). As of 2026-10 its dropdown is a single
+   data-validation rule over `E2:E1000` (an earlier split into `E2` + `E3:E1000` has since been merged) —
+   check 資料 → 資料驗證 lists only that one rule before editing, in case it has split again.
 
 It is easy to change the generator's accepted `功能` values while forgetting that the spreadsheet and
 `AGENTS.md` still describe the old ones — both are the actual interface a spreadsheet author sees, this file
@@ -173,7 +188,8 @@ isn't.
 - **Per-machine, in `%LocalAppData%\StoryForge\`**: `AppSettings` (`settings.json`), `ChapterFilterSettings`
   (`pipeline-filter.json`), `AudioBrowserSettings` (`audio-browser-settings.json`), `AudioWaveformCache`
   (`audio-waveform-cache.json`), `PortraitDescriptionSettings` (`portrait-descriptions.json`),
-  `PortraitFilterSettings` (`portrait-filter.json`). The old WinForms tool has its own separate
+  `PortraitFilterSettings` (`portrait-filter.json`), the
+  `GuidePathMemoSync` base (`guide-path-memo-base.json`). The old WinForms tool has its own separate
   `%LocalAppData%\PlayscriptOfflineTool\` folder — `LegacyToolMigration.MigrateIfNeeded()` (called once at
   the top of `Program.cs`, gated by a `legacy-migration-done.txt` marker so it only ever runs once) is the
   one-time bridge that copies/merges the old tool's real tuned values into StoryForge's own folder the first

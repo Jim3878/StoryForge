@@ -32,19 +32,17 @@ public static class NodeContentStore
     // graph is loaded or saved. A file that already exists keeps whatever's already written into it
     // (Memo/Conflict/Change/Characters/Location); only Guid/PlayscriptName get refreshed, so a rename or
     // one of the graph's real duplicate-identity nodes never silently overwrites someone else's content.
-    // currentMemo seeds a brand-new file only — it's the one-time migration off the old
-    // GraphNodeVm.Fields["memo"] convention (the caller strips that key out of Fields once read).
     public static void SyncAll(string dataFolder,
-        IEnumerable<(string Guid, string PlayscriptName, string CurrentMemo)> nodes)
+        IEnumerable<(string Guid, string PlayscriptName)> nodes)
     {
-        foreach (var (guid, playscriptName, currentMemo) in nodes)
+        foreach (var (guid, playscriptName) in nodes)
         {
             var path = ResolvePath(dataFolder, playscriptName, guid);
             var directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(directory))
                 Directory.CreateDirectory(directory);
 
-            var entry = TryReadRaw(path) ?? new NodeContentEntry { Memo = currentMemo };
+            var entry = TryReadRaw(path) ?? new NodeContentEntry();
             entry.Guid = guid;
             entry.PlayscriptName = playscriptName;
             File.WriteAllText(path, JsonConvert.SerializeObject(entry, Formatting.Indented));

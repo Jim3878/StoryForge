@@ -7,7 +7,27 @@
     <div class="save-result-overlay">
         <section class="save-result save-result-@_report.Outcome.ToString().ToLowerInvariant()"
                  role="dialog" aria-modal="true" aria-labelledby="save-result-title">
-            @if (_confirmingCleanup)
+            @if (_confirmingRenames)
+            {
+                <header>
+                    <span class="save-result-icon">⚠</span>
+                    <h2 id="save-result-title">確認處理改名衝突</h2>
+                </header>
+                <p>會執行下列檔案操作。執行前會重新掃描；若檔案在這之間有變化，該項會略過。</p>
+                <div class="save-result-details save-result-file-list">
+                    @foreach (var line in PlannedRenameActions)
+                    {
+                        <div>@line</div>
+                    }
+                </div>
+                <footer>
+                    <button type="button" @onclick="CancelRenames">返回</button>
+                    <button type="button" class="danger" @ref="_primaryButton" @onclick="ConfirmRenames">
+                        確認套用
+                    </button>
+                </footer>
+            }
+            else if (_confirmingCleanup)
             {
                 <header>
                     <span class="save-result-icon">⚠</span>
@@ -42,7 +62,57 @@
                         <div>@detail</div>
                     }
                 </div>
+                @if (_report.SaveSucceeded && _report.RenameCollisions.Count > 0)
+                {
+                    <div class="rename-conflicts">
+                        <h3>劇本檔改名衝突</h3>
+                        <p>節點已改名，但新名稱的位置已經有檔案，所以沒有自動搬移。請逐項選擇；「先不處理」的項目維持原狀，下次存檔會再詢問。被取代的檔案都會移到資源回收筒。</p>
+                        @foreach (var collision in _report.RenameCollisions)
+                        {
+                            <div class="rename-conflict">
+                                <div class="rename-conflict-title">@collision.Title</div>
+                                <div class="rename-conflict-reason">@collision.Reason</div>
+                                <div class="rename-conflict-files">
+                                    <div>
+                                        <strong>節點目前的內容檔</strong>
+                                        @foreach (var file in collision.CurrentFiles)
+                                        {
+                                            <div>@FileLine(file)</div>
+                                        }
+                                    </div>
+                                    <div>
+                                        <strong>新名稱位置已有的檔案</strong>
+                                        @foreach (var file in collision.TargetFiles)
+                                        {
+                                            <div>@FileLine(file)</div>
+                                        }
+                                    </div>
+                                </div>
+                                @if (collision.CanResolve)
+                                {
+                                    <div class="rename-conflict-choices">
+                                        @foreach (var (choice, label) in ChoiceLabels)
+                                        {
+                                            <label>
+                                                <input type="radio" name="rename-@collision.Guid"
+                                                       checked="@(ChoiceFor(collision) == choice)"
+                                                       @onchange="() => _renameChoices[collision.Guid] = choice" />
+                                                @label
+                                            </label>
+                                        }
+                                    </div>
+                                }
+                            </div>
+                        }
+                    </div>
+                }
                 <footer>
+                    @if (_report.SaveSucceeded && _report.RenameCollisions.Any(c => c.CanResolve))
+                    {
+                        <button type="button" class="danger" disabled="@(!HasRenameChoices)" @onclick="BeginRenames">
+                            套用改名選擇
+                        </button>
+                    }
                     @if (_report.SaveSucceeded && _report.OrphanFiles.Count > 0)
                     {
                         <button type="button" class="danger" @onclick="BeginCleanup">清除孤兒內容檔</button>
@@ -121,6 +191,37 @@
     .save-result button.primary:hover { background: #407cad; }
     .save-result button.danger { color: #fff; background: #873d3d; border-color: #b45858; }
     .save-result button.danger:hover { background: #a04848; }
+    .save-result button:disabled { opacity: 0.45; cursor: default; }
+
+    .rename-conflicts {
+        min-height: 0;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+    .rename-conflicts h3 { margin: 0; color: #f0c870; font-size: 15px; }
+    .rename-conflict {
+        padding: 10px 12px;
+        background: #171717;
+        border: 1px solid #4a4030;
+        border-radius: 4px;
+        font-size: 13px;
+    }
+    .rename-conflict-title { color: #fff; font-family: Consolas, monospace; overflow-wrap: anywhere; }
+    .rename-conflict-reason { margin-top: 2px; color: #bbb; }
+    .rename-conflict-files {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 8px;
+        margin-top: 8px;
+        color: #ccc;
+        font-size: 12px;
+        overflow-wrap: anywhere;
+    }
+    .rename-conflict-files strong { display: block; color: #ddd; }
+    .rename-conflict-choices { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 8px; }
+    .rename-conflict-choices label { cursor: pointer; }
 </style>
 
 @code {
@@ -129,6 +230,33 @@
     private ElementReference _primaryButton;
     private bool _focusPending;
     private bool _confirmingCleanup;
+    private bool _confirmingRenames;
+    private readonly Dictionary<string, RenameCollisionChoice> _renameChoices = new();
+
+    private static readonly (RenameCollisionChoice Choice, string Label)[] ChoiceLabels =
+    {
+        (RenameCollisionChoice.Skip, "先不處理"),
+        (RenameCollisionChoice.KeepTarget, "採用新位置的劇本（節點目前的 .md 丟棄）"),
+        (RenameCollisionChoice.Overwrite, "用節點目前的內容檔覆蓋"),
+    };
+
+    private RenameCollisionChoice ChoiceFor(RenameCollision collision) =>
+        _renameChoices.TryGetValue(collision.Guid, out var choice) ? choice : RenameCollisionChoice.Skip;
+
+    private List<RenameCollisionDecision> RenameDecisions =>
+        _report?.RenameCollisions
+            .Where(c => c.CanResolve && ChoiceFor(c) != RenameCollisionChoice.Skip)
+            .Select(c => new RenameCollisionDecision(c, ChoiceFor(c)))
+            .ToList()
+        ?? new List<RenameCollisionDecision>();
+
+    private bool HasRenameChoices => RenameDecisions.Count > 0;
+
+    private IEnumerable<string> PlannedRenameActions =>
+        RenameDecisions.SelectMany(d => d.Collision.PlannedActions(d.Choice));
+
+    private static string FileLine(ContentFileInfo file) =>
+        $"{file.RelativePath}　{file.Summary}　{file.Size:N0} bytes　{file.Modified:yyyy-MM-dd HH:mm}";
 
     private string Icon => _report?.Outcome switch
     {
@@ -148,7 +276,37 @@
         _report = report;
         _time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         _confirmingCleanup = false;
+        _confirmingRenames = false;
+        _renameChoices.Clear();
         RequestPrimaryFocus();
+    }
+
+    private void BeginRenames()
+    {
+        if (!HasRenameChoices)
+            return;
+
+        _confirmingRenames = true;
+        RequestPrimaryFocus();
+    }
+
+    private void CancelRenames()
+    {
+        _confirmingRenames = false;
+        RequestPrimaryFocus();
+    }
+
+    private async Task ConfirmRenames()
+    {
+        if (_report == null)
+            return;
+
+        _report = GraphState.ResolveRenameCollisions(RenameDecisions);
+        _time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        _confirmingRenames = false;
+        _renameChoices.Clear();
+        RequestPrimaryFocus();
+        await JS.InvokeVoidAsync("storyForgeUi.playSaveFeedback", _report.Outcome.ToString());
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -180,6 +338,7 @@
         _report = GraphState.ClearOrphanContentFiles(_report.OrphanFiles);
         _time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         _confirmingCleanup = false;
+        _renameChoices.Clear();
         RequestPrimaryFocus();
         await JS.InvokeVoidAsync("storyForgeUi.playSaveFeedback", _report.Outcome.ToString());
     }
@@ -188,6 +347,7 @@
     {
         _report = null;
         _confirmingCleanup = false;
+        _confirmingRenames = false;
     }
 
     private void RequestPrimaryFocus()

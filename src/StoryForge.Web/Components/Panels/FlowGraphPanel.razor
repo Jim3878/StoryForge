@@ -31,10 +31,7 @@
                 <div class="graph-inspector-title">@_selectedNodeTitle</div>
                 <div class="graph-inspector-guid">@_selectedNodeGuid</div>
                 @{
-                    // "memo" is excluded here — it moved out of the graph's own Fields entirely and into
-                    // its own NodeContentStore file (see GraphEditorState.SyncNodeContentFiles), rendered
-                    // as its own section below instead of through the generic schema-driven field loop.
-                    var identityFields = _selectedNodeIdentityFields.Where(f => f != "memo").ToList();
+                    var identityFields = _selectedNodeIdentityFields;
                 }
                 @if (identityFields.Count == 0 && _nodeContent == null)
                 {

@@ -41,6 +41,9 @@ window.storyForgeGraph = (function () {
     patchUndoRedoKeys();
     patchPersistViewportOnWheel();
     patchGroupRendering();
+    patchLinearLinkRendering();
+    patchSnapAlignment();
+    patchClipboardKeys();
 
     // Set for the duration of a multi-node drag (see patchEdgeBodyRewiring's beginMultiNodeDrag) so
     // onNodeMoved — which LiteGraph only ever calls once, for whichever node the mouse actually grabbed —
@@ -652,20 +655,10 @@ window.storyForgeGraph = (function () {
 
             const from = originNode.getConnectionPos(false, link.origin_slot);
             const to = targetNode.getConnectionPos(true, link.target_slot);
-            // Same control-point construction as the curve LiteGraph itself renders (renderLink): a
-            // horizontal-tangent cubic bezier, so the sampled curve matches what's actually drawn on screen.
-            const dx = Math.max(40, Math.abs(to[0] - from[0]) * 0.5);
-            const p1 = [from[0] + dx, from[1]];
-            const p2 = [to[0] - dx, to[1]];
-
-            // Sample density scales with the curve's (approximate) length so a long wire doesn't have gaps
-            // wide enough for a click to fall through between samples.
-            const approxLength = distanceBetween(from, p1) + distanceBetween(p1, p2) + distanceBetween(p2, to);
-            const sampleCount = Math.min(300, Math.max(12, Math.round(approxLength / 6)));
-
-            for (let i = 0; i <= sampleCount; i++) {
-                const sampled = sampleCubicBezier(from, p1, p2, to, i / sampleCount);
-                const dist = distanceBetween(sampled, point);
+            // 和畫面上一樣的三段折線（見 linearLinkPoints），直接算點到線段的距離，不用取樣
+            const points = linearLinkPoints(from, to);
+            for (let i = 0; i < points.length - 1; i++) {
+                const dist = distanceToSegment(point, points[i], points[i + 1]);
                 if (dist < bestDist) {
                     bestDist = dist;
                     best = { link: link, nearerToOrigin: distanceBetween(from, point) <= distanceBetween(to, point) };
@@ -681,13 +674,143 @@ window.storyForgeGraph = (function () {
         return Math.sqrt(dx * dx + dy * dy);
     }
 
-    function sampleCubicBezier(p0, p1, p2, p3, t) {
-        const mt = 1 - t;
-        const a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
-        return [
-            a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0],
-            a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1],
-        ];
+    function distanceToSegment(p, a, b) {
+        const abx = b[0] - a[0], aby = b[1] - a[1];
+        const lengthSq = abx * abx + aby * aby;
+        const t = lengthSq === 0 ? 0
+            : Math.max(0, Math.min(1, ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / lengthSq));
+        return distanceBetween(p, [a[0] + t * abx, a[1] + t * aby]);
+    }
+
+    // LiteGraph 的 LINEAR_LINK（和 Unity GraphView 的連線同一種樣子）：從輸出點往右水平伸出 15、
+    // 斜直線、再水平 15 接進輸入點。15 是 LiteGraph renderLink 裡寫死的長度，這裡必須跟它一致，
+    // 點擊判斷才會和畫面上的線完全重合。
+    const LINEAR_LINK_STUB = 15;
+
+    function linearLinkPoints(from, to) {
+        return [from, [from[0] + LINEAR_LINK_STUB, from[1]], [to[0] - LINEAR_LINK_STUB, to[1]], to];
+    }
+
+    // 連線改成直線（LINEAR_LINK），並拿掉每條線中間的小圓點。圓點和 highquality_render 綁在同一個條件
+    // 裡、沒有獨立開關，所以只在畫連線的這一下把 highquality_render 關掉。LiteGraph 另外會把圓點位置
+    // 記在 link._pos（點到那裡會開連線選單），它是用曲線公式算的、會落在直線外面，改成直線中段的中點。
+    function patchLinearLinkRendering() {
+        const originalRenderLink = LGraphCanvas.prototype.renderLink;
+        LGraphCanvas.prototype.renderLink = function (ctx, from, to, link) {
+            const highQuality = this.highquality_render;
+            this.highquality_render = false;
+            try {
+                return originalRenderLink.apply(this, arguments);
+            } finally {
+                this.highquality_render = highQuality;
+                if (link && link._pos) {
+                    link._pos[0] = (from[0] + to[0]) / 2;
+                    link._pos[1] = (from[1] + to[1]) / 2;
+                }
+            }
+        };
+    }
+
+    // 磁吸對齊：只在拖動單一節點時作用（多選一起拖不吸）。拿畫面上看得到的其他節點當目標，
+    // 左緣（X）和上緣（Y）各自吸到螢幕距離 8px 內最近的那個，並畫參考線。拖動時按住 Alt 暫時不吸。
+    // LiteGraph 每次 mousemove 都是把位移量加到節點目前的位置上，所以要另外記住「沒吸附的原始位置」，
+    // 每次先還原、讓 LiteGraph 加上位移、再重新計算吸附，否則吸住之後就拖不開了。
+    const SNAP_THRESHOLD_PX = 8;
+    let snapDrag = null; // { node, rawPos: [x, y], guides: [{ axis: "x" | "y", other }] }
+
+    function patchSnapAlignment() {
+        const originalProcessMouseMove = LGraphCanvas.prototype.processMouseMove;
+        LGraphCanvas.prototype.processMouseMove = function (e) {
+            const node = this.node_dragged;
+            const isSingleNodeDrag = node && !pendingMultiDragNodes && Object.keys(this.selected_nodes).length <= 1;
+            if (!isSingleNodeDrag) {
+                snapDrag = null;
+                return originalProcessMouseMove.call(this, e);
+            }
+
+            if (snapDrag && snapDrag.node === node) {
+                node.pos[0] = snapDrag.rawPos[0];
+                node.pos[1] = snapDrag.rawPos[1];
+            } else {
+                snapDrag = { node: node, rawPos: [node.pos[0], node.pos[1]], guides: [] };
+            }
+
+            const result = originalProcessMouseMove.call(this, e);
+            snapDrag.rawPos = [node.pos[0], node.pos[1]];
+            snapDrag.guides = e.altKey ? [] : snapNodeToNeighbours(this, node);
+            return result;
+        };
+
+        const originalProcessMouseUp = LGraphCanvas.prototype.processMouseUp;
+        LGraphCanvas.prototype.processMouseUp = function (e) {
+            const hadGuides = snapDrag && snapDrag.guides.length > 0;
+            snapDrag = null;
+            const result = originalProcessMouseUp.call(this, e);
+            if (hadGuides)
+                this.setDirty(true, false);
+            return result;
+        };
+    }
+
+    function snapNodeToNeighbours(canvasInstance, node) {
+        const threshold = SNAP_THRESHOLD_PX / canvasInstance.ds.scale;
+        let bestX = null, bestY = null;
+        for (const other of canvasInstance.visible_nodes || []) {
+            if (other === node) continue;
+            const dx = other.pos[0] - node.pos[0];
+            if (Math.abs(dx) <= threshold && (!bestX || Math.abs(dx) < Math.abs(bestX.delta)))
+                bestX = { delta: dx, other: other };
+            const dy = other.pos[1] - node.pos[1];
+            if (Math.abs(dy) <= threshold && (!bestY || Math.abs(dy) < Math.abs(bestY.delta)))
+                bestY = { delta: dy, other: other };
+        }
+
+        const guides = [];
+        if (bestX) {
+            node.pos[0] += bestX.delta;
+            guides.push({ axis: "x", other: bestX.other });
+        }
+        if (bestY) {
+            node.pos[1] += bestY.delta;
+            guides.push({ axis: "y", other: bestY.other });
+        }
+        return guides;
+    }
+
+    // 在 onDrawOverlay 的螢幕座標裡畫：左緣對齊畫一條直的、上緣對齊畫一條橫的（在標題列頂端），
+    // 範圍涵蓋被拖的節點和對齊目標兩者
+    function drawSnapGuides(ctx) {
+        if (ctx !== canvas.ctx || !snapDrag || snapDrag.guides.length === 0) return;
+
+        const scale = canvas.ds.scale, offset = canvas.ds.offset;
+        const titleHeight = LiteGraph.NODE_TITLE_HEIGHT || 30;
+        const toScreen = (x, y) => [(x + offset[0]) * scale, (y + offset[1]) * scale];
+        const node = snapDrag.node;
+
+        ctx.save();
+        ctx.strokeStyle = "#4fc3f7";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        for (const guide of snapDrag.guides) {
+            const other = guide.other;
+            if (guide.axis === "x") {
+                const top = Math.min(node.pos[1], other.pos[1]) - titleHeight;
+                const bottom = Math.max(node.pos[1] + node.size[1], other.pos[1] + other.size[1]);
+                const a = toScreen(node.pos[0], top), b = toScreen(node.pos[0], bottom);
+                ctx.moveTo(Math.round(a[0]) + 0.5, a[1]);
+                ctx.lineTo(Math.round(b[0]) + 0.5, b[1]);
+            } else {
+                const y = node.pos[1] - titleHeight;
+                const left = Math.min(node.pos[0], other.pos[0]);
+                const right = Math.max(node.pos[0] + node.size[0], other.pos[0] + other.size[0]);
+                const a = toScreen(left, y), b = toScreen(right, y);
+                ctx.moveTo(a[0], Math.round(a[1]) + 0.5);
+                ctx.lineTo(b[0], Math.round(b[1]) + 0.5);
+            }
+        }
+        ctx.stroke();
+        ctx.restore();
     }
 
     // Detaches the grabbed link completely (regardless of which end was clicked — a rewire always yields
@@ -1111,7 +1234,11 @@ window.storyForgeGraph = (function () {
     // would make 複製 a destructive action on an unrelated node. Skipping just that one connection is a far
     // smaller surprise than quietly breaking someone else's link.
     async function duplicateSelectedNodes(canvasInstance) {
-        const sourceNodes = Object.values(canvasInstance.selected_nodes || {});
+        await duplicateNodes(canvasInstance, Object.values(canvasInstance.selected_nodes || {}), [30, 30]);
+    }
+
+    // offset：新節點相對來源節點的位移（右鍵「複製」固定往右下 30；Ctrl+V 則是讓整批落在滑鼠位置）
+    async function duplicateNodes(canvasInstance, sourceNodes, offset) {
         if (sourceNodes.length === 0)
             return;
 
@@ -1134,7 +1261,7 @@ window.storyForgeGraph = (function () {
                 continue;
 
             const newGuid = crypto.randomUUID();
-            newNode.pos = [sourceNode.pos[0] + 30, sourceNode.pos[1] + 30];
+            newNode.pos = [sourceNode.pos[0] + offset[0], sourceNode.pos[1] + offset[1]];
             const naturalSize = newNode.computeSize();
             newNode.size = [Math.max(sourceNode._baseWidth || 0, naturalSize[0]), naturalSize[1]];
             newNode.title = " "; // see init()'s node loop for why not ""
@@ -1186,6 +1313,48 @@ window.storyForgeGraph = (function () {
             canvasInstance.selectNodes(createdNodes);
         canvasInstance.setDirty(true, true);
         commitUndoableChange();
+    }
+
+    // Ctrl+C / Ctrl+V — LiteGraph 原生的剪貼簿只複製畫布上的空殼節點：沒有 GUID（存檔時被略過，存完就消失）、
+    // 沒有標題，也沒有伺服器端的欄位與劇本內容。改成 Ctrl+C 只記住選取了哪些節點，Ctrl+V 走和右鍵「複製」
+    // 同一套 duplicateNodes，整批放到滑鼠位置（以這批節點的左上角對齊游標，相對位置不變）。
+    // 記的是 GUID 而不是節點物件：復原／重做會重建所有節點物件，GUID 才是穩定的。
+    let copiedNodeGuids = [];
+
+    function patchClipboardKeys() {
+        const originalProcessKey = LGraphCanvas.prototype.processKey;
+        LGraphCanvas.prototype.processKey = function (e) {
+            const targetName = e.target && e.target.localName;
+            const isEditableTarget = targetName === "input" || targetName === "textarea";
+            if (!isEditableTarget && e.type === "keydown" && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+                const key = (e.key || "").toLowerCase();
+                if (key === "c") {
+                    copiedNodeGuids = Object.values(this.selected_nodes || {})
+                        .map(node => guidByNode.get(node))
+                        .filter(Boolean);
+                    e.preventDefault();
+                    return false;
+                }
+                if (key === "v") {
+                    pasteCopiedNodes(this);
+                    e.preventDefault();
+                    return false;
+                }
+            }
+            return originalProcessKey.call(this, e);
+        };
+    }
+
+    function pasteCopiedNodes(canvasInstance) {
+        const sourceNodes = copiedNodeGuids.map(guid => nodesByGuid.get(guid))
+            .filter(node => node && node.graph === canvasInstance.graph);
+        if (sourceNodes.length === 0)
+            return;
+
+        const left = Math.min(...sourceNodes.map(node => node.pos[0]));
+        const top = Math.min(...sourceNodes.map(node => node.pos[1]));
+        const mouse = canvasInstance.graph_mouse || [left + 30, top + 30];
+        duplicateNodes(canvasInstance, sourceNodes, [mouse[0] - left, mouse[1] - top]);
     }
 
     // Delete key (native processKey, gated on the canvas having focus and the event not targeting a text
@@ -1385,7 +1554,11 @@ window.storyForgeGraph = (function () {
         canvas = new LGraphCanvas("#" + canvasElementId, graph);
         canvas.allow_searchbox = false;
         canvas.render_canvas_border = false;
-        canvas.onDrawOverlay = drawFrozenLabels;
+        canvas.links_render_mode = LiteGraph.LINEAR_LINK;
+        canvas.onDrawOverlay = function (ctx) {
+            drawFrozenLabels(ctx);
+            drawSnapGuides(ctx);
+        };
 
         // Single-selection only for now (the inspector sidebar shows one node's fields at a time) — with
         // more than one selected, or none, there's nothing for it to show.

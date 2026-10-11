@@ -4,6 +4,11 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Single-user desktop app, not a high-throughput server: the Web SDK's default Server GC (one heap per
+         core) stalled the whole process for ~6 s on its very first gen0 collection at startup, and again for
+         over a second at the next gen2 — that's what kept the flow graph stuck on 「正在載入流程圖資料」.
+         Workstation concurrent GC keeps pauses short. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
     <!-- Baked into AssemblyInformationalVersion below, so it changes on every real `dotnet build`/`publish`
          invocation (forces AssemblyInfo regeneration since the string differs from the cached one), unlike
          reading a source file's own last-write time, which says nothing about whether the running process

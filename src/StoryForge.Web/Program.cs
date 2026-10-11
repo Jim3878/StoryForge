@@ -5,10 +5,6 @@ using StoryForge.Web.Components;
 using StoryForge.Web.GraphEditor;
 using StoryForge.Web.UpdateCheck;
 
-// Must run before AppSettings.LoadOrDefault() below ever executes — see LegacyToolMigration's own comment
-// for why this has to happen inside the real app process rather than via an external tool.
-LegacyToolMigration.MigrateIfNeeded();
-
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.

@@ -338,6 +338,9 @@ public sealed class GraphDocumentModel
 
     public void MarkClean() => _lastCleanJson = SerializeCanonical();
 
+    // 最後一次載入／存檔時的正規化 JSON（MarkClean 算好的），讓呼叫端不必再序列化一次
+    public string? LastCleanJson => _lastCleanJson;
+
     public string SerializeCanonical() => CanonicalGraphJson.Serialize(BuildCanonicalDocument(), Schema);
 
     public ProcessNodeTypeSchema? GetSchema(string typeName)

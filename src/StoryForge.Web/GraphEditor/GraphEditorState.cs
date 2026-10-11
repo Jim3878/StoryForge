@@ -57,6 +57,12 @@ public sealed class GraphEditorState
     // Unity 的檔案在上次匯入／匯出後被改過（載入、存檔、匯入、匯出時檢查）
     public bool UnityHasNewVersion { get; private set; }
 
+    // 第一次 LoadGraph 結束（成功或失敗都算）時完成。劇本管線狀態的第一次重新整理會等它：
+    // 一來它需要流程圖的劇本名稱，二來兩邊同時讀大檔會互搶 CPU／GC，讓流程圖開很久。
+    private readonly TaskCompletionSource _firstLoadCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task FirstLoadCompleted => _firstLoadCompleted.Task;
+
     public GraphEditorPayload LoadGraph()
     {
         var prefix = _statusPrefix;
@@ -99,7 +105,7 @@ public sealed class GraphEditorState
                 StatusMessage = $"尚無藍圖，已從 Unity 載入：{_model.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組";
             }
 
-            RefreshSyncState(_model.BuildCanonicalDocument());
+            RefreshSyncState();
             StatusMessage = prefix + StatusMessage + DescribeSyncState() + DescribeContentFileState();
             return ToPayload();
         }
@@ -107,6 +113,10 @@ public sealed class GraphEditorState
         {
             StatusMessage = prefix + $"載入失敗：{e.Message}";
             return new GraphEditorPayload();
+        }
+        finally
+        {
+            _firstLoadCompleted.TrySetResult();
         }
     }
 
@@ -326,21 +336,61 @@ public sealed class GraphEditorState
         return backupPath;
     }
 
-    // 載入、存檔時更新「藍圖有未匯出的修改」與「Unity 有新版本」
-    private void RefreshSyncState(CanonicalGraphDocument savedGraph)
+    // 載入、存檔時更新「藍圖有未匯出的修改」與「Unity 有新版本」。
+    // 每次存檔都會跑：基準版只在換掉 _baseGraph 時重新正規化，Unity 版只在檔案的修改時間／大小變了才重讀，
+    // 目前版本直接用 MarkClean 剛算好的 JSON，避免一次存檔做好幾次整張圖的序列化。
+    private void RefreshSyncState()
     {
-        if (_model == null || _baseGraph == null)
+        if (_model?.LastCleanJson is not { } savedJson || _baseGraph == null)
             return;
 
-        HasUnexportedChanges = !CanonicalGraphJson.Equivalent(savedGraph, _baseGraph, _model.Schema);
+        var baseJson = GetBaseGraphJson();
+        HasUnexportedChanges = !string.Equals(savedJson, baseJson, StringComparison.Ordinal);
         try
         {
-            UnityHasNewVersion = !CanonicalGraphJson.Equivalent(ReadUnityGraph(), _baseGraph, _model.Schema);
+            UnityHasNewVersion = !string.Equals(GetUnityGraphJson(), baseJson, StringComparison.Ordinal);
         }
         catch
         {
             UnityHasNewVersion = false;
         }
+    }
+
+    // 正規化依 schema 的欄位順序，所以快取也要跟著 schema（每次 LoadGraph 都是新的物件）
+    private CanonicalGraphDocument? _baseGraphJsonSource;
+    private ProcessNodeSchemaDocument? _baseGraphJsonSchema;
+    private string? _baseGraphJson;
+
+    private string GetBaseGraphJson()
+    {
+        var schema = _model?.Schema;
+        if (!ReferenceEquals(_baseGraphJsonSource, _baseGraph) || !ReferenceEquals(_baseGraphJsonSchema, schema)
+            || _baseGraphJson == null)
+        {
+            _baseGraphJson = CanonicalGraphJson.Serialize(_baseGraph!, schema);
+            _baseGraphJsonSource = _baseGraph;
+            _baseGraphJsonSchema = schema;
+        }
+        return _baseGraphJson;
+    }
+
+    private (string Path, DateTime Modified, long Length, ProcessNodeSchemaDocument? Schema)? _unityGraphJsonKey;
+    private string? _unityGraphJson;
+
+    private string GetUnityGraphJson()
+    {
+        var info = new FileInfo(_unityGraphPath ?? string.Empty);
+        if (!info.Exists)
+            throw new FileNotFoundException("找不到 Unity 的流程圖 JSON。", _unityGraphPath);
+
+        var key = (info.FullName, info.LastWriteTimeUtc, info.Length, _model?.Schema);
+        if (_unityGraphJsonKey is not { } cached || cached.Path != key.FullName || cached.Modified != key.LastWriteTimeUtc
+            || cached.Length != key.Length || !ReferenceEquals(cached.Schema, key.Schema) || _unityGraphJson == null)
+        {
+            _unityGraphJson = CanonicalGraphJson.Serialize(ReadUnityGraph(), _model?.Schema);
+            _unityGraphJsonKey = key;
+        }
+        return _unityGraphJson;
     }
 
     private string DescribeSyncState()
@@ -361,7 +411,7 @@ public sealed class GraphEditorState
         var graph = _model.BuildCanonicalDocument();
         WriteBlueprint(graph, _baseGraph);
         _model.MarkClean();
-        RefreshSyncState(graph);
+        RefreshSyncState();
     }
 
     private void WriteBlueprint(CanonicalGraphDocument graph, CanonicalGraphDocument baseGraph)
@@ -585,10 +635,11 @@ public sealed class GraphEditorState
         }
     }
 
-    private void AppendRenameCollisionWarning(List<string> renameCollisions)
+    private void AppendRenameCollisionWarning(List<RenameCollision> renameCollisions)
     {
         if (renameCollisions.Count > 0)
-            StatusMessage += $"；{renameCollisions.Count} 個劇本檔改名失敗（目標名稱已有其他內容檔）：{string.Join("、", renameCollisions)}";
+            StatusMessage += $"；{renameCollisions.Count} 個劇本檔改名衝突（新名稱已有其他檔案，請在存檔結果中選擇處理方式）：" +
+                             string.Join("、", renameCollisions.Select(c => c.Title));
     }
 
     // 載入時附在狀態列的內容檔狀態：檔名待同步（節點在別處改了名）、孤兒內容檔（流程圖上已無對應節點）、
@@ -625,9 +676,7 @@ public sealed class GraphEditorState
             .ToList();
         var liveGuids = new HashSet<string>(liveNodes.Select(n => n.Guid), StringComparer.Ordinal);
 
-        var pendingRename = liveNodes.Count(n =>
-            !string.IsNullOrEmpty(n.IdentityValue) && index.TryGetValue(n.Guid, out var basePath) &&
-            !IsAtExpectedPath(dataFolder, basePath, n.IdentityValue!, n.Guid));
+        var renamePlan = PlanRenames();
         foreach (var pair in index
                      .Where(pair => !liveGuids.Contains(pair.Key) && !duplicateGuids.Contains(pair.Key))
                      .OrderBy(pair => pair.Value, StringComparer.OrdinalIgnoreCase))
@@ -646,8 +695,10 @@ public sealed class GraphEditorState
             .Select(path => Path.GetRelativePath(dataFolder, path))
             .ToList();
 
-        if (pendingRename > 0)
-            summary.Add($"{pendingRename} 個劇本檔檔名待同步（存檔時自動更新）");
+        if (renamePlan.Ready.Count > 0)
+            summary.Add($"{renamePlan.Ready.Count} 個劇本檔檔名待同步（存檔時自動更新）");
+        if (renamePlan.Collisions.Count > 0)
+            summary.Add($"{renamePlan.Collisions.Count} 個劇本檔改名衝突（新名稱已有其他檔案，存檔後選擇處理方式）");
         if (orphans.Count > 0)
         {
             summary.Add($"{orphans.Count} 個孤兒內容檔（流程圖上已無對應節點）");
@@ -664,18 +715,17 @@ public sealed class GraphEditorState
         return new ContentFileState(summary, details, orphans);
     }
 
-    // 存檔成功後的紀錄：數量、存檔位置、內容檔狀態；有改名失敗時為「有警告」
-    private SaveReport BuildSaveReport(string title, List<string> renameCollisions, string? extraLine = null)
+    // 存檔成功後的紀錄：數量、存檔位置、內容檔狀態；有改名衝突時為「有警告」，衝突本身由彈窗另外列出讓使用者選擇
+    private SaveReport BuildSaveReport(string title, List<RenameCollision> renameCollisions,
+        IEnumerable<string>? extraLines = null)
     {
         var details = new List<string>
         {
             $"{_model!.Nodes.Count} 節點、{_model.Edges.Count} 連線、{_model.Groups.Count} 群組",
             $"存檔位置：{_blueprintPath}",
         };
-        if (extraLine != null)
-            details.Add(extraLine);
-
-        details.AddRange(renameCollisions.Select(collision => $"內容檔改名失敗（目標名稱已有其他內容檔）：{collision}"));
+        if (extraLines != null)
+            details.AddRange(extraLines);
 
         var fileState = GetContentFileState();
         details.AddRange(fileState.Summary);
@@ -683,7 +733,80 @@ public sealed class GraphEditorState
 
         var hasWarnings = renameCollisions.Count > 0 || fileState.Summary.Count > 0;
         return new SaveReport(hasWarnings ? SaveOutcome.Warning : SaveOutcome.Success,
-            hasWarnings ? title + "（有警告）" : title, details, fileState.Orphans);
+            hasWarnings ? title + "（有警告）" : title, details, fileState.Orphans, renameCollisions);
+    }
+
+    // 存檔結果彈窗確認後才會進到這裡。重新掃描，只處理和使用者看到時完全相同（同檔案、同大小與修改時間）的衝突；
+    // 被取代的檔案一律移到 Windows 資源回收筒，不直接刪除。
+    public SaveReport ResolveRenameCollisions(IReadOnlyList<RenameCollisionDecision> decisions)
+    {
+        if (_model == null)
+            return new SaveReport(SaveOutcome.Failure, "改名衝突處理失敗", new[] { "流程圖尚未載入。" });
+
+        var dataFolder = _appSettings.ExternalDataFolder;
+        NodeFileIndex.Rebuild(dataFolder);
+        var current = PlanRenames().Collisions.ToDictionary(c => c.Guid, StringComparer.Ordinal);
+        var lines = new List<string>();
+
+        foreach (var decision in decisions.Where(d => d.Choice != RenameCollisionChoice.Skip))
+        {
+            var expected = decision.Collision;
+            if (!current.TryGetValue(expected.Guid, out var collision) || !collision.SameFilesAs(expected))
+            {
+                lines.Add($"略過（檔案在確認前已改變，請重新存檔後再選擇）：{expected.Title}");
+                continue;
+            }
+
+            if (!collision.CanResolve)
+            {
+                lines.Add($"略過（新名稱屬於另一個節點）：{collision.Title}");
+                continue;
+            }
+
+            try
+            {
+                if (decision.Choice == RenameCollisionChoice.Overwrite)
+                {
+                    RecycleContentFile(collision.TargetBase + ".json");
+                    RecycleContentFile(collision.TargetBase + ".md");
+                    RenameScriptFiles(dataFolder, collision.CurrentBase, collision.NewName, collision.Guid);
+                    lines.Add($"已用目前的內容檔覆蓋：{collision.Title}");
+                }
+                else
+                {
+                    RecycleContentFile(collision.TargetBase + ".json");
+                    RecycleContentFile(collision.CurrentBase + ".md");
+                    RenameScriptFiles(dataFolder, collision.CurrentBase, collision.NewName, collision.Guid);
+                    RetitleScript(collision.TargetBase + ".md", collision.NewName);
+                    lines.Add($"已採用新位置的劇本：{collision.Title}");
+                }
+            }
+            catch (Exception e)
+            {
+                lines.Add($"處理失敗：{collision.Title}（{e.Message}）");
+            }
+        }
+
+        if (lines.Count == 0)
+            lines.Add("沒有選擇要處理的改名衝突。");
+
+        NodeFileIndex.Rebuild(dataFolder);
+        return BuildSaveReport("改名衝突處理完成", PlanRenames().Collisions, lines);
+    }
+
+    // 只允許把 Nodes 資料夾內的內容檔移到資源回收筒；檔案不存在時什麼都不做
+    private void RecycleContentFile(string path)
+    {
+        if (!File.Exists(path))
+            return;
+
+        var contentRoot = Path.GetFullPath(Path.Combine(_appSettings.ExternalDataFolder, "Nodes"))
+                          + Path.DirectorySeparatorChar;
+        var fullPath = Path.GetFullPath(path);
+        if (!fullPath.StartsWith(contentRoot, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"拒絕處理 Nodes 資料夾外的路徑：{fullPath}");
+
+        FileSystem.DeleteFile(fullPath, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
     }
 
     // 存檔結果 modal 的第二次確認才會進到這裡。重新掃描並逐項比對後，只有仍然是孤兒、
@@ -753,7 +876,7 @@ public sealed class GraphEditorState
         var hasWarnings = skipped.Count > 0 || failures.Count > 0 || remainingState.Summary.Count > 0;
         return new SaveReport(hasWarnings ? SaveOutcome.Warning : SaveOutcome.Success,
             hasWarnings ? "孤兒清除完成（有警告）" : "孤兒清除完成",
-            details, remainingState.Orphans);
+            details, remainingState.Orphans, PlanRenames().Collisions);
     }
 
     private static bool SameOrphanSet(
@@ -781,17 +904,19 @@ public sealed class GraphEditorState
         return string.Equals(basePath, $"{plainBase}-{suffix}", StringComparison.OrdinalIgnoreCase);
     }
 
-    // 每次存檔前執行：依 GUID 索引找到每個劇本節點的內容檔，檔名和目前的劇本名稱對不上時（在 StoryForge、
-    // Unity 或切換分支時改了名），把 .json/.md 搬到新名稱。目標名稱已經被其他內容檔佔用時不搬也不覆蓋
-    // （對方可能是孤兒檔，裡面仍有劇情內容），回報給呼叫端顯示警告，直到使用者處理為止。
-    private List<string> SyncRenamedScriptFiles()
+    private sealed record RenameTarget(string Guid, string CurrentBase, string NewName);
+
+    private sealed record RenamePlan(List<RenameTarget> Ready, List<RenameCollision> Collisions);
+
+    // 依 GUID 索引找到每個劇本節點的內容檔，檔名和目前的劇本名稱對不上時（在 StoryForge、Unity 或切換分支時改了名）
+    // 列為待改名。新名稱的位置已經有其他檔案時列為衝突：不搬也不覆蓋（對方可能仍有劇情內容），交給使用者選擇。
+    private RenamePlan PlanRenames()
     {
+        var plan = new RenamePlan(new List<RenameTarget>(), new List<RenameCollision>());
         if (_model == null)
-            return new List<string>();
+            return plan;
 
         var dataFolder = _appSettings.ExternalDataFolder;
-        var collisions = new List<string>();
-
         foreach (var node in _model.Nodes)
         {
             if (node.TypeName != PlayscriptProcessNodeTypeName || node.IsMarkedForDeletion ||
@@ -802,27 +927,112 @@ public sealed class GraphEditorState
             if (currentBase == null || IsAtExpectedPath(dataFolder, currentBase, node.IdentityValue!, node.Guid))
                 continue;
 
-            var occupant = NodeContentStore.ReadAtPlainPath(dataFolder, node.IdentityValue!);
+            var newName = node.IdentityValue!;
+            var targetBase = NodeContentStore.ResolvePlainBasePath(dataFolder, newName);
+            RenameCollisionKind? kind = null;
+
+            var occupant = NodeContentStore.ReadAtPlainPath(dataFolder, newName);
             if (occupant != null && occupant.Guid != node.Guid)
             {
-                var occupantIsLive = _model.Nodes.Any(n => n.Guid == occupant.Guid && !n.IsMarkedForDeletion);
-                collisions.Add($"{Path.GetFileName(currentBase)} → {node.IdentityValue}" +
-                               (occupantIsLive ? string.Empty : "（目標名稱是孤兒內容檔）"));
-                continue;
+                kind = _model.Nodes.Any(n => n.Guid == occupant.Guid && !n.IsMarkedForDeletion)
+                    ? RenameCollisionKind.TargetLiveNode
+                    : RenameCollisionKind.TargetOrphan;
             }
-
             // 目標名稱只有 .md 劇本檔、沒有 .json 時（例如先從 Sheet 下載過劇本），同樣不覆蓋
-            if (occupant == null &&
-                File.Exists(NodeContentStore.ResolvePlainBasePath(dataFolder, node.IdentityValue!) + ".md"))
+            else if (occupant == null && File.Exists(targetBase + ".md"))
             {
-                collisions.Add($"{Path.GetFileName(currentBase)} → {node.IdentityValue}（目標名稱已有劇本檔）");
+                kind = RenameCollisionKind.TargetScriptOnly;
+            }
+
+            if (kind == null)
+            {
+                plan.Ready.Add(new RenameTarget(node.Guid, currentBase, newName));
                 continue;
             }
 
-            RenameScriptFiles(dataFolder, currentBase, node.IdentityValue!, node.Guid);
+            plan.Collisions.Add(new RenameCollision(
+                node.Guid, currentBase, targetBase,
+                Path.GetRelativePath(dataFolder, currentBase), Path.GetRelativePath(dataFolder, targetBase),
+                newName, kind.Value,
+                DescribeContentFiles(dataFolder, currentBase), DescribeContentFiles(dataFolder, targetBase)));
         }
 
-        return collisions;
+        return plan;
+    }
+
+    // 每次存檔前執行：沒有衝突的改名直接搬檔，衝突回傳給呼叫端，由存檔結果彈窗讓使用者選擇
+    private List<RenameCollision> SyncRenamedScriptFiles()
+    {
+        var plan = PlanRenames();
+        foreach (var target in plan.Ready)
+            RenameScriptFiles(_appSettings.ExternalDataFolder, target.CurrentBase, target.NewName, target.Guid);
+
+        return plan.Collisions;
+    }
+
+    private static List<ContentFileInfo> DescribeContentFiles(string dataFolder, string basePath)
+    {
+        var files = new List<ContentFileInfo>();
+        foreach (var extension in new[] { ".json", ".md" })
+        {
+            var path = basePath + extension;
+            if (!File.Exists(path))
+                continue;
+
+            var info = new FileInfo(path);
+            string summary;
+            try
+            {
+                var text = File.ReadAllText(path);
+                summary = extension == ".md" ? DescribeScriptText(text) : DescribeEntryText(text);
+            }
+            catch (Exception e)
+            {
+                summary = $"無法讀取（{e.Message}）";
+            }
+
+            files.Add(new ContentFileInfo(Path.GetRelativePath(dataFolder, path), info.Length,
+                info.LastWriteTime, summary));
+        }
+
+        return files;
+    }
+
+    // 劇本表格中至少有一格有內容的列數（不含表頭）
+    private static string DescribeScriptText(string text)
+    {
+        var rows = 0;
+        var pastSeparator = false;
+        foreach (var rawLine in text.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (!line.StartsWith('|'))
+                continue;
+
+            var cells = line.Trim('|').Split('|').Select(cell => cell.Trim()).ToList();
+            if (!pastSeparator)
+            {
+                pastSeparator = cells.All(cell => cell.Length > 0 && cell.All(ch => ch == '-' || ch == ':'));
+                continue;
+            }
+
+            if (cells.Any(cell => cell.Length > 0))
+                rows++;
+        }
+
+        return rows == 0 ? "空白劇本" : $"{rows} 列有內容";
+    }
+
+    // 節點資料（備註、衝突、角色…）中有內容的欄位數
+    private static string DescribeEntryText(string text)
+    {
+        var entry = JObject.Parse(text);
+        var filled = entry.Properties().Count(property =>
+            property.Name != nameof(NodeContentEntry.Guid) &&
+            property.Name != nameof(NodeContentEntry.PlayscriptName) &&
+            property.Value.Type == JTokenType.String &&
+            !string.IsNullOrWhiteSpace(property.Value.Value<string>()));
+        return filled == 0 ? "節點資料空白" : $"節點資料 {filled} 個欄位有內容";
     }
 
     // 把一個節點的 .json（更新劇本名稱）與 .md（只改第一行「# 標題」，其餘是 AI 工具寫的劇本內容不動）
@@ -849,21 +1059,36 @@ public sealed class GraphEditorState
         var oldMdPath = oldBase + ".md";
         if (File.Exists(oldMdPath))
         {
-            var content = File.ReadAllText(oldMdPath);
-            var newlineIndex = content.IndexOf('\n');
-            var firstLine = newlineIndex >= 0 ? content[..newlineIndex] : content;
-            var rest = newlineIndex >= 0 ? content[newlineIndex..] : string.Empty;
-            var updated = firstLine.TrimStart().StartsWith("# ") ? $"# {newName}{rest}" : content;
-            File.WriteAllText(newBase + ".md", updated);
+            File.WriteAllText(newBase + ".md", RetitleScriptText(File.ReadAllText(oldMdPath), newName));
             File.Delete(oldMdPath);
         }
+    }
+
+    private static void RetitleScript(string mdPath, string newName)
+    {
+        if (!File.Exists(mdPath))
+            return;
+
+        var content = File.ReadAllText(mdPath);
+        var updated = RetitleScriptText(content, newName);
+        if (updated != content)
+            File.WriteAllText(mdPath, updated);
+    }
+
+    // 只改第一行「# 標題」，其餘是 AI 工具寫的劇本內容不動
+    private static string RetitleScriptText(string content, string newName)
+    {
+        var newlineIndex = content.IndexOf('\n');
+        var firstLine = newlineIndex >= 0 ? content[..newlineIndex] : content;
+        var rest = newlineIndex >= 0 ? content[newlineIndex..] : string.Empty;
+        return firstLine.TrimStart().StartsWith("# ") ? $"# {newName}{rest}" : content;
     }
 
     // One node queued for 建立劇本檔: either ready to sync immediately (no plain-path collision) or stuck
     // behind an orphaned file — content from some other, no-longer-live node's guid still occupying the
     // plain path — that needs the user's explicit go-ahead before ScriptFileSyncPlan.Ready's write would
     // otherwise overwrite it silently.
-    public readonly record struct ScriptFileSyncItem(string Guid, string PlayscriptName, string CurrentMemo);
+    public readonly record struct ScriptFileSyncItem(string Guid, string PlayscriptName);
 
     public sealed class ScriptFileSyncPlan
     {
@@ -871,15 +1096,8 @@ public sealed class GraphEditorState
         public List<ScriptFileSyncItem> Conflicts { get; init; } = new();
     }
 
-    // One-time-per-node migration + on-demand sync: memo used to live inside the node's own Fields (a real
-    // Unity schema field that never should have been one — see conversation history; Unity's own schema
-    // still declares it, but that's a Unity-side mistake outside this tool's reach to fix). It now lives
-    // only in its own NodeContentStore file, so syncing both seeds a brand-new file from whatever's still in
-    // Fields (once) and strips the key out of Fields going forward so it doesn't linger duplicated in
-    // blueprint.json. The only caller is PipelineStatusPanel's own 建立劇本檔 button (not flow-graph
-    // load/save) — that panel owns the row-checkbox selection in its grid, so this only touches nodes whose
-    // playscriptId is in selectedPlayscriptNames, matching whatever rows the user currently has checked
-    // there.
+    // The only caller is PipelineStatusPanel's 建立劇本檔 button. It creates the separate StoryForge
+    // content/template files for the selected playscript nodes; canonical Unity node data is untouched.
     //
     // playscriptId is enforced unique among live nodes at edit time (UpdateNodeField), so two selected
     // names can no longer collide with EACH OTHER — a plain-path collision found here can only be a
@@ -901,8 +1119,7 @@ public sealed class GraphEditorState
 
         foreach (var n in nodes)
         {
-            var memo = n.Fields.TryGetValue("memo", out var m) ? m?.ToString() ?? string.Empty : string.Empty;
-            var item = new ScriptFileSyncItem(n.Guid, n.IdentityValue!, memo);
+            var item = new ScriptFileSyncItem(n.Guid, n.IdentityValue!);
 
             var existing = NodeContentStore.ReadAtPlainPath(_appSettings.ExternalDataFolder, n.IdentityValue!);
             if (existing != null && existing.Guid != n.Guid)
@@ -919,11 +1136,8 @@ public sealed class GraphEditorState
     // has already guaranteed nothing else currently owns the plain path for any of these names.
     public int SyncNodeContentFiles(IReadOnlyCollection<ScriptFileSyncItem> ready)
     {
-        foreach (var item in ready)
-            _model?.FindNode(item.Guid)?.Fields.Remove("memo");
-
         NodeContentStore.SyncAll(_appSettings.ExternalDataFolder,
-            ready.Select(i => (i.Guid, i.PlayscriptName, i.CurrentMemo)));
+            ready.Select(i => (i.Guid, i.PlayscriptName)));
         NodeScriptTableStore.SyncAll(_appSettings.ExternalDataFolder,
             ready.Select(i => (i.Guid, i.PlayscriptName)));
 
@@ -936,13 +1150,10 @@ public sealed class GraphEditorState
     // reclaim the plain name for this node.
     public void OverwriteNodeContentFile(ScriptFileSyncItem item)
     {
-        _model?.FindNode(item.Guid)?.Fields.Remove("memo");
-
         NodeContentStore.WriteAtPlainPath(_appSettings.ExternalDataFolder, new NodeContentEntry
         {
             Guid = item.Guid,
             PlayscriptName = item.PlayscriptName,
-            Memo = item.CurrentMemo,
         });
         NodeScriptTableStore.WriteTemplateAtPlainPath(_appSettings.ExternalDataFolder, item.PlayscriptName);
     }
@@ -1101,14 +1312,25 @@ public sealed class GraphEditorState
     // Every node's current identity value (playscriptId/flagId) — the live in-memory equivalent of the
     // original tool's ProcessGraphPanel.GetLivePlayscriptIds(), used by PipelineStatusState's 流程圖 column.
     public IEnumerable<string> GetPlayscriptIdentities() =>
-        _model?.Nodes.Where(n => !n.IsMarkedForDeletion && !string.IsNullOrEmpty(n.IdentityValue))
+        _model?.Nodes.Where(n => !n.IsMarkedForDeletion && DefinesPlayscript(n) &&
+                                 !string.IsNullOrEmpty(n.IdentityValue))
             .Select(n => n.IdentityValue!) ?? Enumerable.Empty<string>();
 
     // Null when the playscript has no live graph node (listed in the Sheet index but never added to the
     // flow graph) — callers resolving a file path for it fall back to NodeContentStore's plain (non-guid)
     // path the same way PipelineStatusState's "本地劇本" column already does for a leftover file.
     public string? FindNodeGuidForPlayscript(string playscriptName) =>
-        _model?.Nodes.FirstOrDefault(n => !n.IsMarkedForDeletion && n.IdentityValue == playscriptName)?.Guid;
+        _model?.Nodes.FirstOrDefault(n => !n.IsMarkedForDeletion && DefinesPlayscript(n) &&
+                                          n.IdentityValue == playscriptName)?.Guid;
+
+    // 劇本 (playscript) and 開啟劇本 (unlock-passive) nodes each define a playscript — most of the graph's
+    // _s/_t/_v functional playscripts exist only as a 開啟劇本 node. A 劇本條件 (playscript-flag) node's
+    // playscriptId instead names some existing playscript whose 完成/解鎖 state it tests, so it is expected
+    // to repeat another node's name: it is never made unique, never counts as the playscript being on the
+    // graph, and is never the node a playscript name resolves to.
+    private const string PlayscriptConditionNodeTypeName = "playscript-flag";
+
+    private static bool DefinesPlayscript(GraphNodeVm node) => node.TypeName != PlayscriptConditionNodeTypeName;
 
     // Node identity/memo fields aren't part of the canvas rendering at all (LiteGraph never sees them), so
     // this itself needs no round trip through JS — it goes straight into the live model, the same one 存檔
@@ -1133,7 +1355,7 @@ public sealed class GraphEditorState
             return value;
         }
 
-        if (fieldName == "playscriptId")
+        if (fieldName == "playscriptId" && DefinesPlayscript(node))
             value = MakeUniquePlayscriptId(nodeGuid, value);
 
         node.Fields[fieldName] = value;
@@ -1145,14 +1367,15 @@ public sealed class GraphEditorState
     // unused "_N" suffix rather than allowing two live nodes to share a name, per explicit product
     // decision: a duplicate identity silently breaks the C# factory codegen (two playscripts would resolve
     // to the same output class/file) and confuses the Pipeline Status/本地劇本 file-per-name bookkeeping.
-    // flagId nodes are exempt — flags are expected to repeat.
+    // flagId nodes are exempt — flags are expected to repeat, and so are 劇本條件 nodes (see
+    // DefinesPlayscript): only nodes that define a playscript have to be unique among themselves.
     private string MakeUniquePlayscriptId(string nodeGuid, string candidate)
     {
         if (_model == null)
             return candidate;
 
         bool CollidesWith(string v) => _model.Nodes.Any(n =>
-            n.Guid != nodeGuid && !n.IsMarkedForDeletion &&
+            n.Guid != nodeGuid && !n.IsMarkedForDeletion && DefinesPlayscript(n) &&
             n.Fields.TryGetValue("playscriptId", out var existing) &&
             string.Equals(existing?.ToString(), v, StringComparison.Ordinal));
 
