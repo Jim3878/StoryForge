@@ -634,9 +634,9 @@
         await InvokeAsync(StateHasChanged);
     }
 
-    // Called by column-sort.js after a drag completes — SortableJS already physically moved the <th> in
-    // the DOM itself; this just updates the C# source of truth to match and re-renders from it, so a
-    // stray external DOM mutation never drifts out of sync with what Blazor thinks the column order is.
+    // Called with SortableJS's draggable indices (which exclude the fixed select-all header). The JS side
+    // restores SortableJS's temporary DOM move first, then this updates the C# source of truth and lets
+    // Blazor render both the header and every body row in the same new order.
     [JSInvokable]
     public void OnColumnReordered(int oldIndex, int newIndex)
     {

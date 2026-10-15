@@ -94,6 +94,30 @@
                     <input type="text" @bind="_ffmpegPath" />
                 </label>
             </div>
+
+            <h3>CG 管理</h3>
+            <p class="settings-hint">
+                CG 根目錄底下依檔名找 clip／png／spine。Unity.exe 只在 Unity 沒開、要用 batchmode 匯入時使用，留空會依專案的
+                ProjectVersion.txt 推算 Unity Hub 的安裝路徑。
+            </p>
+            <div class="settings-grid settings-grid-1col">
+                <label>
+                    <span>CG 根目錄</span>
+                    <input type="text" @bind="_cgRootFolder" />
+                </label>
+                <label>
+                    <span>Csp 工具（clip_layer_comp_exporter.exe）</span>
+                    <input type="text" @bind="_cspExePath" />
+                </label>
+                <label>
+                    <span>Spine CLI（Spine.com）</span>
+                    <input type="text" @bind="_spineCliPath" />
+                </label>
+                <label>
+                    <span>Unity.exe（留空＝自動）</span>
+                    <input type="text" @bind="_unityExePath" />
+                </label>
+            </div>
         </div>
         <div class="settings-dialog-footer">
             <span class="settings-status">@_statusMessage</span>
@@ -138,6 +162,10 @@
     private string _ldtkExecutablePath = string.Empty;
     private string _ldtkWorkingDirectory = string.Empty;
     private string _ffmpegPath = string.Empty;
+    private string _cgRootFolder = string.Empty;
+    private string _cspExePath = string.Empty;
+    private string _spineCliPath = string.Empty;
+    private string _unityExePath = string.Empty;
 
     // Called from the toolbar's 設定 button — snapshots current values into local scratch fields (rather
     // than binding the inputs straight to AppSettingsStore) so 取消 has something to discard back to.
@@ -153,6 +181,10 @@
         _ldtkExecutablePath = AppSettingsStore.LdtkExecutablePath;
         _ldtkWorkingDirectory = AppSettingsStore.LdtkWorkingDirectory;
         _ffmpegPath = AppSettingsStore.FfmpegPath;
+        _cgRootFolder = AppSettingsStore.CgRootFolder;
+        _cspExePath = AppSettingsStore.CspExePath;
+        _spineCliPath = AppSettingsStore.SpineCliPath;
+        _unityExePath = AppSettingsStore.UnityExePath;
         _statusMessage = string.Empty;
         _isOpen = true;
         StateHasChanged();
@@ -178,6 +210,10 @@
         AppSettingsStore.LdtkExecutablePath = _ldtkExecutablePath;
         AppSettingsStore.LdtkWorkingDirectory = _ldtkWorkingDirectory;
         AppSettingsStore.FfmpegPath = _ffmpegPath;
+        AppSettingsStore.CgRootFolder = _cgRootFolder;
+        AppSettingsStore.CspExePath = _cspExePath;
+        AppSettingsStore.SpineCliPath = _spineCliPath;
+        AppSettingsStore.UnityExePath = _unityExePath;
         AppSettingsStore.Save();
 
         await JS.InvokeVoidAsync("storyForgeGraph.updateSettings", new

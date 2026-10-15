@@ -18,9 +18,23 @@ window.storyForgeColumnSort = (function () {
 
         row._sortableInstance = Sortable.create(row, {
             animation: 150,
+            // The leading select-all <th> is fixed and has no matching entry in the C# _columns list.
+            // Restrict dragging to data headers so Sortable's draggable indices line up with that list.
+            draggable: "th:not(.ps-select-col)",
+            onStart: function (evt) {
+                evt.item._originalNextSibling = evt.item.nextSibling;
+            },
             onEnd: function (evt) {
-                if (evt.oldIndex !== evt.newIndex) {
-                    dotNetRef.invokeMethodAsync("OnColumnReordered", evt.oldIndex, evt.newIndex);
+                const oldIndex = evt.oldDraggableIndex;
+                const newIndex = evt.newDraggableIndex;
+
+                // Sortable has already moved the real DOM node. Put it back before asking Blazor to
+                // reorder from its C# source of truth; otherwise the header can drift away from the
+                // body columns when Blazor diffs a DOM tree that was mutated behind its back.
+                evt.from.insertBefore(evt.item, evt.item._originalNextSibling);
+
+                if (oldIndex !== newIndex) {
+                    dotNetRef.invokeMethodAsync("OnColumnReordered", oldIndex, newIndex);
                 }
             },
         });

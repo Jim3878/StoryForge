@@ -94,6 +94,20 @@ repo (LFS). A record stores the SHA-256 of what was last written — a mismatch 
 outside the tool, and nothing may be written over it until the user adopts the current file as the new
 original. Adjusting a not-yet-`.ogg` clip converts it on the way (reusing `AudioOggConverter.CarryOverMeta`).
 
+### CG 管理 tab (`CgManagerPanel` / `CgManagerState`)
+Replaces the Unity "CG 匯入整合工具"; the agreed behavior is written down in `docs/cg-manager-spec.md` — check
+it before changing any rule. `Core/Cg/CgCatalog.Build` merges four inputs into one `CgEntry` per CG: the `.md`
+playscripts' `OpenCg`/`Diff` rows (`CgScriptScanner` — C# factories are deliberately not scanned), art files
+under `AppSettings.CgRootFolder` matched **by file name only** (`CgSourceIndex`/`CgNaming`, never by folder), the
+shared-prefab table `Assets/Editor/CgImportPipeline/CgSpecialCases.json` (also edited by Unity's
+`CgShareTableWindow`, so every save is a re-read + replace-one-row, never a whole-file write), and Unity's
+current state read straight from disk (`CgUnityState`: base64-protobuf `GalleryDefinition/*.txt`, prefabs).
+Heavy work never runs in-process: clips render through the Csp project's `clip_layer_comp_exporter.exe --batch`
+(`CspBatchClient`; the exe is `--windowed`, so progress comes from a JSON-lines file, not stdout), spine
+previews through the Spine CLI, and the actual prefab/definition import through Unity's
+`CgImportQueue.ProcessPending` — via its editor hook when `Temp/UnityLockfile` is held, else Unity batchmode
+(`UnityCgImportClient`). All three are queued one at a time in `CgManagerState`.
+
 ### Flow-graph editor: server model + JS canvas, kept in sync explicitly
 `GraphEditorState` (scoped per circuit) holds the authoritative `GraphDocumentModel` server-side, loaded
 from either a resumed `%LocalAppData%\StoryForge\session.json` or, on first load, the Unity-exported
@@ -137,8 +151,11 @@ least once — there's no sheet data until that button has been pressed. The sam
 every Transport/TransportTarget (plus the keyed guide-path points `SetGuidePath` accepts) so an AI filling a playscript sheet can look up `LevelTransport`/
 `DoorLevelTransport` iids without reading the 8 MB `.ldtk`; it's only rewritten when its content changed,
 since that folder is a git repo. Likewise `PlayscriptNames.json` (`Codegen/PlayscriptNameListExport`): the closed
-名字/表情 lists the codegen accepts (`DialogName`/`Portrait`/`Face`/`ChatName` labels from the Unity-exported
-`PlayscriptEnumLabelMaps.json`), which `AGENTS.md` tells the AI it must pick names from.
+名字/表情 lists the codegen accepts (`DialogName`/`Portrait`/`Face`/`ChatName` labels), which `AGENTS.md` tells
+the AI it must pick names from. Those labels come from `Core/Schemas/EnumLabelMapSource`, a port of Unity's
+匯出Enum對照表 that parses the enums' `[LabelText]` straight out of `Assets/13.Scripts/Utility/CoreConfig.cs` and
+rewrites `PlayscriptEnumLabelMaps.json` (byte-identical to Unity's output) when it changed. It runs on every
+refresh and again right before every 匯出成C#, so a newly added name never needs a Unity re-export first.
 
 The same refresh also writes `GuidePathPoints.json` (`Ldtk/GuidePathMemoSync`): every LDtk guide-path point with
 its `Memo` field, which the AI may edit. Edits go back into `Company.ldtk` only via the manual 寫回LDtk引導點Memo

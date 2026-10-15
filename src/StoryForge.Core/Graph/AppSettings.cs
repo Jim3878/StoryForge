@@ -67,6 +67,13 @@ public sealed class AppSettings
     public string FfmpegPath { get; set; } =
         @"C:\Users\User\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe";
 
+    // CG 管理分頁：美術 CG 根目錄（只依檔名找 clip/png/spine）、Csp 的 clip_layer_comp_exporter.exe（批次模式渲染 clip）、
+    // Spine CLI（spine 預覽）、Unity.exe（Unity 沒開時跑 batchmode 匯入；留空 = 依 ProjectVersion.txt 推 Hub 路徑）。
+    public string CgRootFolder { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\美術\CG圖";
+    public string CspExePath { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\Code\Csp\clip_layer_comp_exporter.exe";
+    public string SpineCliPath { get; set; } = @"C:\Program Files\Spine\Spine.com";
+    public string UnityExePath { get; set; } = string.Empty;
+
     // Home.razor's tab strip order, as tab keys, after drag-to-reorder. Empty = default order. Keys missing
     // here (a tab added in a later build) are appended at the end; keys no longer known are ignored.
     public List<string> TabOrder { get; set; } = new();

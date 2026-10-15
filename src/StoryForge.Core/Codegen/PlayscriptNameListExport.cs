@@ -5,15 +5,12 @@ using StoryForge.Core.Schemas;
 namespace StoryForge.Core.Codegen;
 
 // PlayscriptNames.json for the AI filling playscript sheets: the 名字/表情 values PlayscriptFactoryCodeGenerator
-// accepts, taken from the same Unity-exported PlayscriptEnumLabelMaps.json (via EnumLabelMaps, so the lists can
+// accepts, taken from the same enum label map (EnumLabelMapSource, via EnumLabelMaps, so the lists can
 // never drift from what the C# export actually checks). Without it the AI has no way to know the 名字 column is a
 // closed list and only finds out at C# export time.
 public static class PlayscriptNameListExport
 {
     public const string ExportFileName = "PlayscriptNames.json";
-
-    public static string EnumMapPath(string projectRoot) =>
-        Path.Combine(projectRoot, "Assets", "06.Definition", "PlayscriptOfflineExport", "PlayscriptEnumLabelMaps.json");
 
     // Only writes when the content actually changed — the external data folder is a git repo, and this runs
     // on every 流程狀態 refresh.

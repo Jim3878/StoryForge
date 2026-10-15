@@ -787,15 +787,22 @@ public sealed class PipelineStatusState
         }
 
         var assetsRoot = Path.Combine(_projectRoot, "Assets");
-        var enumMapPath = Path.Combine(assetsRoot, "06.Definition", "PlayscriptOfflineExport", "PlayscriptEnumLabelMaps.json");
-        if (!File.Exists(enumMapPath))
+        // Rebuilt from CoreConfig.cs right before every export (also rewriting PlayscriptEnumLabelMaps.json), so
+        // a name added to the enums is accepted without anyone re-exporting the map from Unity first. No fallback
+        // to the old JSON here: exporting against a stale name list is exactly what this is meant to prevent.
+        EnumLabelMapDocument enumDocument;
+        try
         {
-            StatusMessage = "找不到 Enum 對照表，請先在 Unity 的「精簡劇本管理器」按「匯出Enum對照表」。";
+            enumDocument = EnumLabelMapSource.Refresh(_projectRoot);
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"無法更新 Enum 對照表：{e.Message}";
             return Array.Empty<string>();
         }
 
-        var enumDocument = DocumentLoader.LoadEnumLabelMapDocument(enumMapPath);
         _cSharpExportEnumLabelMaps = EnumLabelMaps.FromDocument(enumDocument);
+        TryWriteNameListExport(enumDocument);
         _cSharpExportOutputRoot = Path.Combine(assetsRoot, "12.Custom", "PlayscriptFactory");
         _cSharpExportAudioClips = PlayscriptAudioClips.Scan(_projectRoot);
         // Re-read here rather than reusing Refresh()'s copy, so the iid checks see the .ldtk as it is right now.
@@ -1122,15 +1129,26 @@ public sealed class PipelineStatusState
     {
         try
         {
+            var document = EnumLabelMapSource.RefreshOrLoadExisting(projectRoot, out var warning);
+            if (document == null)
+                return $"{warning}，未寫出 {PlayscriptNameListExport.ExportFileName}";
+
+            return TryWriteNameListExport(document) ?? warning;
+        }
+        catch (Exception e)
+        {
+            return $"寫出 {PlayscriptNameListExport.ExportFileName} 失敗：{e.Message}";
+        }
+    }
+
+    private string? TryWriteNameListExport(EnumLabelMapDocument document)
+    {
+        try
+        {
             if (!Directory.Exists(_appSettings.ExternalDataFolder))
                 return $"外部資料夾不存在，未寫出 {PlayscriptNameListExport.ExportFileName}";
 
-            var enumMapPath = PlayscriptNameListExport.EnumMapPath(projectRoot);
-            if (!File.Exists(enumMapPath))
-                return $"找不到 Enum 對照表，未寫出 {PlayscriptNameListExport.ExportFileName}";
-
-            PlayscriptNameListExport.WriteIfChanged(
-                DocumentLoader.LoadEnumLabelMapDocument(enumMapPath), _appSettings.ExternalDataFolder);
+            PlayscriptNameListExport.WriteIfChanged(document, _appSettings.ExternalDataFolder);
             return null;
         }
         catch (Exception e)

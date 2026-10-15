@@ -41,6 +41,9 @@
         <div class="tab-pane" style="display:@(_activeTab == "card" ? "block" : "none")">
             <CharacterCardPanel />
         </div>
+        <div class="tab-pane" style="display:@(_activeTab == "cg" ? "block" : "none")">
+            <CgManagerPanel IsActive="@(_activeTab == "cg")" />
+        </div>
         <div class="tab-pane" style="display:@(_activeTab == "bgm" ? "block" : "none")">
             <AudioBrowserPanel Category="StoryForge.Core.Audio.AudioCategory.Bgm" />
         </div>
@@ -72,6 +75,7 @@
         new("pipeline", "劇本管線狀態"),
         new("graph", "流程圖"),
         new("card", "角色卡"),
+        new("cg", "CG 管理"),
         new("bgm", "BGM"),
         new("sfx", "音效"),
     };

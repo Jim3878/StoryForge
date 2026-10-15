@@ -19,6 +19,7 @@ builder.Services.AddScoped<GraphEditorState>();
 builder.Services.AddScoped<StoryForge.Web.CharacterCard.CharacterCardState>();
 builder.Services.AddScoped<StoryForge.Web.StoryOutline.StoryOutlineState>();
 builder.Services.AddScoped<StoryForge.Web.Pipeline.PipelineStatusState>();
+builder.Services.AddScoped<StoryForge.Web.Cg.CgManagerState>();
 builder.Services.AddScoped<StoryForge.Web.ReloadCoordinator>();
 builder.Services.AddScoped<StoryForge.Web.FlowGraphFocusCoordinator>();
 // Singleton, not scoped — see UpdateCheckService's own comment: one GitHub check result shared by the
@@ -149,7 +150,41 @@ app.MapGet("/api/audio-original/{category}/{guid}", (string category, string gui
     return Results.File(filePath, contentType, enableRangeProcessing: true);
 });
 
+// CG 管理分頁的預覽圖：只放行 CG 根目錄底下的 .png（預覽圖 / 美術 png），路徑來自 client 所以要確認落在根目錄內。
+app.MapGet("/api/cg/image", (string path, AppSettings settings) =>
+{
+    var root = Path.GetFullPath(settings.CgRootFolder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+    var full = Path.GetFullPath(path);
+    if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
+        !full.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || !File.Exists(full))
+        return Results.NotFound();
+
+    // 預覽圖本來就是 512x288，直接送；美術的 1920 png 縮成預覽尺寸再送，卡片多的時候才不會一次載幾十 MB。
+    if (StoryForge.Core.Cg.CgNaming.IsPreviewFile(full))
+        return Results.File(full, "image/png");
+
+    var key = $"{full}|{File.GetLastWriteTimeUtc(full).Ticks}";
+    var png = CgImageCache.GetOrAdd(key, _ => StoryForge.Core.Cg.CgImageUtility.RenderLetterboxed(full,
+        StoryForge.Core.Cg.CgCatalogConstants.PreviewWidth, StoryForge.Core.Cg.CgCatalogConstants.PreviewHeight));
+    return Results.Bytes(png, "image/png");
+});
+
+// 沒有美術檔的差分：當場畫一張 512x288 暫代圖（與輸出至 Unity 的暫代圖同一套畫法）。
+app.MapGet("/api/cg/placeholder", (string cg, string diff, int i, int n, int hue, string? memo) =>
+{
+    var png = StoryForge.Core.Cg.CgPlaceholderRenderer.RenderPng(cg, diff, i, n,
+        StoryForge.Core.Cg.CgPlaceholderRenderer.GetHue(hue), memo ?? string.Empty,
+        StoryForge.Core.Cg.CgCatalogConstants.PreviewWidth, StoryForge.Core.Cg.CgCatalogConstants.PreviewHeight);
+    return Results.Bytes(png, "image/png");
+});
+
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
 
 app.Run();
+
+// CG 管理分頁縮過的美術 png（key = 路徑|修改時間），檔案改了 key 就不同，不會拿到舊圖。
+static partial class Program
+{
+    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte[]> CgImageCache = new();
+}

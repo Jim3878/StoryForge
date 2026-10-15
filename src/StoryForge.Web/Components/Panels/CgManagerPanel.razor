@@ -1,0 +1,692 @@
+@using StoryForge.Core
+@using StoryForge.Core.Cg
+@using StoryForge.Web.Cg
+@implements IDisposable
+@inject CgManagerState State
+@inject IJSRuntime JS
+@inject ReloadCoordinator ReloadCoordinator
+@inject StoryForge.Web.FlowGraphFocusCoordinator FlowGraphFocusCoordinator
+
+<div class="cg-page">
+    <div class="cg-toolbar">
+        <details class="cg-chapter-filter">
+            <summary>章節 (@State.SelectedChapters.Count(State.AllChapters.Contains)/@State.AllChapters.Count)</summary>
+            <div class="cg-chapter-menu">
+                <label><input type="checkbox" checked="@(State.AllChapters.All(State.SelectedChapters.Contains))"
+                              @onchange="e => State.SetAllChapters((bool)e.Value!)" /> 全選/全不選</label>
+                <hr />
+                @foreach (var chapter in State.AllChapters)
+                {
+                    <label><input type="checkbox" checked="@State.SelectedChapters.Contains(chapter)"
+                                  @onchange="e => State.ToggleChapter(chapter, (bool)e.Value!)" /> @chapter</label>
+                }
+            </div>
+        </details>
+        <div class="cg-counts">
+            @foreach (var (status, label, css) in StatusButtons)
+            {
+                <button class="cg-count @css @(State.StatusFilter == status ? "active" : "")" title="點擊只顯示這個狀態，再點一次取消"
+                        @onclick="() => ToggleStatusFilter(status)">@label <b>@State.CountByStatus(status)</b></button>
+            }
+        </div>
+        <input class="cg-search" placeholder="搜尋 CG 名稱..." @bind="State.SearchText" @bind:event="oninput" />
+        <label class="cg-size-slider">
+            <input type="range" min="160" max="640" step="10" value="@State.PreviewSize"
+                   @oninput="OnPreviewSizeInput" @onchange="_ => State.SavePreviewSize()" />
+            <span>@((int)State.PreviewSize)px</span>
+        </label>
+        <span class="cg-toolbar-gap"></span>
+        <button @onclick="State.ScanAsync" disabled="@State.IsScanning">重新掃描</button>
+        <button @onclick="() => State.EnqueuePreview(Visible)" title="只處理目前篩選出來的 CG">更新預覽圖</button>
+        <button @onclick="() => State.EnqueueExportPng(Visible)" title="從 clip 輸出 1920 PNG 到 clip 同級資料夾，不碰 Unity">輸出 PNG</button>
+        <button class="cg-primary" @onclick="() => StartUnityExport(Visible)" title="只處理目前篩選出來的 CG">輸出至 Unity</button>
+        <button @onclick="OpenShareTable">CG 共用表</button>
+        <button @onclick="State.Cancel" disabled="@(!State.IsBusy)">取消</button>
+    </div>
+
+    <div class="cg-grid-wrap">
+        @if (!State.HasScanned && State.IsScanning)
+        {
+            <div class="cg-empty">掃描劇本與 CG 檔案中…</div>
+        }
+        else if (State.ScanError != null)
+        {
+            <div class="cg-empty">掃描失敗：@State.ScanError</div>
+        }
+        else if (Visible.Count == 0)
+        {
+            <div class="cg-empty">沒有符合篩選的 CG</div>
+        }
+        <div class="cg-grid">
+            @foreach (var entry in Visible)
+            {
+                var view = CurrentDiff(entry);
+                var index = GetDiffIndex(entry);
+                <div class="cg-card" @key="entry.CgId" style="width:@(State.PreviewSize)px"
+                     @oncontextmenu="e => OpenContextMenu(e, entry)" @oncontextmenu:preventDefault="true">
+                    <div class="cg-preview" style="height:@(State.PreviewSize * 9 / 16)px">
+                        <img src="@PreviewUrl(entry, view, index)" alt="@entry.CgId" loading="lazy" />
+                        @if (entry.Diffs.Count > 1)
+                        {
+                            <button class="cg-arrow left" @onclick="() => StepDiff(entry, -1)">‹</button>
+                            <button class="cg-arrow right" @onclick="() => StepDiff(entry, 1)">›</button>
+                        }
+                        @if (view.PreviewMissing && view.PreviewSource != "png")
+                        {
+                            <span class="cg-preview-badge">預覽未產生</span>
+                        }
+                        @if (State.CardActivity.TryGetValue(entry.CgId, out var activity))
+                        {
+                            <div class="cg-card-overlay"><span class="cg-spinner"></span>@activity</div>
+                        }
+                    </div>
+                    <div class="cg-diff-line @(view.MissingInSource || view.NotOwned ? "bad" : "")">
+                        <span>@(index + 1)/@entry.Diffs.Count · @view.Diff</span>
+                        <span class="cg-diff-note">@DiffNote(entry, view)</span>
+                    </div>
+                    <div class="cg-name-row">
+                        <span class="cg-name" title="@entry.CgId">@entry.CgId</span>
+                        <span class="cg-status @StatusCss(entry.SourceStatus)" title="@string.Join("\n", entry.SourceIssues)">@StatusLabel(entry.SourceStatus)</span>
+                    </div>
+                    <div class="cg-tags">
+                        <span class="cg-tag @(entry.Sources.Clips.Count > 0 ? "on" : "")" title="@string.Join("\n", entry.Sources.Clips)">clip</span>
+                        <span class="cg-tag @(entry.HasPng ? "on" : "")" title="@string.Join("\n", entry.Sources.Pngs.SelectMany(x => x.Value))">png</span>
+                        <span class="cg-tag @(entry.Sources.Spines.Count > 0 ? "on" : "")" title="@string.Join("\n", entry.Sources.Spines)">spine</span>
+                        <span class="cg-unity @UnityCss(entry.UnityStatus)" title="@entry.UnityDetail">Unity：@UnityLabel(entry.UnityStatus)</span>
+                    </div>
+                    @if (entry.Share != null)
+                    {
+                        <div class="cg-share-tag">→ 共用 @entry.Share.Prefab 的 prefab · @string.Join(", ", entry.Share.Diffs)</div>
+                    }
+                    else if (entry.SharedBy.Count > 0)
+                    {
+                        <div class="cg-share-tag">@SharedByText(entry)</div>
+                    }
+                    <div class="cg-actions">
+                        <select value='@(entry.IsStatic ? "static" : "dynamic")' @onchange="e => OnTypeChanged(entry, e)"
+                                disabled="@(entry.Share != null)" title='@(entry.Share != null ? "類型跟著主 CG" : "動態圖預期要有 spine")'>
+                            <option value="dynamic">動態圖</option>
+                            <option value="static">靜態圖</option>
+                        </select>
+                        <button @onclick="() => State.EnqueuePreview(new[] { entry })">更新預覽</button>
+                        <button class="cg-primary" @onclick="() => StartUnityExport(new List<CgEntry> { entry })">輸出至 Unity</button>
+                    </div>
+                    <div class="cg-scripts">
+                        @foreach (var script in entry.Scripts)
+                        {
+                            <a title="跳到流程圖節點" @onclick="() => JumpToNode(script.PlayscriptName)">@script.PlayscriptName</a>
+                        }
+                        @if (entry.Scripts.Count == 0)
+                        {
+                            <span class="cg-muted">（沒有劇本使用）</span>
+                        }
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+
+    <div class="cg-log @(_logOpen ? "open" : "")">
+        <div class="cg-log-header">
+            <button class="cg-link" @onclick="() => _logOpen = !_logOpen">@(_logOpen ? "▾" : "▸") Log（@State.Log.Count）</button>
+            <span class="cg-log-summary">@LogSummary()</span>
+            <button class="cg-link" @onclick="CopyLog">複製 Log</button>
+            <button class="cg-link" @onclick="State.ClearLog">清除</button>
+        </div>
+        @if (_logOpen)
+        {
+            <div class="cg-log-body">
+                @foreach (var line in State.Log.AsEnumerable().Reverse().Take(500))
+                {
+                    <div class="cg-log-line @line.Level.ToString().ToLowerInvariant()">@line.Time.ToString("HH:mm:ss") @line.Text</div>
+                }
+            </div>
+        }
+    </div>
+
+    <div class="cg-statusbar @(State.IsBusy ? "busy" : "")">
+        @if (State.IsBusy)
+        {
+            <span class="cg-spinner"></span>
+            <span><b>@State.CurrentJob</b> · @State.CurrentStage</span>
+            <span class="cg-muted">@((int)(DateTime.Now - State.CurrentStageStarted).TotalSeconds) 秒 · @State.CurrentDetail</span>
+            @if (State.QueuedJobCount > 0)
+            {
+                <span class="cg-muted">（佇列還有 @State.QueuedJobCount 項）</span>
+            }
+        }
+        else
+        {
+            <span class="cg-status-dot"></span>
+            <span>@(State.IsScanning ? "掃描中…" : $"共 {State.Entries.Count} 張 CG，顯示 {Visible.Count} 張")</span>
+        }
+    </div>
+</div>
+
+@if (_menuEntry is { } menuEntry)
+{
+    <div class="cg-menu-backdrop" @onclick="CloseMenu" @oncontextmenu="CloseMenu" @oncontextmenu:preventDefault="true"></div>
+    <div class="cg-menu" style="left:@(_menuX)px; top:@(_menuY)px">
+        <button @onclick="() => MenuActionAsync(() => CopyText(menuEntry.CgId))">複製 CG 名稱</button>
+        <button disabled="@(menuEntry.Clip == null)" @onclick="() => MenuAction(() => State.OpenFile(menuEntry.Clip))">開啟 clip 檔</button>
+        <button disabled="@(menuEntry.Spine == null)" @onclick="() => MenuAction(() => State.OpenFile(menuEntry.Spine))">開啟 spine 檔</button>
+        <button disabled="@(FirstOf(menuEntry.Sources.Clips) == null)" @onclick="() => MenuAction(() => State.OpenFolder(FirstOf(menuEntry.Sources.Clips)))">開啟 clip 檔資料夾</button>
+        <button disabled="@(FirstOf(menuEntry.Sources.Spines) == null)" @onclick="() => MenuAction(() => State.OpenFolder(FirstOf(menuEntry.Sources.Spines)))">開啟 spine 檔資料夾</button>
+        <button disabled="@(menuEntry.Clip == null)" @onclick="() => MenuAction(() => State.EnqueueExportPng(new[] { menuEntry }))">輸出 PNG</button>
+        <hr />
+        @if (menuEntry.Scripts.Count <= 1)
+        {
+            var script = menuEntry.Scripts.FirstOrDefault();
+            <button disabled="@(script == null)" @onclick="() => MenuAction(() => State.OpenFile(script?.FilePath))">開啟劇本檔</button>
+            <button disabled="@(script == null)" @onclick="() => MenuActionAsync(() => JumpToNode(script!.PlayscriptName))">跳到流程圖節點</button>
+        }
+        else
+        {
+            <div class="cg-submenu">
+                <button>開啟劇本檔 ▸</button>
+                <div class="cg-submenu-items">
+                    @foreach (var script in menuEntry.Scripts)
+                    {
+                        <button @onclick="() => MenuAction(() => State.OpenFile(script.FilePath))">@script.PlayscriptName</button>
+                    }
+                </div>
+            </div>
+            <div class="cg-submenu">
+                <button>跳到流程圖節點 ▸</button>
+                <div class="cg-submenu-items">
+                    @foreach (var script in menuEntry.Scripts)
+                    {
+                        <button @onclick="() => MenuActionAsync(() => JumpToNode(script.PlayscriptName))">@script.PlayscriptName</button>
+                    }
+                </div>
+            </div>
+        }
+    </div>
+}
+
+@if (_overwriteQuestions.Count > 0)
+{
+    var question = _overwriteQuestions[0];
+    <div class="cg-modal-backdrop">
+        <div class="cg-modal">
+            <h3>Unity 裡已經有這張 CG</h3>
+            <p><b>@question.Entry.CgId</b>（@UnityLabel(question.Entry.UnityStatus)）要覆蓋嗎？</p>
+            @if (!string.IsNullOrEmpty(question.Detail))
+            {
+                <p class="cg-warning">@question.Detail</p>
+            }
+            @if (_overwriteQuestions.Count > 1)
+            {
+                <label><input type="checkbox" @bind="_applyToRemaining" /> 套用到剩下 @(_overwriteQuestions.Count - 1) 張</label>
+            }
+            <div class="cg-modal-actions">
+                <button class="cg-primary" @onclick="() => AnswerOverwrite(true)">覆蓋</button>
+                <button @onclick="() => AnswerOverwrite(false)">略過</button>
+                <button @onclick="CancelOverwrite">取消整批</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_shareTableOpen)
+{
+    <div class="cg-modal-backdrop">
+        <div class="cg-modal cg-share-modal">
+            <h3>CG 共用表</h3>
+            <p class="cg-muted">
+                這張 CG 在畫廊是獨立一格，但讀主 CG 的 prefab，只擁有勾選的差分；主 CG 擁有剩下的差分。
+                Unity 的「素材/CG/CG 共用表」編輯同一份檔，存檔以一列為單位，不會蓋掉另一邊改的其他列。
+            </p>
+            <table class="cg-share-table">
+                <thead><tr><th>CG 名稱</th><th>prefab</th><th>差分</th><th></th></tr></thead>
+                <tbody>
+                    @foreach (var row in _shareRows)
+                    {
+                        var taken = TakenDiffs(row);
+                        <tr>
+                            <td><input @bind="row.CgId" @bind:event="oninput" @bind:after="() => row.Dirty = true" /></td>
+                            <td>
+                                <select value="@row.Prefab" @onchange="e => { row.Prefab = (string?)e.Value ?? string.Empty; row.Diffs.Clear(); row.Dirty = true; }">
+                                    <option value="">（選擇 prefab）</option>
+                                    @foreach (var name in State.ShareTargetOptions)
+                                    {
+                                        <option value="@name">@name</option>
+                                    }
+                                </select>
+                            </td>
+                            <td>
+                                <details class="cg-diff-picker">
+                                    <summary>@(row.Diffs.Count == 0 ? "（選差分）" : string.Join(", ", row.Diffs))</summary>
+                                    <div class="cg-diff-picker-menu">
+                                        @foreach (var diff in State.GetPrefabDiffOptions(row.Prefab))
+                                        {
+                                            var owner = taken.GetValueOrDefault(diff);
+                                            <label class="@(owner != null ? "disabled" : "")">
+                                                <input type="checkbox" checked="@row.Diffs.Contains(diff)" disabled="@(owner != null)"
+                                                       @onchange="e => ToggleShareDiff(row, diff, (bool)e.Value!)" />
+                                                @diff @(owner != null ? $"（已分給 {owner}）" : "")
+                                            </label>
+                                        }
+                                        @if (string.IsNullOrEmpty(row.Prefab))
+                                        {
+                                            <span class="cg-muted">先選 prefab</span>
+                                        }
+                                    </div>
+                                </details>
+                            </td>
+                            <td class="cg-share-buttons">
+                                <button disabled="@(!row.Dirty)" @onclick="() => SaveShareRow(row)">@(row.Dirty ? "存檔*" : "存檔")</button>
+                                <button @onclick="() => DeleteShareRow(row)">刪除</button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            @if (!string.IsNullOrEmpty(_shareError))
+            {
+                <p class="cg-warning">@_shareError</p>
+            }
+            <div class="cg-modal-actions">
+                <button @onclick="() => _shareRows.Add(new ShareRow { Dirty = true })">新增一列</button>
+                <button @onclick="CloseShareTable">關閉</button>
+            </div>
+        </div>
+    </div>
+}
+
+<style>
+    .cg-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; background: #262626; }
+    .cg-toolbar { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; background: #1e1e1e; border-bottom: 1px solid #333; font-size: 13px; }
+    .cg-toolbar button, .cg-actions button, .cg-modal button { background: #333; color: #ddd; border: 1px solid #4a4a4a; border-radius: 3px; padding: 4px 10px; cursor: pointer; font: inherit; }
+    .cg-toolbar button:hover:not(:disabled), .cg-actions button:hover:not(:disabled), .cg-modal button:hover:not(:disabled) { background: #3d3d3d; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    button.cg-primary { background: #2f5b8f; border-color: #3d6ea8; color: #fff; }
+    button.cg-primary:hover:not(:disabled) { background: #3a6aa3; }
+    .cg-toolbar-gap { flex: 1 1 auto; }
+    .cg-search { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 8px; border-radius: 3px; width: 160px; }
+    .cg-size-slider { display: flex; align-items: center; gap: 6px; font-size: 12px; opacity: 0.85; }
+    .cg-size-slider input { width: 100px; }
+    .cg-chapter-filter { position: relative; }
+    .cg-chapter-filter summary { cursor: pointer; padding: 4px 10px; background: #2a2a2a; border: 1px solid #444; border-radius: 3px; list-style: none; }
+    .cg-chapter-filter summary::-webkit-details-marker { display: none; }
+    .cg-chapter-menu { position: absolute; top: 100%; left: 0; z-index: 30; margin-top: 4px; background: #2a2a2a; border: 1px solid #444; border-radius: 3px; padding: 8px 12px; min-width: 150px; max-height: 360px; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+    .cg-chapter-menu label { display: block; padding: 3px 0; white-space: nowrap; }
+    .cg-chapter-menu hr { border-color: #444; margin: 4px 0; }
+    .cg-counts { display: flex; gap: 4px; }
+    .cg-count { font-size: 12px; }
+    .cg-count b { margin-left: 4px; }
+    .cg-count.active { outline: 2px solid #8ab4f8; }
+
+    .missing { color: #ff8a80; }
+    .missing-spine { color: #ffd479; }
+    .anomaly { color: #ffab40; }
+    .done { color: #8bd88b; }
+
+    .cg-grid-wrap { flex: 1 1 auto; overflow: auto; padding: 12px; }
+    .cg-grid { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+    .cg-empty { padding: 16px; opacity: 0.6; font-size: 13px; }
+    .cg-card { background: #2c2c2c; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; box-sizing: content-box; }
+    .cg-preview { position: relative; background: #111; border-radius: 3px; overflow: hidden; }
+    .cg-preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .cg-arrow { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.45); color: #fff; border: none; width: 26px; height: 44px; font-size: 22px; cursor: pointer; border-radius: 3px; opacity: 0.6; }
+    .cg-arrow:hover { opacity: 1; }
+    .cg-arrow.left { left: 4px; }
+    .cg-arrow.right { right: 4px; }
+    .cg-preview-badge { position: absolute; top: 4px; right: 4px; background: rgba(0,0,0,0.65); color: #ffd479; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+    .cg-card-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; gap: 8px; color: #fff; font-size: 13px; }
+    .cg-diff-line { display: flex; justify-content: space-between; gap: 6px; opacity: 0.85; }
+    .cg-diff-line.bad .cg-diff-note { color: #ff8a80; }
+    .cg-diff-note { opacity: 0.85; text-align: right; }
+    .cg-name-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+    .cg-name { font-weight: bold; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cg-status { flex: 0 0 auto; font-weight: bold; cursor: help; }
+    .cg-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .cg-tag { padding: 0 6px; border-radius: 3px; background: #333; color: #666; border: 1px solid #3c3c3c; }
+    .cg-tag.on { background: #24452f; color: #9fe0a8; border-color: #2f6a40; }
+    .cg-unity { margin-left: auto; padding: 0 6px; border-radius: 3px; background: #333; cursor: help; }
+    .cg-unity.synced { color: #8bd88b; }
+    .cg-unity.notexported { color: #aaa; }
+    .cg-unity.placeholder, .cg-unity.sourcenewer { color: #ffd479; }
+    .cg-unity.incompletediffs { color: #ff8a80; }
+    .cg-share-tag { color: #9ecbff; }
+    .cg-actions { display: flex; gap: 4px; align-items: center; }
+    .cg-actions select { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 3px; padding: 3px; }
+    .cg-actions button { padding: 3px 8px; font-size: 12px; }
+    .cg-scripts { display: flex; flex-wrap: wrap; gap: 2px 8px; }
+    .cg-scripts a { color: #8ab4f8; cursor: pointer; }
+    .cg-scripts a:hover { text-decoration: underline; }
+    .cg-muted { opacity: 0.6; }
+
+    .cg-log { flex: 0 0 auto; border-top: 1px solid #333; background: #1e1e1e; font-size: 12px; }
+    .cg-log-header { display: flex; align-items: center; gap: 10px; padding: 4px 10px; }
+    .cg-log-summary { flex: 1 1 auto; opacity: 0.8; }
+    .cg-link { background: none; border: none; color: #8ab4f8; cursor: pointer; font: inherit; padding: 0; }
+    .cg-log-body { max-height: 200px; overflow-y: auto; padding: 0 10px 6px; font-family: Consolas, monospace; }
+    .cg-log-line { white-space: pre-wrap; padding: 1px 0; }
+    .cg-log-line.error, .cg-log-line.missing { color: #ff8a80; }
+    .cg-log-line.anomaly { color: #ffab40; }
+    .cg-log-line.missingspine { color: #ffd479; }
+    .cg-log-line.done { color: #8bd88b; }
+
+    .cg-statusbar { flex: 0 0 24px; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #171717; border-top: 1px solid #333; font-size: 12px; color: #aaa; white-space: nowrap; overflow: hidden; }
+    .cg-status-dot { width: 7px; height: 7px; border-radius: 50%; background: #5f9f62; }
+    .cg-spinner { width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.25); border-top-color: #8ab4f8; border-radius: 50%; animation: cg-spin 0.8s linear infinite; flex: 0 0 auto; }
+    @@keyframes cg-spin { to { transform: rotate(360deg); } }
+
+    .cg-menu-backdrop { position: fixed; inset: 0; z-index: 1100; }
+    .cg-menu { position: fixed; z-index: 1101; background: #2a2a2a; border: 1px solid #444; border-radius: 4px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); padding: 4px 0; min-width: 190px; font-size: 13px; }
+    .cg-menu button { display: block; width: 100%; text-align: left; padding: 7px 14px; background: none; border: none; color: #ddd; cursor: pointer; font: inherit; white-space: nowrap; }
+    .cg-menu button:hover:not(:disabled) { background: #3a3a3a; }
+    .cg-menu button:disabled { color: #666; }
+    .cg-menu hr { border: none; border-top: 1px solid #444; margin: 4px 0; }
+    .cg-submenu { position: relative; }
+    .cg-submenu-items { display: none; position: absolute; left: 100%; top: -4px; background: #2a2a2a; border: 1px solid #444; border-radius: 4px; padding: 4px 0; min-width: 200px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+    .cg-submenu:hover .cg-submenu-items { display: block; }
+
+    .cg-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+    .cg-modal { background: #262626; color: #ddd; border: 1px solid #444; border-radius: 6px; padding: 18px 20px; max-width: 560px; width: 90%; max-height: 85vh; overflow: auto; display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+    .cg-modal h3 { margin: 0; }
+    .cg-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .cg-warning { color: #ffab40; }
+    .cg-share-modal { max-width: 860px; }
+    .cg-share-table { width: 100%; border-collapse: collapse; }
+    .cg-share-table th, .cg-share-table td { text-align: left; padding: 4px; border-bottom: 1px solid #333; vertical-align: top; }
+    .cg-share-table input, .cg-share-table select { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 3px; padding: 3px 6px; width: 100%; box-sizing: border-box; }
+    .cg-share-buttons { white-space: nowrap; }
+    .cg-diff-picker { position: relative; }
+    .cg-diff-picker summary { cursor: pointer; padding: 3px 6px; background: #2a2a2a; border: 1px solid #444; border-radius: 3px; list-style: none; }
+    .cg-diff-picker-menu { position: absolute; z-index: 5; background: #2a2a2a; border: 1px solid #444; border-radius: 3px; padding: 6px 10px; min-width: 180px; max-height: 240px; overflow-y: auto; }
+    .cg-diff-picker-menu label { display: block; padding: 2px 0; white-space: nowrap; }
+    .cg-diff-picker-menu label.disabled { opacity: 0.5; }
+</style>
+
+@code {
+    private static readonly (CgSourceStatus Status, string Label, string Css)[] StatusButtons =
+    {
+        (CgSourceStatus.Missing, "缺檔", "missing"),
+        (CgSourceStatus.MissingSpine, "缺 spine", "missing-spine"),
+        (CgSourceStatus.Anomaly, "異常", "anomaly"),
+        (CgSourceStatus.Done, "已完成", "done"),
+    };
+
+    private readonly Dictionary<string, int> _diffIndex = new(StringComparer.Ordinal);
+    private bool _logOpen = true;
+    private CgEntry? _menuEntry;
+    private double _menuX;
+    private double _menuY;
+    private List<CgOverwriteQuestion> _overwriteQuestions = new();
+    private List<CgEntry> _pendingExport = new();
+    private bool _applyToRemaining;
+    private bool _shareTableOpen;
+    private List<ShareRow> _shareRows = new();
+    private string? _shareError;
+    private System.Threading.Timer? _ticker;
+    private bool _scannedOnce;
+
+    private List<CgEntry> Visible => State.FilteredEntries.ToList();
+
+    [Parameter] public bool IsActive { get; set; }
+
+    protected override void OnInitialized()
+    {
+        State.Changed += OnStateChanged;
+        ReloadCoordinator.Subscribe(OnReload);
+
+        // 跑工作時每秒刷新狀態列的秒數。
+        _ticker = new System.Threading.Timer(_ =>
+        {
+            if (State.IsBusy)
+                InvokeAsync(StateHasChanged);
+        }, null, 1000, 1000);
+    }
+
+    // 切到這個分頁時自動掃一次（之後靠「重新掃描」與兩份 JSON 的檔案監看）。
+    protected override async Task OnParametersSetAsync()
+    {
+        if (IsActive && !_scannedOnce)
+        {
+            _scannedOnce = true;
+            await State.ScanAsync();
+        }
+    }
+
+    private void OnStateChanged() => InvokeAsync(StateHasChanged);
+
+    private async Task OnReload()
+    {
+        if (_scannedOnce)
+            await State.ScanAsync();
+    }
+
+    public void Dispose()
+    {
+        State.Changed -= OnStateChanged;
+        ReloadCoordinator.Unsubscribe(OnReload);
+        _ticker?.Dispose();
+    }
+
+    private void ToggleStatusFilter(CgSourceStatus status) =>
+        State.StatusFilter = State.StatusFilter == status ? null : status;
+
+    private void OnPreviewSizeInput(ChangeEventArgs e)
+    {
+        if (float.TryParse(e.Value?.ToString(), out var value))
+            State.PreviewSize = value;
+    }
+
+    private int GetDiffIndex(CgEntry entry)
+    {
+        var index = _diffIndex.GetValueOrDefault(entry.CgId);
+        return entry.Diffs.Count == 0 ? 0 : Math.Clamp(index, 0, entry.Diffs.Count - 1);
+    }
+
+    private CgDiffView CurrentDiff(CgEntry entry) => entry.Diffs[GetDiffIndex(entry)];
+
+    private void StepDiff(CgEntry entry, int step)
+    {
+        var count = entry.Diffs.Count;
+        _diffIndex[entry.CgId] = ((GetDiffIndex(entry) + step) % count + count) % count;
+    }
+
+    private static string DiffNote(CgEntry entry, CgDiffView view)
+    {
+        if (view.NotOwned)
+            return "不屬於這張 CG";
+        if (view.MissingInSource)
+            return "來源缺此差分";
+        var parts = new List<string> { view.PreviewSource };
+        if (!view.UsedByScript)
+            parts.Add("劇本未使用");
+        if (entry.Share != null)
+            parts.Add($"共用 {entry.Share.Prefab}");
+        else if (entry.SharedBy.Count > 0)
+            parts.Add("剩餘");
+        return string.Join(" · ", parts);
+    }
+
+    private string PreviewUrl(CgEntry entry, CgDiffView view, int index)
+    {
+        if (view.PreviewPath != null && !view.MissingInSource && !view.NotOwned)
+        {
+            var stamp = File.Exists(view.PreviewPath) ? File.GetLastWriteTimeUtc(view.PreviewPath).Ticks : 0;
+            return $"/api/cg/image?path={Uri.EscapeDataString(view.PreviewPath)}&v={stamp}";
+        }
+
+        return $"/api/cg/placeholder?cg={Uri.EscapeDataString(entry.CgId)}&diff={Uri.EscapeDataString(view.Diff)}" +
+               $"&i={index}&n={entry.Diffs.Count}&hue={entry.HueIndex}&memo={Uri.EscapeDataString(view.Memo)}";
+    }
+
+    private Task OnTypeChanged(CgEntry entry, ChangeEventArgs e) =>
+        State.SetStaticAsync(entry, (string?)e.Value == "static");
+
+    private static string SharedByText(CgEntry entry) =>
+        $"被 {string.Join("、", entry.SharedBy.Select(s => s.CgId))} 共用{(entry.ContainerOnly ? "（僅供共用）" : "")}";
+
+    private static string StatusLabel(CgSourceStatus status) => status switch
+    {
+        CgSourceStatus.Missing => "缺檔",
+        CgSourceStatus.MissingSpine => "缺 spine",
+        CgSourceStatus.Anomaly => "異常",
+        _ => "已完成"
+    };
+
+    private static string StatusCss(CgSourceStatus status) => status switch
+    {
+        CgSourceStatus.Missing => "missing",
+        CgSourceStatus.MissingSpine => "missing-spine",
+        CgSourceStatus.Anomaly => "anomaly",
+        _ => "done"
+    };
+
+    private static string UnityLabel(CgUnityStatus status) => status switch
+    {
+        CgUnityStatus.NotExported => "未輸出",
+        CgUnityStatus.Placeholder => "暫代圖",
+        CgUnityStatus.IncompleteDiffs => "差分不全",
+        CgUnityStatus.SourceNewer => "來源較新",
+        _ => "已同步"
+    };
+
+    private static string UnityCss(CgUnityStatus status) => status.ToString().ToLowerInvariant();
+
+    private string LogSummary()
+    {
+        var lines = State.Log;
+        int Count(CgLogLevel level) => lines.Count(l => l.Level == level);
+        return $"缺檔 {Count(CgLogLevel.Missing)}｜缺 spine {Count(CgLogLevel.MissingSpine)}｜異常 {Count(CgLogLevel.Anomaly)}｜已完成 {Count(CgLogLevel.Done)}｜錯誤 {Count(CgLogLevel.Error)}";
+    }
+
+    private async Task CopyLog() =>
+        await CopyText(string.Join("\n", State.Log.Select(l => $"{l.Time:HH:mm:ss} {l.Text}")));
+
+    private async Task CopyText(string text) => await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+
+    private async Task JumpToNode(string playscriptName) => await FlowGraphFocusCoordinator.RequestFocusAsync(playscriptName);
+
+    private static string? FirstOf(List<string> paths) => paths.FirstOrDefault();
+
+    // ---- 右鍵選單 ----
+
+    private void OpenContextMenu(MouseEventArgs e, CgEntry entry)
+    {
+        _menuEntry = entry;
+        _menuX = e.ClientX;
+        _menuY = e.ClientY;
+    }
+
+    private void CloseMenu() => _menuEntry = null;
+
+    private void MenuAction(Action action)
+    {
+        _menuEntry = null;
+        action();
+    }
+
+    private async Task MenuActionAsync(Func<Task> action)
+    {
+        _menuEntry = null;
+        await action();
+    }
+
+    // ---- 輸出至 Unity：開始前把覆蓋 / 略過問完 ----
+
+    private void StartUnityExport(List<CgEntry> entries)
+    {
+        if (entries.Count == 0)
+            return;
+
+        _pendingExport = entries.ToList();
+        _overwriteQuestions = State.GetOverwriteQuestions(entries);
+        _applyToRemaining = false;
+        if (_overwriteQuestions.Count == 0)
+            FinishOverwriteQuestions();
+    }
+
+    private void AnswerOverwrite(bool overwrite)
+    {
+        var answered = _applyToRemaining ? _overwriteQuestions.ToList() : new List<CgOverwriteQuestion> { _overwriteQuestions[0] };
+        foreach (var question in answered)
+        {
+            if (!overwrite)
+            {
+                _pendingExport.Remove(question.Entry);
+                State.AddLog(CgLogLevel.Info, $"[{question.Entry.CgId}] Unity 裡已有，略過。");
+            }
+            _overwriteQuestions.Remove(question);
+        }
+
+        if (_overwriteQuestions.Count == 0)
+            FinishOverwriteQuestions();
+    }
+
+    private void CancelOverwrite()
+    {
+        _overwriteQuestions.Clear();
+        _pendingExport.Clear();
+        State.AddLog(CgLogLevel.Info, "已取消輸出至 Unity。");
+    }
+
+    private void FinishOverwriteQuestions()
+    {
+        if (_pendingExport.Count > 0)
+            State.EnqueueUnityExport(_pendingExport);
+        _pendingExport = new List<CgEntry>();
+    }
+
+    // ---- CG 共用表 ----
+
+    private sealed class ShareRow
+    {
+        public string? SavedCgId { get; set; }
+        public string CgId { get; set; } = string.Empty;
+        public string Prefab { get; set; } = string.Empty;
+        public List<string> Diffs { get; set; } = new();
+        public bool Dirty { get; set; }
+    }
+
+    private void OpenShareTable()
+    {
+        _shareRows = State.Shares.Select(s => new ShareRow { SavedCgId = s.CgId, CgId = s.CgId, Prefab = s.Prefab, Diffs = s.Diffs.ToList() }).ToList();
+        _shareError = null;
+        _shareTableOpen = true;
+    }
+
+    private async Task CloseShareTable()
+    {
+        _shareTableOpen = false;
+        await State.ScanAsync();
+    }
+
+    private Dictionary<string, string> TakenDiffs(ShareRow row) =>
+        _shareRows.Where(r => r != row && r.Prefab == row.Prefab)
+            .SelectMany(r => r.Diffs.Select(d => (d, r.CgId)))
+            .GroupBy(x => x.d)
+            .ToDictionary(x => x.Key, x => x.First().CgId);
+
+    private void ToggleShareDiff(ShareRow row, string diff, bool selected)
+    {
+        if (selected && !row.Diffs.Contains(diff))
+            row.Diffs.Add(diff);
+        else if (!selected)
+            row.Diffs.Remove(diff);
+        row.Diffs.Sort(NaturalStringComparer.Instance);
+        row.Dirty = true;
+    }
+
+    private void SaveShareRow(ShareRow row)
+    {
+        _shareError = State.SaveShare(row.SavedCgId, new CgShare { CgId = row.CgId, Prefab = row.Prefab, Diffs = row.Diffs.ToList() });
+        if (_shareError != null)
+            return;
+        row.CgId = row.CgId.Trim();
+        row.SavedCgId = row.CgId;
+        row.Dirty = false;
+    }
+
+    private void DeleteShareRow(ShareRow row)
+    {
+        if (row.SavedCgId != null)
+            State.DeleteShare(row.SavedCgId);
+        _shareRows.Remove(row);
+    }
+}

@@ -17,6 +17,9 @@ public static class NodeScriptTableStore
     // The "功能" column's legal values and per-function rules are documented in the external data folder's
     // own AGENTS.md (read by the AI actually filling these files in) rather than echoed into every .md here.
     private static readonly string[] Headers = { "名字", "表情", "配音情緒", "台詞", "功能", "備註", "參數" };
+    public const int TextColumn = 3;
+    public const int FunctionColumn = 4;
+    public const int ParameterColumn = 6;
 
     // Name-only existence check — used by PipelineStatusState's "本地劇本" column, which needs to flag a
     // leftover .md file even for a playscript name that no longer has a live graph node (and therefore no
@@ -80,7 +83,13 @@ public static class NodeScriptTableStore
     // HasFile/HasFileAt first when "no local content" is a meaningful, non-error outcome for them.
     public static List<string[]> ReadRows(string dataFolder, string playscriptName, string? guid)
     {
-        var path = ResolvePath(dataFolder, playscriptName, guid);
+        return ReadRowsFromFile(ResolvePath(dataFolder, playscriptName, guid));
+    }
+
+    // Path-based form of ReadRows, for callers that walk the Nodes folder themselves (CgScriptScanner)
+    // instead of resolving one playscript name at a time.
+    public static List<string[]> ReadRowsFromFile(string path)
+    {
         if (!File.Exists(path))
             return new List<string[]>();
 
