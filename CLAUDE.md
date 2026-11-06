@@ -130,6 +130,15 @@ validation), then `MergeProvenance` (rows nobody wrote / rows a side added that 
 Blank rows are kept in sync (`ReadRowsFromFile(path, keepBlankRows: true)`), but an all-blank table equals an
 empty one (`CloudRows.Normalize`).
 
+**Flow graph:** once uploaded (雲端同步 → 上傳流程圖, `sf graph-push`), the cloud copy `db$<ws>$sf.flowgraph.main`
+(`cloud/src/flowgraph.ts`: the canonical graph as Y maps, plus per-node Memo Y.Texts) is the master. It is edited
+in the AFFiNE web editor (the same `graph-editor.js` canvas, saved as per-field changes relative to what that
+editor loaded); 下載 pulls it into blueprint.json's `graph` (keeping `baseGraph`, so 匯出至Unity still merges
+against Unity), writes the Memos to the nodes' .json and moves renamed nodes' files. The marker
+`cloud-base/<ws>/flowgraph-managed.json` makes the local flow graph tab read-only (`GraphEditorState.IsCloudManaged`
+refuses 存檔 / 從Unity匯入 / field and Memo edits; the canvas gets `read_only`). 用本機流程圖覆蓋雲端 is the explicit,
+confirmed escape hatch. The node schema (ProcessNodeSchema.json) travels with the graph upload into the rules doc.
+
 `Core/Cloud/CloudRulesExport` builds the rules JSON (function list from `PlayscriptFunctionCatalog`, 名字 lists from
 the enum labels, each character card's 表情 labels); it is uploaded with every 上傳 and read by the MCP tools and the
 web editor for closed-list checks only. **`PlayscriptFunctionCatalog` is a third place the 功能 list lives** — see

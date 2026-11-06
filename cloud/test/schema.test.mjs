@@ -83,3 +83,66 @@ test("checkRows flags unknown function, name and per-character face", () => {
   ]);
   assert.deepEqual(issues.map(i => `${i.row}:${i.column}`), ["2:表情", "3:功能", "3:名字"]);
 });
+
+// ---------- flow graph ----------
+import { createFlowGraph } from "../dist/flowgraph.js";
+import { readFileSync, existsSync } from "fs";
+const F = createFlowGraph(Y);
+const BLUEPRINT = "E:/DevTool/_sf-cloud-test/data/blueprint.json";
+const sortGraph = g => JSON.parse(JSON.stringify({ ...g,
+  nodes: [...g.nodes].sort((a, b) => a.id.localeCompare(b.id)),
+  edges: [...g.edges].map(e => JSON.stringify(e)).sort(),
+  groups: [...g.groups].map(x => ({ ...x, nodes: [...x.nodes].sort() })).sort((a, b) => a.id.localeCompare(b.id)),
+  stickyNotes: [...g.stickyNotes].sort((a, b) => a.id.localeCompare(b.id)) }));
+
+test("flow graph round-trips the real blueprint graph losslessly", { skip: !existsSync(BLUEPRINT) }, () => {
+  const graph = JSON.parse(readFileSync(BLUEPRINT, "utf8")).graph;
+  const doc = new Y.Doc();
+  F.writeGraph(doc, graph);
+  const back = F.readGraph(doc);
+  assert.deepEqual(sortGraph(back), sortGraph(graph));
+  // Through an encoded update too (what actually goes over the wire).
+  const doc2 = new Y.Doc();
+  Y.applyUpdate(doc2, Y.encodeStateAsUpdate(doc));
+  assert.deepEqual(sortGraph(F.readGraph(doc2)), sortGraph(graph));
+});
+
+test("two people's saves from the same base both survive", () => {
+  const base = {
+    schemaVersion: 1, graphId: "PlayscriptProcessor", stickyNotes: [], groups: [],
+    nodes: [
+      { id: "a", type: "playscript", position: { x: 0, y: 0, width: 220, height: 140 }, data: { playscriptId: "A1/1" } },
+      { id: "b", type: "and", position: { x: 300, y: 0, width: 100, height: 60 }, data: {} },
+    ],
+    edges: [],
+  };
+  const a = new Y.Doc(), b = new Y.Doc();
+  F.writeGraph(a, base);
+  Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+  // A moves node a; B renames node a and adds a link.
+  const editA = structuredClone(base); editA.nodes[0].position.x = 50;
+  const editB = structuredClone(base); editB.nodes[0].data.playscriptId = "A1/1_改名";
+  editB.edges.push({ fromNode: "a", fromPort: "isFinish", toNode: "b", toPort: "condition" });
+  F.writeGraph(a, editA, base);
+  F.writeGraph(b, editB, base);
+  Y.applyUpdate(a, Y.encodeStateAsUpdate(b)); Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+  const g = F.readGraph(a);
+  assert.equal(g.nodes[0].position.x, 50);
+  assert.equal(g.nodes[0].data.playscriptId, "A1/1_改名");
+  assert.equal(g.edges.length, 1);
+  assert.deepEqual(sortGraph(g), sortGraph(F.readGraph(b)));
+});
+
+test("a link to a node someone else deleted is dropped", () => {
+  const base = { schemaVersion: 1, graphId: "g", stickyNotes: [], groups: [], edges: [],
+    nodes: [{ id: "a", type: "and", position: { x: 0, y: 0, width: 1, height: 1 }, data: {} },
+            { id: "b", type: "and", position: { x: 0, y: 0, width: 1, height: 1 }, data: {} }] };
+  const a = new Y.Doc(), b = new Y.Doc();
+  F.writeGraph(a, base); Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+  F.writeGraph(a, { ...base, nodes: [base.nodes[0]] }, base);
+  F.writeGraph(b, { ...base, edges: [{ fromNode: "a", fromPort: "o", toNode: "b", toPort: "i" }] }, base);
+  Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+  const g = F.readGraph(a);
+  assert.equal(g.nodes.length, 1);
+  assert.equal(g.edges.length, 0);
+});

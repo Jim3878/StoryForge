@@ -107,6 +107,8 @@ public sealed class GraphEditorState
 
             RefreshSyncState();
             StatusMessage = prefix + StatusMessage + DescribeSyncState() + DescribeContentFileState();
+            if (IsCloudManaged)
+                StatusMessage += "；" + CloudManagedMessage;
             return ToPayload();
         }
         catch (Exception e)
@@ -123,6 +125,8 @@ public sealed class GraphEditorState
     // 存檔：把畫布的內容套用到模型，只寫入藍圖，不碰 Unity 的檔案
     public void ApplyAndSave(GraphEditorExport export)
     {
+        if (RefuseCloudManaged("存檔"))
+            return;
         if (_model == null)
         {
             LastSaveReport = new SaveReport(SaveOutcome.Failure, "存檔失敗", new[] { "流程圖尚未載入，請先切換到流程圖分頁或按「讀取」。" });
@@ -173,6 +177,8 @@ public sealed class GraphEditorState
     // 用 Unity 的版本覆蓋藍圖。覆蓋前若藍圖和 Unity 不同，先把藍圖備份起來。呼叫端之後要重新載入流程圖。
     public void ImportFromUnity()
     {
+        if (RefuseCloudManaged("從Unity匯入"))
+            return;
         if (_model == null || _blueprintPath == null)
         {
             LastSaveReport = new SaveReport(SaveOutcome.Failure, "從Unity匯入失敗", new[] { "流程圖尚未載入。" });
@@ -403,6 +409,91 @@ public sealed class GraphEditorState
         return parts.Count == 0 ? string.Empty : "；" + string.Join("；", parts);
     }
 
+    // ---------- 雲端同步 (cloud-managed flow graph) ----------
+
+    // Once the flow graph has been uploaded to the cloud workspace, the cloud copy is the master: edits happen
+    // in the AFFiNE web editor and arrive here through 雲端同步's 下載. Exporting (匯出成C#, 匯出至Unity) still works.
+    public bool IsCloudManaged => StoryForge.Core.Cloud.CloudBaseStore.FlowGraphManagedFor(_appSettings);
+
+    public const string CloudManagedMessage = "流程圖由雲端管理：請在 AFFiNE 網頁版的「StoryForge 流程圖」編輯，再到「雲端同步」按「下載」。";
+
+    private bool RefuseCloudManaged(string action)
+    {
+        if (!IsCloudManaged)
+            return false;
+        StatusMessage = $"{action}已擋下。{CloudManagedMessage}";
+        LastSaveReport = new SaveReport(SaveOutcome.Failure, $"{action}已擋下", new[] { CloudManagedMessage });
+        return true;
+    }
+
+    // What 雲端同步 uploads the first time: the saved graph (as on disk, not unsaved canvas edits) and memos.
+    public (string GraphJson, Dictionary<string, string> Memos)? BuildCloudUpload()
+    {
+        if (_blueprintPath == null || !File.Exists(_blueprintPath))
+            return null;
+        var blueprint = CanonicalGraphJson.ParseBlueprint(File.ReadAllText(_blueprintPath));
+        var memos = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var node in blueprint.Graph.Nodes)
+        {
+            if (node.Type != PlayscriptProcessNodeTypeName)
+                continue;
+            var name = node.Data.Value<string>("playscriptId");
+            if (string.IsNullOrEmpty(name))
+                continue;
+            var memo = NodeContentStore.Read(_appSettings.ExternalDataFolder, name, node.Id)?.Memo;
+            if (!string.IsNullOrEmpty(memo))
+                memos[node.Id] = memo;
+        }
+        return (CanonicalGraphJson.Serialize(blueprint.Graph, _model?.Schema), memos);
+    }
+
+    // 下載: the cloud graph replaces the blueprint's `graph`; `baseGraph` (what Unity last saw) stays, so
+    // 匯出至Unity still merges against Unity correctly. Memos go to the nodes' .json files. Returns a summary;
+    // the caller reloads the canvas afterwards (ReloadCoordinator).
+    public string ApplyCloudGraph(CanonicalGraphDocument cloudGraph, IReadOnlyDictionary<string, string> memos)
+    {
+        if (_blueprintPath == null || _baseGraph == null || _model == null)
+            throw new InvalidOperationException("流程圖尚未載入，請先切換到流程圖分頁。");
+
+        CanonicalGraphJson.Normalize(cloudGraph, _model.Schema);
+        var current = _model.BuildCanonicalDocument();
+        var changes = CanonicalGraphJson.DescribeChanges(current, cloudGraph, _model.Schema).Count;
+        if (changes > 0 && File.Exists(_blueprintPath))
+            Backup(_blueprintPath, "blueprint");
+        WriteBlueprint(cloudGraph, _baseGraph);
+
+        var memoWrites = 0;
+        foreach (var node in cloudGraph.Nodes)
+        {
+            if (node.Type != PlayscriptProcessNodeTypeName)
+                continue;
+            var name = node.Data.Value<string>("playscriptId");
+            if (string.IsNullOrEmpty(name))
+                continue;
+            memos.TryGetValue(node.Id, out var memo);
+            memo ??= string.Empty;
+            var entry = NodeContentStore.Read(_appSettings.ExternalDataFolder, name, node.Id);
+            if ((entry?.Memo ?? string.Empty) == memo)
+                continue;
+            entry ??= new NodeContentEntry { Guid = node.Id, PlayscriptName = name };
+            entry.Memo = memo;
+            NodeContentStore.Write(_appSettings.ExternalDataFolder, entry);
+            memoWrites++;
+        }
+
+        return changes == 0 && memoWrites == 0 ? "流程圖沒有變動" : $"流程圖 {changes} 處變動、{memoWrites} 份 Memo 更新";
+    }
+
+    // After a cloud download is loaded: move .md/.json files of nodes renamed in the cloud (same as 存檔 does).
+    public int SyncRenamedFilesAfterCloudDownload()
+    {
+        if (_model == null)
+            return 0;
+        var collisions = SyncRenamedScriptFiles();
+        NodeFileIndex.Rebuild(_appSettings.ExternalDataFolder);
+        return collisions.Count;
+    }
+
     private void PersistBlueprint()
     {
         if (_model == null || _baseGraph == null)
@@ -619,6 +710,8 @@ public sealed class GraphEditorState
     // to open the 流程圖 tab and press 存檔 themselves.
     public void SaveModelOnly()
     {
+        if (RefuseCloudManaged("存檔"))
+            return;
         try
         {
             var renameCollisions = SyncRenamedScriptFiles();
@@ -1206,7 +1299,13 @@ public sealed class GraphEditorState
         }
     }
 
-    public void SetNodeMemo(string nodeGuid, string memo) => UpdateNodeContent(nodeGuid, entry => entry.Memo = memo);
+    public void SetNodeMemo(string nodeGuid, string memo)
+    {
+        // Memos are part of the cloud flow graph once it is cloud-managed.
+        if (RefuseCloudManaged("修改 Memo"))
+            return;
+        UpdateNodeContent(nodeGuid, entry => entry.Memo = memo);
+    }
 
     public void SetNodeConflict(string nodeGuid, string conflict) =>
         UpdateNodeContent(nodeGuid, entry => entry.Conflict = conflict);
@@ -1234,7 +1333,7 @@ public sealed class GraphEditorState
     // makes calling it again there for an already-created node a safe no-op.
     public void CreateNode(string guid, string typeName, float x, float y)
     {
-        if (_model == null || _model.FindNode(guid) != null)
+        if (IsCloudManaged || _model == null || _model.FindNode(guid) != null)
             return;
 
         var schema = _model.GetSchema(typeName);
@@ -1360,6 +1459,8 @@ public sealed class GraphEditorState
         var node = _model?.FindNode(nodeGuid);
         if (node == null)
             return null;
+        if (RefuseCloudManaged("修改節點欄位"))
+            return node.Fields.TryGetValue(fieldName, out var current) ? current?.ToString() ?? string.Empty : string.Empty;
 
         if (string.IsNullOrEmpty(value))
         {
@@ -1466,6 +1567,7 @@ public sealed class GraphEditorState
 
         var payload = new GraphEditorPayload
         {
+            ReadOnly = IsCloudManaged,
             Settings = new GraphSettingsDto
             {
                 NodeFrozenTextSize = model.Settings.NodeFrozenTextSize,

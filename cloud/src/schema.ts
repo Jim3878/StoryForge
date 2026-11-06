@@ -79,10 +79,12 @@ export function createSchema(Y: typeof YType) {
       });
     });
     list.sort((a, b) => (a.chapter + "/" + a.name).localeCompare(b.chapter + "/" + b.name));
+    const modules = (meta.get("modules") ?? {}) as { flowGraph?: { enabled?: boolean } };
     return {
       exists: meta.size > 0,
       schemaVersion: Number(meta.get("schemaVersion") ?? 0),
       minExtensionVersion: String(meta.get("minExtensionVersion") ?? ""),
+      flowGraphEnabled: modules.flowGraph?.enabled === true,
       playscripts: list,
     };
   }
@@ -100,6 +102,21 @@ export function createSchema(Y: typeof YType) {
         outline: { enabled: false },
       });
     }
+  }
+
+  // The flow graph module is on once a graph was uploaded: from then on the cloud graph is the master and
+  // local StoryForge's flow graph tab is read-only.
+  function enableFlowGraph(doc: YType.Doc) {
+    const meta = doc.getMap("meta");
+    const modules = { ...((meta.get("modules") ?? {}) as Record<string, any>) };
+    if (modules.flowGraph?.enabled === true) return;
+    modules.flowGraph = { ...(modules.flowGraph ?? {}), enabled: true, instances: "single" };
+    meta.set("modules", modules);
+  }
+
+  function readNodeSchema(doc: YType.Doc): string | null {
+    const v = doc.getMap("rules").get("nodeSchema");
+    return typeof v === "string" ? v : null;
   }
 
   function upsertIndex(doc: YType.Doc, entry: PlayscriptIndexEntry) {
@@ -309,7 +326,7 @@ export function createSchema(Y: typeof YType) {
   }
 
   return {
-    readProject, ensureProject, upsertIndex,
+    readProject, ensureProject, upsertIndex, enableFlowGraph, readNodeSchema,
     readRules, writeRules,
     readPlayscript, initPlayscriptMeta, updateCell, insertRows, deleteRows, moveRows, writeRows, setText,
   };

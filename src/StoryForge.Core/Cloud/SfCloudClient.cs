@@ -21,6 +21,15 @@ public sealed class CloudPullResult
     public List<CloudPlayscript> Playscripts { get; set; } = new();
 }
 
+public sealed class CloudGraphPull
+{
+    public bool Exists { get; set; }
+    public bool Enabled { get; set; }
+    public Newtonsoft.Json.Linq.JObject? Graph { get; set; }
+    public Dictionary<string, string> Memos { get; set; } = new();
+    public string Sv { get; set; } = string.Empty;
+}
+
 public sealed class CloudPushItem
 {
     public string Guid { get; set; } = string.Empty;
@@ -96,6 +105,51 @@ public sealed class SfCloudClient
             var parsed = JsonConvert.DeserializeAnonymousType(await File.ReadAllTextAsync(outPath, ct),
                 new { results = new List<CloudPushResult>() });
             return parsed?.results ?? new List<CloudPushResult>();
+        }
+        finally
+        {
+            TryDelete(inPath);
+            TryDelete(outPath);
+        }
+    }
+
+    public async Task<CloudGraphPull> PullGraphAsync(CancellationToken ct = default)
+    {
+        var outPath = TempFile("graph-pull");
+        try
+        {
+            await RunAsync(new[] { "sf", "graph-pull", "--workspace", _workspaceId, "--out", outPath }, ct);
+            return JsonConvert.DeserializeObject<CloudGraphPull>(await File.ReadAllTextAsync(outPath, ct))
+                   ?? throw new InvalidOperationException("sf graph-pull 沒有回傳資料");
+        }
+        finally
+        {
+            TryDelete(outPath);
+        }
+    }
+
+    /// <param name="graphJson">canonical graph JSON (the blueprint's `graph`)</param>
+    /// <param name="mode">"seed" (only into an empty cloud graph) or "overwrite"</param>
+    /// <returns>null on success, otherwise the reason it was refused</returns>
+    public async Task<string?> PushGraphAsync(string graphJson, IReadOnlyDictionary<string, string> memos, string? nodeSchemaJson,
+        string mode, CancellationToken ct = default)
+    {
+        var inPath = TempFile("graph-in");
+        var outPath = TempFile("graph-out");
+        try
+        {
+            var body = new Newtonsoft.Json.Linq.JObject
+            {
+                ["graph"] = Newtonsoft.Json.Linq.JObject.Parse(graphJson),
+                ["memos"] = Newtonsoft.Json.Linq.JObject.FromObject(memos),
+                ["mode"] = mode,
+            };
+            if (nodeSchemaJson != null)
+                body["nodeSchema"] = nodeSchemaJson;
+            await File.WriteAllTextAsync(inPath, body.ToString(Formatting.None), new UTF8Encoding(false), ct);
+            await RunAsync(new[] { "sf", "graph-push", "--workspace", _workspaceId, "--in", inPath, "--out", outPath }, ct);
+            var result = Newtonsoft.Json.Linq.JObject.Parse(await File.ReadAllTextAsync(outPath, ct));
+            return result.Value<string>("status") == "ok" ? null : result.Value<string>("message") ?? "雲端拒絕了上傳";
         }
         finally
         {

@@ -40,15 +40,19 @@ public sealed class CloudSyncState
 {
     private readonly AppSettings _settings;
     private readonly GraphEditorState _graph;
+    private readonly ReloadCoordinator _reload;
     private readonly Dictionary<string, CloudPlayscript> _lastCloud = new(StringComparer.Ordinal);
     private readonly HashSet<string> _conflicts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _rejected = new(StringComparer.Ordinal);
 
-    public CloudSyncState(AppSettings settings, GraphEditorState graph)
+    public CloudSyncState(AppSettings settings, GraphEditorState graph, ReloadCoordinator reload)
     {
         _settings = settings;
         _graph = graph;
+        _reload = reload;
     }
+
+    public bool IsFlowGraphManaged => IsConfigured && Base().IsFlowGraphManaged;
 
     public bool IsBusy { get; private set; }
     public string? StatusMessage { get; private set; }
@@ -121,6 +125,7 @@ public sealed class CloudSyncState
             return;
         try
         {
+            var graphSummary = await DownloadFlowGraphAsync();
             var pull = await Client().PullAsync();
             LastPullAt = DateTime.Now;
             _lastCloud.Clear();
@@ -174,11 +179,13 @@ public sealed class CloudSyncState
                 written++;
             }
 
-            var parts = new List<string> { $"下載完成：更新 {written} 份" };
+            var parts = new List<string>();
+            if (graphSummary != null) parts.Add(graphSummary);
+            parts.Add($"劇本更新 {written} 份");
             if (conflicts > 0) parts.Add($"{conflicts} 份兩邊都改過，請逐份選擇");
             if (waitingChanged > 0) parts.Add($"{waitingChanged} 份等待合併中的劇本雲端又改了（按「繼續合併」時會處理）");
             if (backupDir != null) parts.Add($"覆寫前的檔案備份在 {backupDir}");
-            StatusMessage = string.Join("；", parts) + "。";
+            StatusMessage = "下載完成：" + string.Join("；", parts) + "。";
         }
         catch (Exception e)
         {
@@ -245,6 +252,65 @@ public sealed class CloudSyncState
         catch (Exception e)
         {
             StatusMessage = $"上傳失敗：{e.Message}";
+        }
+        finally
+        {
+            End();
+        }
+    }
+
+    // ---------- flow graph ----------
+
+    // Pulls the cloud flow graph (if one was uploaded) into blueprint.json and reloads the canvas, before the
+    // tables are downloaded so nodes created in the web editor already exist locally. Null = no cloud graph.
+    private async Task<string?> DownloadFlowGraphAsync()
+    {
+        var pull = await Client().PullGraphAsync();
+        if (!pull.Exists || pull.Graph == null)
+            return null;
+        Base().SetFlowGraphManaged();
+        var graph = CanonicalGraphJson.Parse(pull.Graph.ToString(Newtonsoft.Json.Formatting.None));
+        var summary = _graph.ApplyCloudGraph(graph, pull.Memos);
+        await _reload.RequestReloadAsync();
+        var collisions = _graph.SyncRenamedFilesAfterCloudDownload();
+        return collisions > 0 ? $"{summary}（{collisions} 個改名的劇本檔撞名，沒有搬，請到流程圖分頁處理）" : summary;
+    }
+
+    // First upload of the local flow graph (seed), or — explicitly confirmed — replacing the cloud graph with
+    // the local one. Afterwards the local flow graph tab is read-only.
+    public async Task UploadFlowGraphAsync(bool overwrite)
+    {
+        if (!await BeginAsync(overwrite ? "用本機流程圖覆蓋雲端…" : "上傳流程圖…"))
+            return;
+        try
+        {
+            if (_graph.HasUnsavedChanges())
+            {
+                StatusMessage = "流程圖分頁還有沒存檔的修改，請先存檔再上傳。";
+                return;
+            }
+            var upload = _graph.BuildCloudUpload()
+                         ?? throw new InvalidOperationException("還沒有藍圖（blueprint.json），請先在流程圖分頁存檔一次。");
+            string? nodeSchema = null;
+            var schemaPath = Path.Combine(ProjectPaths.ResolveUnityProjectRoot(), "Assets", "06.Definition",
+                "PlayscriptOfflineExport", "ProcessNodeSchema.json");
+            if (File.Exists(schemaPath))
+                nodeSchema = await File.ReadAllTextAsync(schemaPath);
+            var refused = await Client().PushGraphAsync(upload.GraphJson, upload.Memos, nodeSchema, overwrite ? "overwrite" : "seed");
+            if (refused != null)
+            {
+                StatusMessage = $"流程圖沒有上傳：{refused}";
+                return;
+            }
+            Base().SetFlowGraphManaged();
+            await _reload.RequestReloadAsync();
+            StatusMessage = overwrite
+                ? "已用本機流程圖覆蓋雲端。本機流程圖分頁現在是唯讀，之後請在網頁版編輯。"
+                : "流程圖已上傳。之後請在 AFFiNE 網頁版的「StoryForge 流程圖」編輯，本機流程圖分頁改成唯讀，按「下載」取得最新版。";
+        }
+        catch (Exception e)
+        {
+            StatusMessage = $"上傳流程圖失敗：{e.Message}";
         }
         finally
         {

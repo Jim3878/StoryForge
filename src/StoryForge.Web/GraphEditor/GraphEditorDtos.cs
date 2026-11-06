@@ -9,6 +9,8 @@ public sealed class GraphEditorPayload
     public List<EdgeDto> Edges { get; set; } = new();
     public List<GroupDto> Groups { get; set; } = new();
     public GraphSettingsDto Settings { get; set; } = new();
+    // 雲端同步: the flow graph is cloud-managed, the local canvas only views it.
+    public bool ReadOnly { get; set; }
 }
 
 // The subset of AppSettings the canvas itself needs at render time — the JS side reads these instead of

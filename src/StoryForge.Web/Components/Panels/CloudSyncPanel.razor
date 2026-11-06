@@ -32,6 +32,33 @@
                 <div class="cs-hint">規則跟 git 一樣：雲端有新改動就要先下載；兩邊都改過的劇本要先處理才能上傳。上傳時一併更新規則 JSON。</div>
             </div>
 
+            <div class="cs-card">
+                <div class="cs-card-title">流程圖</div>
+                @if (State.IsFlowGraphManaged)
+                {
+                    <div>由雲端管理。請在 AFFiNE 網頁版編輯，按「下載」取得最新版；本機流程圖分頁是唯讀。</div>
+                    <div class="cs-actions" style="margin-top:8px">
+                        @if (_confirmOverwrite)
+                        {
+                            <span class="cs-warn">會用本機的流程圖蓋掉雲端（網頁上別人的修改會不見）。確定？</span>
+                            <button @onclick="OverwriteGraph" disabled="@State.IsBusy">確定覆蓋</button>
+                            <button @onclick="() => _confirmOverwrite = false">取消</button>
+                        }
+                        else
+                        {
+                            <button @onclick="() => _confirmOverwrite = true" disabled="@State.IsBusy">用本機流程圖覆蓋雲端…</button>
+                        }
+                    </div>
+                }
+                else
+                {
+                    <div>還沒上傳。上傳後雲端就是主版本：大家在網頁版編輯，本機流程圖分頁改成唯讀。</div>
+                    <div class="cs-actions" style="margin-top:8px">
+                        <button @onclick="() => State.UploadFlowGraphAsync(false)" disabled="@(State.IsBusy || !State.IsConfigured)">⬆ 上傳流程圖</button>
+                    </div>
+                }
+            </div>
+
             @if (State.Waiting.Count > 0)
             {
                 <div class="cs-card cs-card-wait">
@@ -170,6 +197,14 @@
 </style>
 
 @code {
+    private bool _confirmOverwrite;
+
+    private async Task OverwriteGraph()
+    {
+        _confirmOverwrite = false;
+        await State.UploadFlowGraphAsync(true);
+    }
+
     private bool HasConflicts => State.Items.Any(i => i.Status == CloudItemStatus.Conflict);
 
     private static string Label(CloudItemStatus s) => s switch

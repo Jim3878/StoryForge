@@ -8,6 +8,7 @@ import {
 } from "./schema.js";
 import { parseRules, type Rules } from "./rules.js";
 import { EXTENSION_VERSION } from "./version.js";
+import { createFlowGraph, flowgraphDocId, type CanonicalGraph } from "./flowgraph.js";
 
 function cmpVersion(a: string, b: string) {
   const pa = a.split(/[.-]/).map(x => parseInt(x, 10) || 0);
@@ -38,6 +39,7 @@ const CONCURRENCY = 8;
 export function createStore(ctx: HostContext) {
   const { Y } = ctx;
   const schema = createSchema(Y);
+  const flow = createFlowGraph(Y);
 
   async function withSession<T>(workspaceId: string | undefined, fn: (s: DocSession) => Promise<T>): Promise<T> {
     const s = await ctx.openSession(workspaceId);
@@ -135,7 +137,53 @@ export function createStore(ctx: HostContext) {
     return results;
   }
 
-  return { schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
+  // ----- flow graph (cloud is the master once seeded) -----
+
+  async function pullGraph(s: DocSession) {
+    const doc = await s.load(flowgraphDocId(s.workspaceId));
+    const p = await project(s);
+    return {
+      exists: !flow.isEmpty(doc),
+      enabled: p.flowGraphEnabled,
+      graph: flow.isEmpty(doc) ? null : flow.readGraph(doc),
+      memos: flow.readMemos(doc),
+      sv: Buffer.from(Y.encodeStateVector(doc)).toString("base64"),
+    };
+  }
+
+  type GraphPush = {
+    graph: CanonicalGraph;
+    memos?: Record<string, string>;
+    nodeSchema?: string;
+    // seed: only into an empty cloud graph. overwrite: replace the cloud graph with this one (two-way).
+    mode: "seed" | "overwrite";
+  };
+
+  async function pushGraph(s: DocSession, body: GraphPush) {
+    await requireWritable(s);
+    const docId = flowgraphDocId(s.workspaceId);
+    const doc = await s.load(docId);
+    if (body.mode === "seed" && !flow.isEmpty(doc)) {
+      return { status: "rejected" as const, message: "雲端已經有流程圖了。要用本機的蓋掉雲端，請改用「用本機流程圖覆蓋雲端」。" };
+    }
+    const before = Y.encodeStateVector(doc);
+    let stats: unknown;
+    doc.transact(() => {
+      stats = flow.writeGraph(doc, body.graph);
+      if (body.memos) flow.writeMemos(doc, body.memos);
+    });
+    await s.push(docId, doc, before);
+    if (body.nodeSchema) {
+      await mutate(s, rulesDocId(s.workspaceId), d => { d.getMap("rules").set("nodeSchema", body.nodeSchema); });
+    }
+    await mutate(s, projectDocId(s.workspaceId), d => d.transact(() => {
+      schema.ensureProject(d);
+      schema.enableFlowGraph(d);
+    }));
+    return { status: "ok" as const, stats };
+  }
+
+  return { flow, pullGraph, pushGraph, schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
 }
 
 export type Store = ReturnType<typeof createStore>;

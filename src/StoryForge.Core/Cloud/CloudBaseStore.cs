@@ -55,6 +55,22 @@ public sealed class CloudBaseStore
         File.Move(tmp, PathFor(guid), overwrite: true);
     }
 
+    // Once the flow graph has been uploaded (or a download found it enabled in the cloud), the cloud graph is
+    // the master: local StoryForge only downloads it and its flow graph tab is read-only.
+    private string FlowGraphMarker => Path.Combine(_folder, "flowgraph-managed.json");
+
+    public bool IsFlowGraphManaged => File.Exists(FlowGraphMarker);
+
+    public void SetFlowGraphManaged()
+    {
+        Directory.CreateDirectory(_folder);
+        File.WriteAllText(FlowGraphMarker, JsonConvert.SerializeObject(new { since = DateTime.Now }));
+    }
+
+    // Is the flow graph cloud-managed for the workspace these settings point at?
+    public static bool FlowGraphManagedFor(Graph.AppSettings settings) =>
+        !string.IsNullOrWhiteSpace(settings.CloudWorkspaceId) && new CloudBaseStore(settings.CloudWorkspaceId.Trim()).IsFlowGraphManaged;
+
     private string PathFor(string guid) => Path.Combine(_folder, Sanitize(guid) + ".json");
 
     private static string Sanitize(string s) =>

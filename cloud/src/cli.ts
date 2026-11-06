@@ -4,6 +4,8 @@
 //   sf pull  --workspace <id> --out <file>
 //   sf push  --workspace <id> --in <file> --out <file>
 //   sf info  --workspace <id>
+//   sf graph-pull --workspace <id> --out <file>
+//   sf graph-push --workspace <id> --in <file> --out <file>   (body: { graph, memos?, nodeSchema?, mode: seed|overwrite })
 
 import { readFileSync, writeFileSync } from "fs";
 import type { HostContext } from "./host.js";
@@ -43,7 +45,17 @@ export async function runCli(args: string[], ctx: HostContext) {
       writeJson(out, { results: await store.withSession(workspaceId, s => store.pushAll(s, body.playscripts ?? [], body.rules ?? undefined)) });
       return;
     }
+    case "graph-pull":
+      writeJson(out, await store.withSession(workspaceId, s => store.pullGraph(s)));
+      return;
+    case "graph-push": {
+      const input = flag(rest, "in");
+      if (!input) throw new Error("sf graph-push 需要 --in <file>");
+      const body = JSON.parse(readFileSync(input, "utf8").replace(/^﻿/, ""));
+      writeJson(out, await store.withSession(workspaceId, s => store.pushGraph(s, body)));
+      return;
+    }
     default:
-      throw new Error("用法：affine-mcp sf info|pull|push --workspace <id> [--in file] [--out file]");
+      throw new Error("用法：affine-mcp sf info|pull|push|graph-pull|graph-push --workspace <id> [--in file] [--out file]");
   }
 }
