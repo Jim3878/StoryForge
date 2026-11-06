@@ -457,6 +457,7 @@ public sealed class GraphEditorState
 
         CanonicalGraphJson.Normalize(cloudGraph, _model.Schema);
         var current = _model.BuildCanonicalDocument();
+        var known = current.Nodes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
         var changes = CanonicalGraphJson.DescribeChanges(current, cloudGraph, _model.Schema).Count;
         if (changes > 0 && File.Exists(_blueprintPath))
             Backup(_blueprintPath, "blueprint");
@@ -481,7 +482,21 @@ public sealed class GraphEditorState
             memoWrites++;
         }
 
-        return changes == 0 && memoWrites == 0 ? "流程圖沒有變動" : $"流程圖 {changes} 處變動、{memoWrites} 份 Memo 更新";
+        // 劇本 nodes added in the web editor get their .json/.md files right away (an empty table template), the
+        // same files 建立劇本檔 would create, so the AI and the 劇本 tables have something to work on locally.
+        var added = cloudGraph.Nodes
+            .Where(n => n.Type == PlayscriptProcessNodeTypeName && !known.Contains(n.Id))
+            .Select(n => (n.Id, Name: n.Data.Value<string>("playscriptId") ?? string.Empty))
+            .Where(n => n.Name.Length > 0)
+            .ToList();
+        if (added.Count > 0)
+        {
+            NodeContentStore.SyncAll(_appSettings.ExternalDataFolder, added);
+            NodeScriptTableStore.SyncAll(_appSettings.ExternalDataFolder, added);
+        }
+
+        var summary = changes == 0 && memoWrites == 0 ? "流程圖沒有變動" : $"流程圖 {changes} 處變動、{memoWrites} 份 Memo 更新";
+        return added.Count > 0 ? $"{summary}、新劇本 {added.Count} 份（已建立劇本檔）" : summary;
     }
 
     // After a cloud download is loaded: move .md/.json files of nodes renamed in the cloud (same as 存檔 does).
