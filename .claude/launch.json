@@ -4,14 +4,47 @@
     {
       "name": "storyforge-web",
       "runtimeExecutable": "dotnet",
-      "runtimeArgs": ["watch", "--non-interactive", "run", "--project", "src/StoryForge.Web"],
+      "runtimeArgs": [
+        "watch",
+        "--non-interactive",
+        "run",
+        "--project",
+        "src/StoryForge.Web"
+      ],
       "port": 5194
     },
     {
       "name": "storyforge-web-test",
       "runtimeExecutable": "dotnet",
-      "runtimeArgs": ["watch", "--non-interactive", "run", "--project", "src/StoryForge.Web", "--", "--urls", "http://localhost:5195"],
+      "runtimeArgs": [
+        "watch",
+        "--non-interactive",
+        "run",
+        "--project",
+        "src/StoryForge.Web",
+        "--",
+        "--urls",
+        "http://localhost:5195"
+      ],
       "port": 5195
+    },
+    {
+      "name": "storyforge-web-cloudtest",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": [
+        "/c",
+        "set STORYFORGE_TEST_DATA_FOLDER=E:\\DevTool\\_sf-cloud-test\\data\\&& set STORYFORGE_TEST_CLOUD_WORKSPACE=ebb8fb8d-e670-48fa-8247-86628c32860f&& dotnet watch --non-interactive run --project src/StoryForge.Web -- --urls http://localhost:5195"
+      ],
+      "port": 5195
+    },
+    {
+      "name": "affine-web-dev",
+      "runtimeExecutable": "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+      "runtimeArgs": [
+        "-lc",
+        "cd /e/Dev/AFFiNE && export PATH=/e/Dev/tools/node22:$PATH YARN_GLOBAL_FOLDER=E:/Dev/tools/yarn-global COREPACK_HOME=E:/Dev/tools/corepack AFFINE_DEV_PROXY_TARGET=https://affine.nineday.com.tw BUILD_TYPE=stable && exec yarn affine @affine/web dev"
+      ],
+      "port": 8080
     }
   ]
 }

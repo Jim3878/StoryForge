@@ -196,8 +196,17 @@ window.storyForgeUi = (function () {
         if (window._storyForgeSaveShortcutBound) return;
         window._storyForgeSaveShortcutBound = true;
 
+        // 在 user 眼裡這是一個獨立 App，不是 Chrome：會跳出 Chrome 自己介面的快捷鍵一律吞掉
+        // （D 書籤、P 列印、F 尋找列、H 歷史、J 下載、U 原始碼、G 尋找下一個）。Ctrl+D 在流程圖的功能
+        // 由 graph-editor.js 自己處理。F5／Ctrl+R、F12、Ctrl+Shift+J/I（開發者工具）保留。
+        const blockedChromeKeys = new Set(["d", "p", "f", "h", "j", "u", "g"]);
+
         window.addEventListener("keydown", function (e) {
             const key = (e.key || "").toLowerCase();
+            if ((e.ctrlKey || e.metaKey) && !e.altKey && blockedChromeKeys.has(key) && !(e.shiftKey && key === "j")) {
+                e.preventDefault();
+                return;
+            }
             if ((e.ctrlKey || e.metaKey) && key === "s") {
                 e.preventDefault();
                 if (document.querySelector(".save-result-overlay")) return;
@@ -295,9 +304,78 @@ window.storyForgeUi = (function () {
         });
     }
 
+    // 表格的「反白列」快捷鍵（目前只有管線表格）：表格在畫面上、焦點不在輸入元件時，
+    // Ctrl+C 複製反白列的劇本名稱（有用滑鼠反白文字時照瀏覽器原本的行為複製文字），空白鍵切換反白列的勾選。
+    // 反白狀態本身在 C# 端；JS 只看 DOM 上有沒有 .ps-row-highlighted 決定要不要攔截按鍵。
+    // 每次 render 都會呼叫，用 window 上的旗標確保同一個表格只綁一次。
+    function bindRowHighlightKeys(tableId, dotNetRef) {
+        const flag = "_storyForgeRowKeysBound_" + tableId;
+        if (window[flag]) return;
+        window[flag] = true;
+
+        function activeTable() {
+            const table = document.getElementById(tableId);
+            return table && table.offsetParent !== null ? table : null;
+        }
+
+        // Shift／Ctrl 點列是多選，不要讓瀏覽器順便反白一大段文字
+        document.addEventListener("mousedown", function (e) {
+            const table = activeTable();
+            if (table && (e.shiftKey || e.ctrlKey || e.metaKey) && e.target.closest &&
+                e.target.closest("#" + tableId + " tbody tr"))
+                e.preventDefault();
+        });
+
+        document.addEventListener("keydown", function (e) {
+            const table = activeTable();
+            if (!table || !table.querySelector("tr.ps-row-highlighted")) return;
+            const target = e.target;
+            const tag = target && target.localName;
+            if (tag === "input" || tag === "textarea" || tag === "select" || (target && target.isContentEditable))
+                return;
+            if (document.querySelector(".ps-context-menu")) return;
+
+            const key = (e.key || "").toLowerCase();
+            if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && key === "c") {
+                const selection = window.getSelection();
+                if (selection && !selection.isCollapsed && selection.toString().trim() !== "") return;
+                e.preventDefault();
+                dotNetRef.invokeMethodAsync("GetHighlightedNamesForCopy").then(function (text) {
+                    if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(function () {});
+                });
+            } else if (key === " " && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+                e.preventDefault();
+                if (!e.repeat) dotNetRef.invokeMethodAsync("ToggleHighlightedRowsChecked");
+            }
+        });
+    }
+
+    // 流程圖節點右鍵「跳到管線狀態」：分頁切換和該列的 render 都是非同步送到瀏覽器的，
+    // 所以輪詢到表格可見（display:block）且該列已在 DOM 上，才把它捲到畫面中間；最多等 2 秒。
+    function scrollRowIntoViewWhenVisible(tableId, playscriptName) {
+        const deadline = Date.now() + 2000;
+        return new Promise(function (resolve) {
+            (function tick() {
+                const table = document.getElementById(tableId);
+                const row = table && table.offsetParent !== null
+                    ? table.querySelector('tbody tr[data-ps-name="' + CSS.escape(playscriptName) + '"]')
+                    : null;
+                if (row) {
+                    row.scrollIntoView({ block: "center" });
+                    resolve(true);
+                } else if (Date.now() > deadline) {
+                    resolve(false);
+                } else {
+                    requestAnimationFrame(tick);
+                }
+            })();
+        });
+    }
+
     return {
         makeDraggable: makeDraggable, makeResizable: makeResizable, makeVResizable: makeVResizable,
         bindSaveShortcut: bindSaveShortcut, makeSortableList: makeSortableList,
+        bindRowHighlightKeys: bindRowHighlightKeys, scrollRowIntoViewWhenVisible: scrollRowIntoViewWhenVisible,
         playSaveFeedback: playSaveFeedback,
         setServerUnsaved: setServerUnsaved, bindUnsavedGuard: bindUnsavedGuard,
     };

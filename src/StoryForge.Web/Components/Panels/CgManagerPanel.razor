@@ -40,6 +40,8 @@
         <button @onclick="() => State.EnqueuePreview(Visible)" title="只處理目前篩選出來的 CG">更新預覽圖</button>
         <button @onclick="() => State.EnqueueExportPng(Visible)" title="從 clip 輸出 1920 PNG 到 clip 同級資料夾，不碰 Unity">輸出 PNG</button>
         <button class="cg-primary" @onclick="() => StartUnityExport(Visible)" title="只處理目前篩選出來的 CG">輸出至 Unity</button>
+        <button class="cg-danger" @onclick="() => StartUnityDelete(Visible)" disabled="@(!State.CanBatchDeleteFromUnity)"
+                title='@(State.CanBatchDeleteFromUnity ? "把目前篩選出來的 CG 從 Unity 專案刪除（打包試玩版用）" : "請先用章節篩選選出要刪的章節")'>從 Unity 刪除</button>
         <button @onclick="OpenShareTable">CG 共用表</button>
         <button @onclick="State.Cancel" disabled="@(!State.IsBusy)">取消</button>
     </div>
@@ -173,6 +175,16 @@
         <button disabled="@(FirstOf(menuEntry.Sources.Clips) == null)" @onclick="() => MenuAction(() => State.OpenFolder(FirstOf(menuEntry.Sources.Clips)))">開啟 clip 檔資料夾</button>
         <button disabled="@(FirstOf(menuEntry.Sources.Spines) == null)" @onclick="() => MenuAction(() => State.OpenFolder(FirstOf(menuEntry.Sources.Spines)))">開啟 spine 檔資料夾</button>
         <button disabled="@(menuEntry.Clip == null)" @onclick="() => MenuAction(() => State.EnqueueExportPng(new[] { menuEntry }))">輸出 PNG</button>
+        @if (_menuFolderPlan is { Action: CgFolderAction.OpenExisting } plan)
+        {
+            <button title="@plan.ExistingFolder" @onclick="() => MenuAction(() => State.OpenFolder(plan.ExistingFolder))">開啟既有資料夾（找不到 clip，檔名可能錯）@(OwnerSuffix(menuEntry))</button>
+        }
+        else
+        {
+            <button disabled="@(_menuFolderPlan?.Action != CgFolderAction.Create)"
+                    title='@(_menuFolderPlan?.Action == CgFolderAction.HasClip ? (menuEntry.Share != null ? "主 CG 已經有 clip" : "已經有 clip") : "複製範本資料夾，資料夾與 clip 改名成 CG 名稱")'
+                    @onclick="() => MenuActionAsync(() => State.CreateFolderFromTemplateAsync(menuEntry))">從範本建立資料夾@(OwnerSuffix(menuEntry))</button>
+        }
         <hr />
         @if (menuEntry.Scripts.Count <= 1)
         {
@@ -198,6 +210,52 @@
                     {
                         <button @onclick="() => MenuActionAsync(() => JumpToNode(script.PlayscriptName))">@script.PlayscriptName</button>
                     }
+                </div>
+            </div>
+        }
+        <hr />
+        <button class="cg-menu-danger" @onclick="() => MenuAction(() => StartUnityDelete(new List<CgEntry> { menuEntry }))">從 Unity 刪除</button>
+    </div>
+}
+
+@if (_deletePlan is { } deletePlan)
+{
+    <div class="cg-modal-backdrop">
+        @if (!_deleteConfirming)
+        {
+            <div class="cg-modal">
+                <h3>從 Unity 刪除 @deletePlan.Targets.Count 張 CG</h3>
+                <p>會刪除 prefab / definition / 差分圖 / Spine 資料 / 縮圖，並移除 Addressables 登記。美術來源與共用表不動，之後可再「輸出至 Unity」或從 git 找回。</p>
+                <div class="cg-delete-list">
+                    @foreach (var group in deletePlan.Targets.GroupBy(ChapterLabel).OrderBy(g => g.Key, StringComparer.Ordinal))
+                    {
+                        <div><b>@group.Key</b>（@group.Count()）：@string.Join("、", group.Select(e => e.CgId))</div>
+                    }
+                </div>
+                @if (deletePlan.Skipped.Count > 0)
+                {
+                    <div class="cg-warning">
+                        <b>略過 @deletePlan.Skipped.Count 張：</b>
+                        @foreach (var skip in deletePlan.Skipped)
+                        {
+                            <div>@skip.Entry.CgId：@skip.Reason</div>
+                        }
+                    </div>
+                }
+                <div class="cg-modal-actions">
+                    <button class="cg-danger" @onclick="() => _deleteConfirming = true">刪除</button>
+                    <button @onclick="CancelUnityDelete">取消</button>
+                </div>
+            </div>
+        }
+        else
+        {
+            <div class="cg-modal cg-confirm-modal">
+                <h3>確定要刪除嗎？</h3>
+                <p>確定要從 Unity 專案刪除這 @deletePlan.Targets.Count 張 CG？會刪除 prefab / definition / 差分圖 / 縮圖並移除 Addressables 登記。</p>
+                <div class="cg-modal-actions">
+                    <button class="cg-danger" @onclick="ConfirmUnityDelete">確定刪除</button>
+                    <button @ref="_deleteCancelButton" @onclick="CancelUnityDelete">取消</button>
                 </div>
             </div>
         }
@@ -302,6 +360,8 @@
     button:disabled { opacity: 0.45; cursor: default; }
     button.cg-primary { background: #2f5b8f; border-color: #3d6ea8; color: #fff; }
     button.cg-primary:hover:not(:disabled) { background: #3a6aa3; }
+    button.cg-danger { background: #7a2e2e; border-color: #9a3b3b; color: #fff; }
+    button.cg-danger:hover:not(:disabled) { background: #8f3636; }
     .cg-toolbar-gap { flex: 1 1 auto; }
     .cg-search { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 8px; border-radius: 3px; width: 160px; }
     .cg-size-slider { display: flex; align-items: center; gap: 6px; font-size: 12px; opacity: 0.85; }
@@ -389,6 +449,9 @@
     .cg-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
     .cg-warning { color: #ffab40; }
     .cg-share-modal { max-width: 860px; }
+    .cg-confirm-modal { max-width: 420px; }
+    .cg-delete-list { display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; background: #1e1e1e; border: 1px solid #333; border-radius: 3px; padding: 8px; }
+    .cg-menu button.cg-menu-danger { color: #ff8a80; }
     .cg-share-table { width: 100%; border-collapse: collapse; }
     .cg-share-table th, .cg-share-table td { text-align: left; padding: 4px; border-bottom: 1px solid #333; vertical-align: top; }
     .cg-share-table input, .cg-share-table select { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 3px; padding: 3px 6px; width: 100%; box-sizing: border-box; }
@@ -412,11 +475,16 @@
     private readonly Dictionary<string, int> _diffIndex = new(StringComparer.Ordinal);
     private bool _logOpen = true;
     private CgEntry? _menuEntry;
+    private CgFolderPlan? _menuFolderPlan;
     private double _menuX;
     private double _menuY;
     private List<CgOverwriteQuestion> _overwriteQuestions = new();
     private List<CgEntry> _pendingExport = new();
     private bool _applyToRemaining;
+    private CgDeletePlan? _deletePlan;
+    private bool _deleteConfirming;
+    private bool _focusDeleteCancel;
+    private ElementReference _deleteCancelButton;
     private bool _shareTableOpen;
     private List<ShareRow> _shareRows = new();
     private string? _shareError;
@@ -570,11 +638,15 @@
     private void OpenContextMenu(MouseEventArgs e, CgEntry entry)
     {
         _menuEntry = entry;
+        _menuFolderPlan = State.GetFolderPlan(entry);
         _menuX = e.ClientX;
         _menuY = e.ClientY;
     }
 
     private void CloseMenu() => _menuEntry = null;
+
+    // 共用 CG 的資料夾動作是對主 CG 做，選項上標出來。
+    private static string OwnerSuffix(CgEntry entry) => entry.Share != null ? $"（主 CG：{entry.OwnerId}）" : string.Empty;
 
     private void MenuAction(Action action)
     {
@@ -632,6 +704,55 @@
             State.EnqueueUnityExport(_pendingExport);
         _pendingExport = new List<CgEntry>();
     }
+
+    // ---- 從 Unity 刪除：清單確認 → 第二次確認（預設焦點在取消，按 Enter 不會誤刪） ----
+
+    private void StartUnityDelete(List<CgEntry> entries)
+    {
+        var plan = State.GetDeletePlan(entries);
+        if (plan.Targets.Count == 0)
+        {
+            foreach (var skip in plan.Skipped)
+                State.AddLog(CgLogLevel.Info, $"[{skip.Entry.CgId}] {skip.Reason}，略過。");
+            State.AddLog(CgLogLevel.Info, "從 Unity 刪除：Unity 裡沒有可刪除的 CG。");
+            return;
+        }
+
+        _deletePlan = plan;
+        _deleteConfirming = false;
+    }
+
+    private void CancelUnityDelete()
+    {
+        _deletePlan = null;
+        _deleteConfirming = false;
+        State.AddLog(CgLogLevel.Info, "已取消從 Unity 刪除。");
+    }
+
+    private void ConfirmUnityDelete()
+    {
+        var plan = _deletePlan;
+        _deletePlan = null;
+        _deleteConfirming = false;
+        if (plan != null)
+            State.EnqueueUnityDelete(plan);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_deletePlan != null && _deleteConfirming && !_focusDeleteCancel)
+        {
+            _focusDeleteCancel = true;
+            await _deleteCancelButton.FocusAsync();
+        }
+        else if (!_deleteConfirming)
+        {
+            _focusDeleteCancel = false;
+        }
+    }
+
+    private static string ChapterLabel(CgEntry entry) =>
+        entry.Chapters.Count == 0 ? CgManagerState.NoChapter : string.Join(" / ", entry.Chapters);
 
     // ---- CG 共用表 ----
 

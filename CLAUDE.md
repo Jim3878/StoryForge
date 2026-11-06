@@ -62,7 +62,7 @@ Unity project data fails at that point with a message telling the user to create
 
 ### Always-mounted tab shell
 `Home.razor` renders all panels (`StoryOutlinePanel`/`PipelineStatusPanel`/`FlowGraphPanel`/
-`CharacterCardPanel`, plus two `AudioBrowserPanel` instances for BGM/音效) simultaneously inside `.tab-pane`
+`CharacterCardPanel`, plus two `AudioBrowserPanel` instances for BGM/音效, `CgManagerPanel`, `CloudSyncPanel`) simultaneously inside `.tab-pane`
 divs; switching tabs only toggles `style="display:none/block"`. Panels are never conditionally removed with `@if` — that would destroy and
 recreate the component, losing state (most importantly `FlowGraphPanel`'s LiteGraph canvas: zoom/pan/
 selection). A new panel must follow this same pattern. The tab strip's button order is user-draggable (persisted in
@@ -107,6 +107,34 @@ Heavy work never runs in-process: clips render through the Csp project's `clip_l
 previews through the Spine CLI, and the actual prefab/definition import through Unity's
 `CgImportQueue.ProcessPending` — via its editor hook when `Temp/UnityLockfile` is held, else Unity batchmode
 (`UnityCgImportClient`). All three are queued one at a time in `CgManagerState`.
+
+### 雲端同步 tab (`CloudSyncPanel` / `CloudSyncState`) and the `cloud/` package
+Playscript tables also live in an AFFiNE workspace (`AppSettings.CloudWorkspaceId`) as StoryForge module docs:
+`db$<ws>$sf.project` (index of playscripts by node guid), `db$<ws>$sf.rules` (rules JSON) and one
+`db$<ws>$sf.playscript.<node guid>` per table (`order` Y.Array of rowIds, `rows` rowId → column → Y.Text). The
+layout is defined once in `cloud/src/schema.ts` (TypeScript), which is used by the nineday affine-mcp fork's
+StoryForge extension (`cloud/` builds it; `npm run install-into-mcp` copies it into
+`E:\Devffine-mcp-server\extensions\storyforge`) and copied into the AFFiNE fork's web editor by
+`cloud/scripts/copy-schema-to-affine.mjs`. C# never talks Yjs: `Core/Cloud/SfCloudClient` runs
+`affine-mcp sf pull|push` and exchanges JSON files with it; login lives in affine-mcp's own config.
+
+Sync is git-style and per whole playscript. The base (last agreed version) is per machine in
+`%LocalAppData%\StoryForge\cloud-base\<ws>\<guid>.json` (`CloudBaseStore`). 上傳 is fast-forward only: the
+extension refuses a playscript whose cloud rows differ from the base sent with it. 下載 overwrites only playscripts
+nobody changed locally (backup first, to `備份/雲端同步/<time>/`); both-changed ones offer 用我的 / 用雲端的 / Wait
+merge. Wait merge (`WaitMergeStore`) writes `Conflicts/<guid>/{base,mine,theirs}.md` + `state.json` + an AI
+`README.md` into the data folder; the playscript is read-only in StoryForge (Sheet download skips it) and
+**匯出成C# is blocked as a whole** while any wait exists. 繼續合併 checks, in order: working file changed, cloud
+unchanged since the wait started (else theirs/mine are restacked), `PlayscriptRowValidator` (the real codegen
+validation), then `MergeProvenance` (rows nobody wrote / rows a side added that got dropped) for the user to confirm.
+Blank rows are kept in sync (`ReadRowsFromFile(path, keepBlankRows: true)`), but an all-blank table equals an
+empty one (`CloudRows.Normalize`).
+
+`Core/Cloud/CloudRulesExport` builds the rules JSON (function list from `PlayscriptFunctionCatalog`, 名字 lists from
+the enum labels, each character card's 表情 labels); it is uploaded with every 上傳 and read by the MCP tools and the
+web editor for closed-list checks only. **`PlayscriptFunctionCatalog` is a third place the 功能 list lives** — see
+the "參數" section below. To test against a copy of the data folder, use the `storyforge-web-cloudtest` launch
+config (port 5195, `STORYFORGE_TEST_DATA_FOLDER` / `STORYFORGE_TEST_CLOUD_WORKSPACE` override settings in memory).
 
 ### Flow-graph editor: server model + JS canvas, kept in sync explicitly
 `GraphEditorState` (scoped per circuit) holds the authoritative `GraphDocumentModel` server-side, loaded
@@ -180,8 +208,9 @@ copied for new functions. `OpenCg`/`Diff` also take an optional `;備註` (`TryS
 `SplitParameterValues`, more than one half-width `;` is an error.
 
 Whenever a `功能` value is added, removed, or has its argument column(s) changed in
-`PlayscriptFactoryCodeGenerator` (both `GenerateCode` and its matching check in `ValidateSheetRows`), two
-other places must be updated in the same change, not left for later:
+`PlayscriptFactoryCodeGenerator` (both `GenerateCode` and its matching check in `ValidateSheetRows`), three
+other places must be updated in the same change, not left for later (the third is
+`Core/Cloud/PlayscriptFunctionCatalog`, which feeds the cloud rules JSON):
 1. The legal-value list and per-function rules in `AGENTS.md` at the root of `AppSettings.ExternalDataFolder`
    (default `E:\本地端\遊戲專案管理\臥底治安官\AI劇本\`) — that file, not this one, is what a human or AI
    actually filling in a playscript spreadsheet reads (see the comment atop `NodeScriptTableStore.cs`).
@@ -206,7 +235,7 @@ isn't.
   (`pipeline-filter.json`), `AudioBrowserSettings` (`audio-browser-settings.json`), `AudioWaveformCache`
   (`audio-waveform-cache.json`), `PortraitDescriptionSettings` (`portrait-descriptions.json`),
   `PortraitFilterSettings` (`portrait-filter.json`), the
-  `GuidePathMemoSync` base (`guide-path-memo-base.json`). The old WinForms tool has its own separate
+  `GuidePathMemoSync` base (`guide-path-memo-base.json`), the cloud sync base (`cloud-base/<workspace>/`). The old WinForms tool has its own separate
   `%LocalAppData%\PlayscriptOfflineTool\` folder — `LegacyToolMigration.MigrateIfNeeded()` (called once at
   the top of `Program.cs`, gated by a `legacy-migration-done.txt` marker so it only ever runs once) is the
   one-time bridge that copies/merges the old tool's real tuned values into StoryForge's own folder the first
@@ -229,4 +258,8 @@ the server when that window closes. It redirects the child processes' stdout/std
 `%LocalAppData%\StoryForge\` using `BeginOutputReadLine`/`BeginErrorReadLine` — redirecting without draining
 those streams deadlocks the child the moment its startup logging fills the OS pipe buffer, which is a bug
 this code already hit once and fixed. A desktop shortcut points at the Launcher's Release exe; `publish.bat`
-is what refreshes the Release build both the shortcut and the Launcher's own first-run fallback use.
+is what refreshes the Release build both the shortcut and the Launcher's own first-run fallback use. It publishes
+into `bin/Release/net8.0/publish-staged` (plus a `.complete` marker written last), never into the `publish` folder the
+running app keeps locked; the Launcher's `ApplyStagedWebBuild` swaps it in on its next start, so publishing never
+needs the app closed — only a restart. The Launcher's own exe is still locked while it runs, so `publish.bat` skips
+rebuilding it then; only a change to the Launcher itself needs the app closed before publishing.

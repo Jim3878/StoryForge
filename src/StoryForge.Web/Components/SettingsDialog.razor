@@ -3,6 +3,7 @@
    backdrop, no close-on-outside-click, and the canvas behind it stays fully interactive while it's open —
    only the ×/確定/取消 buttons close it. Draggable by its header via ui-draggable.js (plain DOM mouse
    listeners, not Blazor's own mouse events, so dragging doesn't round-trip over SignalR per pixel). *@
+@using StoryForge.Core.Cg
 @using StoryForge.Core.Graph
 @inject AppSettings AppSettingsStore
 @inject IJSRuntime JS
@@ -117,10 +118,26 @@
                     <span>Unity.exe（留空＝自動）</span>
                     <input type="text" @bind="_unityExePath" />
                 </label>
+                <label>
+                    <span>CG 範本資料夾（右鍵「從範本建立資料夾」複製的來源）</span>
+                    <input type="text" @bind="_cgTemplateFolder" />
+                </label>
+                <label>
+                    <span>範本 clip（範本資料夾底下的相對路徑，會改名成 CG 名稱）</span>
+                    <input type="text" @bind="_cgTemplateClip" />
+                </label>
+                <label>
+                    <span>雲端同步：AFFiNE workspace id（空白＝不使用雲端同步）</span>
+                    <input type="text" @bind="_cloudWorkspaceId" />
+                </label>
+                <label>
+                    <span>雲端同步：affine-mcp 指令（nineday 版，登入資料用它自己的設定）</span>
+                    <input type="text" @bind="_affineMcpCommand" />
+                </label>
             </div>
         </div>
         <div class="settings-dialog-footer">
-            <span class="settings-status">@_statusMessage</span>
+            <span class="settings-status @(_statusWarning ? "warning" : "")">@_statusMessage</span>
             <button @onclick="Apply">套用</button>
             <button @onclick="Ok">確定</button>
             <button @onclick="Cancel">取消</button>
@@ -146,11 +163,13 @@
     .settings-grid input { width: 100%; box-sizing: border-box; background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 7px; border-radius: 3px; }
     .settings-dialog-footer { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid #444; }
     .settings-status { flex: 1 1 auto; opacity: 0.8; font-size: 12px; }
+    .settings-status.warning { color: #ffab40; opacity: 1; }
 </style>
 
 @code {
     private bool _isOpen;
     private string _statusMessage = string.Empty;
+    private bool _statusWarning;
 
     private float _nodeFrozenTextSize;
     private float _nodeMaxTextSize;
@@ -166,6 +185,10 @@
     private string _cspExePath = string.Empty;
     private string _spineCliPath = string.Empty;
     private string _unityExePath = string.Empty;
+    private string _cgTemplateFolder = string.Empty;
+    private string _cgTemplateClip = string.Empty;
+    private string _cloudWorkspaceId = string.Empty;
+    private string _affineMcpCommand = string.Empty;
 
     // Called from the toolbar's 設定 button — snapshots current values into local scratch fields (rather
     // than binding the inputs straight to AppSettingsStore) so 取消 has something to discard back to.
@@ -185,7 +208,12 @@
         _cspExePath = AppSettingsStore.CspExePath;
         _spineCliPath = AppSettingsStore.SpineCliPath;
         _unityExePath = AppSettingsStore.UnityExePath;
+        _cgTemplateFolder = AppSettingsStore.CgTemplateFolder;
+        _cgTemplateClip = AppSettingsStore.CgTemplateClip;
+        _cloudWorkspaceId = AppSettingsStore.CloudWorkspaceId;
+        _affineMcpCommand = AppSettingsStore.AffineMcpCommand;
         _statusMessage = string.Empty;
+        _statusWarning = false;
         _isOpen = true;
         StateHasChanged();
     }
@@ -214,6 +242,10 @@
         AppSettingsStore.CspExePath = _cspExePath;
         AppSettingsStore.SpineCliPath = _spineCliPath;
         AppSettingsStore.UnityExePath = _unityExePath;
+        AppSettingsStore.CgTemplateFolder = _cgTemplateFolder;
+        AppSettingsStore.CgTemplateClip = _cgTemplateClip;
+        AppSettingsStore.CloudWorkspaceId = (_cloudWorkspaceId ?? string.Empty).Trim();
+        AppSettingsStore.AffineMcpCommand = string.IsNullOrWhiteSpace(_affineMcpCommand) ? "affine-mcp.cmd" : _affineMcpCommand.Trim();
         AppSettingsStore.Save();
 
         await JS.InvokeVoidAsync("storyForgeGraph.updateSettings", new
@@ -224,13 +256,19 @@
             groupMaxTextSize = _groupMaxTextSize,
         });
 
-        _statusMessage = "已套用";
+        // 範本有問題照樣存（可能只是暫時沒接上那顆硬碟），但要讓人看到；右鍵建立時還會再檢查一次。
+        var templateProblem = CgFolderTemplate.Validate(_cgTemplateFolder, _cgTemplateClip);
+        _statusWarning = templateProblem != null;
+        _statusMessage = templateProblem != null ? $"已套用，但 CG 範本有問題：{templateProblem}" : "已套用";
     }
 
+    // 有警告時不關視窗，讓人看得到；再按一次確定或取消就關。
     private async Task Ok()
     {
+        var alreadyWarned = _statusWarning;
         await Apply();
-        _isOpen = false;
+        if (!_statusWarning || alreadyWarned)
+            _isOpen = false;
     }
 
     private void Cancel()

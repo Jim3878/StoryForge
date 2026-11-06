@@ -17,7 +17,8 @@ public enum UnityImportKind
     Sprite,
     Placeholder,
     Spine,
-    Share
+    Share,
+    Delete
 }
 
 public sealed class UnityImportItem
@@ -130,7 +131,7 @@ public static class UnityCgImportClient
                 var progress = TryRead<UnityImportProgress>(progressPath);
                 if (progress != null && progress.RequestId == request.RequestId && progress.State == "running")
                 {
-                    onProgress(new CgToolProgress($"Unity 匯入 {progress.Index + 1}/{progress.Total} · {progress.CgId}", $"已 {elapsed:0} 秒"));
+                    onProgress(new CgToolProgress($"Unity {progress.Step} {progress.Index + 1}/{progress.Total} · {progress.CgId}", $"已 {elapsed:0} 秒"));
                 }
                 else if (batch != null)
                 {

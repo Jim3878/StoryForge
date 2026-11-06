@@ -1,0 +1,210 @@
+@using StoryForge.Web.Cloud
+@implements IDisposable
+@inject CloudSyncState State
+@inject StoryForge.Core.Graph.AppSettings Settings
+
+@* 雲端同步: git-style download / upload of playscript tables to the AFFiNE workspace (see
+   docs: the StoryForge cloud design canvas, zone ④). Conflicts are per whole playscript. *@
+<div class="cs-page">
+    <div class="cs-toolbar">
+        <button @onclick="State.DownloadAsync" disabled="@(State.IsBusy || !State.IsConfigured)">⬇ 下載</button>
+        <button @onclick="State.UploadAsync" disabled="@(State.IsBusy || !State.IsConfigured || HasConflicts)"
+                title="@(HasConflicts ? "還有衝突沒處理，處理完才能上傳" : "")">⬆ 上傳</button>
+        <button @onclick="State.RefreshLocal" disabled="@State.IsBusy">重新整理</button>
+        <span class="cs-status">@State.StatusMessage</span>
+    </div>
+
+    <div class="cs-body">
+        <div class="cs-side">
+            <div class="cs-card">
+                <div class="cs-card-title">連線</div>
+                @if (!State.IsConfigured)
+                {
+                    <div class="cs-warn">還沒設定雲端 workspace id。到「設定 → 雲端同步」填入。</div>
+                }
+                else
+                {
+                    <div class="cs-kv"><span>Workspace</span><span>@State.WorkspaceId</span></div>
+                }
+                <div class="cs-kv"><span>指令</span><span>@Settings.AffineMcpCommand</span></div>
+                <div class="cs-kv"><span>流程圖劇本</span><span>@State.LocalPlayscriptCount 個節點</span></div>
+                <div class="cs-kv"><span>上次下載</span><span>@(State.LastPullAt?.ToString("yyyy-MM-dd HH:mm") ?? "（這次開啟後還沒下載）")</span></div>
+                <div class="cs-hint">規則跟 git 一樣：雲端有新改動就要先下載；兩邊都改過的劇本要先處理才能上傳。上傳時一併更新規則 JSON。</div>
+            </div>
+
+            @if (State.Waiting.Count > 0)
+            {
+                <div class="cs-card cs-card-wait">
+                    <div class="cs-card-title">等待合併（@State.Waiting.Count）</div>
+                    <div class="cs-hint">這些劇本在 StoryForge 裡唯讀，匯出成C# 也整個擋下。請叫 Claude 照資料夾裡的 README.md 合併，再按「繼續合併」。</div>
+                    @foreach (var w in State.Waiting)
+                    {
+                        <div class="cs-wait-row">
+                            <div class="cs-wait-name">@w.PlayscriptName</div>
+                            <div class="cs-wait-path">@StoryForge.Core.Cloud.WaitMergeStore.FolderFor(Settings.ExternalDataFolder, w.Guid)</div>
+                            <div class="cs-actions">
+                                <button @onclick="() => State.ContinueMergeAsync(w.Guid)" disabled="@State.IsBusy">繼續合併</button>
+                                <button @onclick="() => State.CancelWait(w.Guid)" disabled="@State.IsBusy">取消等待</button>
+                            </div>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="cs-list">
+            <div class="cs-list-head">
+                <span>狀態</span><span>劇本</span><span>處理</span>
+            </div>
+            @if (State.Items.Count == 0)
+            {
+                <div class="cs-empty">@(State.IsConfigured ? "沒有需要同步的劇本。按「下載」取得雲端的版本。" : "")</div>
+            }
+            @foreach (var item in State.Items)
+            {
+                <div class="cs-row cs-@item.Status.ToString().ToLowerInvariant()" @key="item.Guid">
+                    <span class="cs-badge">@Label(item.Status)</span>
+                    <span class="cs-name" title="@item.Guid">@item.Name @if (item.Message != null) { <em>（@item.Message）</em> }</span>
+                    <span class="cs-actions">
+                        @if (item.Status == CloudItemStatus.Conflict)
+                        {
+                            <button @onclick="() => State.UseMine(item.Guid)">用我的</button>
+                            <button @onclick="() => State.UseTheirs(item.Guid)">用雲端的</button>
+                            <button @onclick="() => State.StartWaitMerge(item.Guid)">Wait merge</button>
+                        }
+                    </span>
+                </div>
+            }
+        </div>
+    </div>
+
+    @if (State.PendingMergeCheck is { } check)
+    {
+        <div class="cs-modal-backdrop">
+            <div class="cs-modal">
+                @if (check.Failure != null)
+                {
+                    <div class="cs-modal-title">還不能完成合併</div>
+                    <p>@check.Failure</p>
+                    <p class="cs-hint">可以繼續修改工作檔再按「繼續合併」，或改選下面其中一個。</p>
+                    <div class="cs-actions">
+                        <button @onclick="State.DismissMergeCheck">繼續等待</button>
+                        <button @onclick="() => State.CancelWait(check.Guid)">取消等待（還原工作檔，重新選擇）</button>
+                    </div>
+                }
+                else if (check.Provenance is { } p)
+                {
+                    <div class="cs-modal-title">④ 確認合併結果</div>
+                    @if (p.IsEmpty)
+                    {
+                        <p>每一列都找得到出處（基準、本機或雲端），也沒有任何一邊新增的列被丟掉。</p>
+                    }
+                    @if (p.NewRows.Count > 0)
+                    {
+                        <div class="cs-sub">AI 新寫的列（@p.NewRows.Count）</div>
+                        <div class="cs-rows">
+                            @foreach (var (row, cells) in p.NewRows)
+                            {
+                                <div class="cs-cellrow"><b>第 @row 列</b> @Describe(cells)</div>
+                            }
+                        </div>
+                    }
+                    @if (p.DroppedRows.Count > 0)
+                    {
+                        <div class="cs-sub">被刪掉的列（@p.DroppedRows.Count）</div>
+                        <div class="cs-rows">
+                            @foreach (var (side, cells) in p.DroppedRows)
+                            {
+                                <div class="cs-cellrow"><b>@side</b> @Describe(cells)</div>
+                            }
+                        </div>
+                    }
+                    <div class="cs-actions">
+                        <button class="cs-primary" @onclick="() => State.ConfirmMerge(check.Guid)">確認，解除唯讀</button>
+                        <button @onclick="State.DismissMergeCheck">再改一下</button>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+</div>
+
+<style>
+    .cs-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; position: relative; }
+    .cs-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1e1e1e; }
+    .cs-status { margin-left: 8px; opacity: 0.85; font-size: 13px; }
+    .cs-body { flex: 1 1 auto; display: flex; min-height: 0; background: #262626; }
+    .cs-side { flex: 0 0 340px; overflow-y: auto; border-right: 1px solid #333; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+    .cs-card { background: #2c2c2c; border: 1px solid #3a3a3a; border-radius: 6px; padding: 10px 12px; font-size: 13px; }
+    .cs-card-wait { border-color: #8a6d12; }
+    .cs-card-title { font-weight: 700; margin-bottom: 8px; }
+    .cs-kv { display: flex; gap: 8px; margin: 3px 0; }
+    .cs-kv span:first-child { flex: 0 0 70px; opacity: 0.6; }
+    .cs-kv span:last-child { word-break: break-all; }
+    .cs-hint { opacity: 0.6; font-size: 12px; margin-top: 6px; line-height: 1.5; }
+    .cs-warn { color: #f0a35e; }
+    .cs-wait-row { border-top: 1px solid #3a3a3a; padding-top: 8px; margin-top: 8px; }
+    .cs-wait-name { font-weight: 600; }
+    .cs-wait-path { font-size: 11px; opacity: 0.6; word-break: break-all; margin: 2px 0 6px; }
+    .cs-list { flex: 1 1 auto; overflow-y: auto; }
+    .cs-list-head, .cs-row { display: grid; grid-template-columns: 110px 1fr 300px; gap: 8px; align-items: center; padding: 6px 12px; font-size: 13px; }
+    .cs-list-head { position: sticky; top: 0; background: #1e1e1e; opacity: 0.8; }
+    .cs-row { border-bottom: 1px solid #2e2e2e; }
+    .cs-name em { opacity: 0.6; font-style: normal; font-size: 12px; }
+    .cs-badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #3a3c44; justify-self: start; }
+    .cs-conflict .cs-badge { background: #6b2f2f; color: #ffb0a8; }
+    .cs-waiting .cs-badge { background: #5a4a17; color: #ffe08a; }
+    .cs-rejected .cs-badge { background: #5a3030; color: #ffb0a8; }
+    .cs-localchanged .cs-badge, .cs-newlocal .cs-badge { background: #24406b; color: #9cc4ff; }
+    .cs-synced .cs-badge { background: #2f4a36; color: #9fe0aa; }
+    .cs-notongraph .cs-badge { opacity: 0.6; }
+    .cs-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .cs-empty { padding: 16px; opacity: 0.6; font-size: 13px; }
+    .cs-modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+    .cs-modal { background: #2a2c33; border: 1px solid #444; border-radius: 8px; padding: 16px 20px; width: min(760px, 90%); max-height: 80%; overflow-y: auto; font-size: 13px; }
+    .cs-modal-title { font-weight: 700; font-size: 15px; margin-bottom: 8px; }
+    .cs-sub { font-weight: 600; margin: 10px 0 4px; }
+    .cs-rows { background: #222; border-radius: 4px; padding: 6px 8px; max-height: 220px; overflow-y: auto; }
+    .cs-cellrow { padding: 3px 0; border-bottom: 1px solid #333; }
+    .cs-primary { background: #4a9d5b; color: #fff; border: none; padding: 4px 10px; border-radius: 3px; }
+</style>
+
+@code {
+    private bool HasConflicts => State.Items.Any(i => i.Status == CloudItemStatus.Conflict);
+
+    private static string Label(CloudItemStatus s) => s switch
+    {
+        CloudItemStatus.Synced => "已同步",
+        CloudItemStatus.LocalChanged => "待上傳",
+        CloudItemStatus.NewLocal => "新的，待上傳",
+        CloudItemStatus.Conflict => "⚠ 兩邊都改過",
+        CloudItemStatus.Waiting => "等待合併",
+        CloudItemStatus.Rejected => "請先下載",
+        CloudItemStatus.NotOnGraph => "流程圖沒有",
+        _ => s.ToString(),
+    };
+
+    private static string Describe(string[] cells)
+    {
+        var labels = new[] { "名字", "表情", "配音情緒", "台詞", "功能", "備註", "參數" };
+        return string.Join("　", cells.Select((c, i) => (c, i)).Where(x => !string.IsNullOrWhiteSpace(x.c)).Select(x => $"{labels[x.i]}：{x.c}"));
+    }
+
+    // The flow graph loads after this panel is first rendered, so the list is rebuilt whenever the tab is
+    // switched to (a local-only scan, no network).
+    [Parameter] public bool IsActive { get; set; }
+    private bool _wasActive;
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    protected override void OnParametersSet()
+    {
+        if (IsActive && !_wasActive && !State.IsBusy)
+            State.RefreshLocal();
+        _wasActive = IsActive;
+    }
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => State.Changed -= OnChanged;
+}

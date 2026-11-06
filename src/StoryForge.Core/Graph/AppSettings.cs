@@ -74,6 +74,17 @@ public sealed class AppSettings
     public string SpineCliPath { get; set; } = @"C:\Program Files\Spine\Spine.com";
     public string UnityExePath { get; set; } = string.Empty;
 
+    // CG 管理右鍵「從範本建立資料夾」：整個複製範本資料夾、改名成 CG 名稱；範本 clip 是範本資料夾底下的相對路徑，
+    // 複製後改名成 {CG}.clip。
+    public string CgTemplateFolder { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\美術\CG圖\Sample";
+    public string CgTemplateClip { get; set; } = @"01_source\FalseBadgeCG.clip";
+
+    // 雲端同步: the AFFiNE workspace holding this project's StoryForge module docs, and the command that runs
+    // the nineday affine-mcp (its StoryForge extension does the actual download/upload; login lives in
+    // affine-mcp's own config, not here). Empty workspace id = cloud sync off.
+    public string CloudWorkspaceId { get; set; } = string.Empty;
+    public string AffineMcpCommand { get; set; } = "affine-mcp.cmd";
+
     // Home.razor's tab strip order, as tab keys, after drag-to-reorder. Empty = default order. Keys missing
     // here (a tab added in a later build) are appended at the end; keys no longer known are ignored.
     public List<string> TabOrder { get; set; } = new();

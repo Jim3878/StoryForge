@@ -2,6 +2,7 @@
 @using StoryForge.Web.Components.Panels
 @implements IDisposable
 @inject FlowGraphFocusCoordinator FlowGraphFocusCoordinator
+@inject PipelineFocusCoordinator PipelineFocusCoordinator
 @inject StoryForge.Core.Graph.AppSettings AppSettings
 @inject IJSRuntime JS
 
@@ -50,6 +51,9 @@
         <div class="tab-pane" style="display:@(_activeTab == "sfx" ? "block" : "none")">
             <AudioBrowserPanel Category="StoryForge.Core.Audio.AudioCategory.Sfx" />
         </div>
+        <div class="tab-pane" style="display:@(_activeTab == "cloud" ? "block" : "none")">
+            <CloudSyncPanel IsActive="@(_activeTab == "cloud")" />
+        </div>
     </div>
 </div>
 
@@ -78,6 +82,7 @@
         new("cg", "CG 管理"),
         new("bgm", "BGM"),
         new("sfx", "音效"),
+        new("cloud", "雲端同步"),
     };
 
     private string _activeTab = "graph";
@@ -96,6 +101,7 @@
     protected override void OnInitialized()
     {
         FlowGraphFocusCoordinator.SubscribeTabActivation(ActivateGraphTab);
+        PipelineFocusCoordinator.SubscribeTabActivation(ActivatePipelineTab);
 
         // Saved order first (skipping keys no longer known), then any tab the saved order doesn't mention
         // yet — e.g. one added in a later build — at the end in its default position.
@@ -139,9 +145,17 @@
         return InvokeAsync(StateHasChanged);
     }
 
+    // FlowGraphPanel's node right-click "跳到管線狀態" — the mirror image of ActivateGraphTab above.
+    private Task ActivatePipelineTab()
+    {
+        _activeTab = "pipeline";
+        return InvokeAsync(StateHasChanged);
+    }
+
     public void Dispose()
     {
         FlowGraphFocusCoordinator.UnsubscribeTabActivation(ActivateGraphTab);
+        PipelineFocusCoordinator.UnsubscribeTabActivation(ActivatePipelineTab);
         _selfRef?.Dispose();
     }
 }

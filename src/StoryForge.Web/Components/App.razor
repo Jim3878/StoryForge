@@ -14,7 +14,17 @@
 
 <body>
     <Routes @rendermode="InteractiveServer" />
-    <script src="_framework/blazor.web.js"></script>
+    <script src="_framework/blazor.web.js" autostart="false"></script>
+    <script>
+        // 預設只重試 8 次、每次 20 秒，約 3 分鐘後就放棄並顯示「Could not reconnect to the server」；
+        // 電腦睡眠或視窗縮小被節流後回來常常超過這個時間。後端會把 circuit 保留一天（見 Program.cs），
+        // 所以這裡改成每 3 秒一直重試，直到連回去為止。
+        Blazor.start({
+            circuit: {
+                reconnectionOptions: { maxRetries: 1000000, retryIntervalMilliseconds: 3000 }
+            }
+        });
+    </script>
     <script src="lib/litegraph/litegraph.min.js"></script>
     <script src="js/graph-editor.js?v=@(DateTime.UtcNow.Ticks)"></script>
     <script src="js/ui-draggable.js?v=@(DateTime.UtcNow.Ticks)"></script>

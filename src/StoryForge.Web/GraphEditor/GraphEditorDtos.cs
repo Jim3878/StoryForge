@@ -131,6 +131,9 @@ public sealed class NodeContextMenuInfoDto
 {
     public string PlayscriptName { get; set; } = string.Empty;
     public bool HasScriptFile { get; set; }
+    // Filled in by FlowGraphPanel from PipelineStatusState's last refresh (GraphEditorState doesn't know it).
+    public bool IsOnPipeline { get; set; }
+    public bool HasLdtkLocation { get; set; }
 }
 
 // What GraphEditorState.DuplicateNode hands back to graph-editor.js so the client can paint the new node's

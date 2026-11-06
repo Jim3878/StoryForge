@@ -620,7 +620,8 @@ public static class PlayscriptFactoryCodeGenerator
     private static string BuildDefaultEndingLine(ParsedPlayscriptName parsed)
     {
         return parsed.IsHScene
-            ? "            EndVideoAndFadeOff();"
+            // memoryId = 這支劇本的 className（Unity 的回憶系統用它解鎖／結束回憶）。
+            ? $"            EndVideoAndFadeOff(\"{CodegenTextUtility.EscapeCSharpString(parsed.ClassName)}\");"
             : parsed.ShouldEndRpgRoleWithoutFinish
                 ? "            EndRpgRoleWithoutFinish();"
                 : parsed.IsSideStory

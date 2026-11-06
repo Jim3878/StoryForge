@@ -1,0 +1,19 @@
+{
+  "name": "@nineday/storyforge-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "StoryForge extension for the nineday affine-mcp fork: sf_* tools and the sf CLI used by local StoryForge.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/schema.test.mjs",
+    "install-into-mcp": "npm run build && node scripts/install-into-mcp.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.4",
+    "typescript": "^5.9.3",
+    "yjs": "^13.6.27",
+    "zod": "^3.25.76"
+  }
+}

@@ -45,6 +45,12 @@ public static class CgCatalogConstants
 {
     public const int PreviewWidth = 512;
     public const int PreviewHeight = 288;
+
+    // Unity CG 鏡頭在 Spine 骨架座標（像素）的可見範圍，以骨架原點為中心，不含出血。
+    // 由 Unity 端換算：鏡頭 orthographicSize 5（高 10 單位）、SkeletonDataAsset scale 0.01、Spine 子物件縮放 0.5
+    // → 10 / (0.01 * 0.5) = 2000；寬依 1920:1080。
+    public const double SpineCameraHeight = 2000;
+    public const double SpineCameraWidth = SpineCameraHeight * 1920 / 1080;
 }
 
 // 一行進度：stage = 目前階段；detail = 補充（例如 Csp 的最後一行輸出）。
@@ -162,7 +168,7 @@ public static class CspBatchClient
     }
 }
 
-// Spine 預覽：Spine CLI 先匯出骨架 JSON 取得動畫清單與 bg 範圍（遊戲鏡頭框），再一次啟動串接每個動畫的第 0 幀 PNG。
+// Spine 預覽：Spine CLI 先匯出骨架 JSON 取得動畫清單，再一次啟動串接每個動畫的第 0 幀 PNG（裁成遊戲鏡頭範圍）。
 // 每次啟動 Spine 約 14 秒，所以全部動畫合併成同一次啟動。
 public static class SpinePreviewExporter
 {
@@ -180,7 +186,7 @@ public static class SpinePreviewExporter
             var jsonSettings = Path.Combine(work, "json.export.json");
             File.WriteAllText(jsonSettings, JsonConvert.SerializeObject(new
             {
-                @class = "export-json", extension = ".json", format = "JSON", prettyPrint = false, nonessential = false,
+                @class = "export-json", extension = ".json", format = "JSON", prettyPrint = false, nonessential = true,
                 cleanUp = true, packAtlas = (object?)null, packSource = "attachments", packTarget = "perskeleton", warnings = false
             }));
             await RunAsync(spineCliPath, new[] { "-i", spinePath, "-o", jsonOut, "-e", jsonSettings },
@@ -193,28 +199,42 @@ public static class SpinePreviewExporter
             if (animations.Count == 0)
                 throw new InvalidOperationException("spine 沒有任何動畫。");
 
-            var crop = FindBackgroundRect(skeleton);
+            // PNG 從改過的 JSON 輸出（不是 .spine）：遮擋用的 censor_* slot 不進預覽。
+            // images 是相對 .spine 的路徑，JSON 換了位置要改成絕對路徑，否則圖全部變成 MISSING。
+            var spineFolder = Path.GetDirectoryName(spinePath)!;
+            if (skeleton["skeleton"] is JObject info)
+                info["images"] = Path.GetFullPath(Path.Combine(spineFolder, (string?)info["images"] ?? "./images/"));
+            HideCensorSlots(skeleton);
+            var previewJson = Path.Combine(work, Path.GetFileNameWithoutExtension(spinePath) + ".json");
+            File.WriteAllText(previewJson, skeleton.ToString(Formatting.None), new UTF8Encoding(false));
+
+            // 只裁遊戲鏡頭看得到的範圍；bg 圖本身含出血，不能拿來當裁切框
+            const double cropWidth = CgCatalogConstants.SpineCameraWidth;
+            const double cropHeight = CgCatalogConstants.SpineCameraHeight;
+            var scale = Math.Min(100.0, 100.0 * CgCatalogConstants.PreviewWidth * 2 / cropWidth);
+
             var args = new List<string>();
             for (var i = 0; i < animations.Count; i++)
             {
                 var settingsPath = Path.Combine(work, $"png{i}.export.json");
-                var scale = crop != null ? Math.Min(100.0, 100.0 * CgCatalogConstants.PreviewWidth * 2 / crop.Value.Width) : 25.0;
                 File.WriteAllText(settingsPath, JsonConvert.SerializeObject(new
                 {
                     @class = "export-png", exportType = "animation", skeletonType = "single", skeleton = (string?)null,
                     animationType = "single", animation = animations[i], skinType = "current", skinNone = false, skin = (string?)null,
                     maxBounds = false, renderImages = true, renderBones = false, renderOthers = false, scale,
                     fitWidth = 0, fitHeight = 0, enlarge = false, background = (string?)null, fps = 30, lastFrame = false,
-                    cropX = crop?.X ?? 0, cropY = crop?.Y ?? 0, cropWidth = crop?.Width ?? 0, cropHeight = crop?.Height ?? 0,
+                    cropX = -cropWidth / 2, cropY = -cropHeight / 2, cropWidth, cropHeight,
                     rangeStart = 0, rangeEnd = 0, packAtlas = (object?)null, compression = 6, pad = false, msaa = 4, smoothing = 8,
                     renderSelection = false, cropToWindow = false
                 }));
-                args.AddRange(new[] { "-i", spinePath, "-o", Path.Combine(work, "png" + i), "-e", settingsPath });
+                // 輸出資料夾要先存在：不存在時 Spine 會把 -o 當成檔名前綴，寫成上一層的 png{i}_0.png。
+                var pngOut = Path.Combine(work, "png" + i);
+                Directory.CreateDirectory(pngOut);
+                args.AddRange(new[] { "-i", previewJson, "-o", pngOut, "-e", settingsPath });
             }
 
             await RunAsync(spineCliPath, args, $"{Path.GetFileName(spinePath)} · 輸出 {animations.Count} 個動畫預覽", onProgress, cancellationToken);
 
-            var spineFolder = Path.GetDirectoryName(spinePath)!;
             for (var i = 0; i < animations.Count; i++)
             {
                 var png = Directory.Exists(Path.Combine(work, "png" + i))
@@ -233,87 +253,31 @@ public static class SpinePreviewExporter
         }
     }
 
-    private readonly record struct Rect(double X, double Y, double Width, double Height);
-
-    // 遊戲鏡頭框 = 名為 bg 的 slot 上的圖（region 或 mesh）在世界座標的範圍。骨骼只加總位移（CG 的 bg 都掛在 root 附近）。
-    private static Rect? FindBackgroundRect(JObject skeleton)
+    // 名稱 censor_ 開頭的 slot：顏色 alpha 設 0，並拿掉動畫裡的顏色時間軸（否則動畫會把 alpha 打回來）。
+    // 不刪 slot 本身，避免動畫 / 繪製順序 / 剪裁參照到不存在的 slot。
+    private static void HideCensorSlots(JObject skeleton)
     {
-        var bones = (skeleton["bones"] as JArray)?.OfType<JObject>().ToList() ?? new List<JObject>();
-        var byName = bones.ToDictionary(x => (string)x["name"]!, x => x);
-        (double X, double Y) BoneOffset(string? name)
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var slot in (skeleton["slots"] as JArray)?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
         {
-            double x = 0, y = 0;
-            while (name != null && byName.TryGetValue(name, out var bone))
+            var name = (string?)slot["name"];
+            if (name == null || !name.StartsWith("censor_", StringComparison.OrdinalIgnoreCase))
+                continue;
+            names.Add(name);
+            var color = (string?)slot["color"] ?? "ffffffff";
+            slot["color"] = color[..6] + "00";
+        }
+
+        foreach (var animation in (skeleton["animations"] as JObject)?.Properties().Select(p => p.Value).OfType<JObject>() ?? Enumerable.Empty<JObject>())
+        {
+            foreach (var name in names)
             {
-                x += (double?)bone["x"] ?? 0;
-                y += (double?)bone["y"] ?? 0;
-                name = (string?)bone["parent"];
-            }
-            return (x, y);
-        }
-
-        var slot = (skeleton["slots"] as JArray)?.OfType<JObject>()
-            .FirstOrDefault(x => string.Equals((string?)x["name"], "bg", StringComparison.OrdinalIgnoreCase));
-        if (slot == null)
-            return null;
-
-        var slotName = (string)slot["name"]!;
-        var attachments = (skeleton["skins"] as JArray)?.OfType<JObject>()
-            .Select(s => s["attachments"]?[slotName] as JObject)
-            .FirstOrDefault(x => x != null);
-        var attachment = attachments?.Properties().Select(p => p.Value as JObject).FirstOrDefault(x => x != null);
-        if (attachment == null)
-            return null;
-
-        var type = (string?)attachment["type"] ?? "region";
-        if (type == "region")
-        {
-            var (bx, by) = BoneOffset((string?)slot["bone"]);
-            var w = ((double?)attachment["width"] ?? 0) * ((double?)attachment["scaleX"] ?? 1);
-            var h = ((double?)attachment["height"] ?? 0) * ((double?)attachment["scaleY"] ?? 1);
-            var cx = bx + ((double?)attachment["x"] ?? 0);
-            var cy = by + ((double?)attachment["y"] ?? 0);
-            return w > 0 && h > 0 ? new Rect(cx - w / 2, cy - h / 2, w, h) : null;
-        }
-
-        if (type != "mesh" || attachment["vertices"] is not JArray vertexArray)
-            return null;
-
-        var vertices = vertexArray.Select(x => (double)x).ToList();
-        var uvCount = (attachment["uvs"] as JArray)?.Count ?? 0;
-        var points = new List<(double X, double Y)>();
-        if (vertices.Count == uvCount)
-        {
-            var (bx, by) = BoneOffset((string?)slot["bone"]);
-            for (var i = 0; i + 1 < vertices.Count; i += 2)
-                points.Add((bx + vertices[i], by + vertices[i + 1]));
-        }
-        else
-        {
-            // 加權網格：boneCount, (boneIndex, x, y, weight) * boneCount
-            var index = 0;
-            while (index < vertices.Count)
-            {
-                var count = (int)vertices[index++];
-                double x = 0, y = 0;
-                for (var b = 0; b < count; b++)
-                {
-                    var boneIndex = (int)vertices[index];
-                    var (bx, by) = boneIndex < bones.Count ? BoneOffset((string?)bones[boneIndex]["name"]) : (0, 0);
-                    var weight = vertices[index + 3];
-                    x += (bx + vertices[index + 1]) * weight;
-                    y += (by + vertices[index + 2]) * weight;
-                    index += 4;
-                }
-                points.Add((x, y));
+                if (animation["slots"]?[name] is not JObject timelines)
+                    continue;
+                foreach (var key in new[] { "rgba", "rgb", "alpha", "rgba2", "rgb2" })
+                    timelines.Remove(key);
             }
         }
-
-        if (points.Count == 0)
-            return null;
-        var minX = points.Min(p => p.X);
-        var minY = points.Min(p => p.Y);
-        return new Rect(minX, minY, points.Max(p => p.X) - minX, points.Max(p => p.Y) - minY);
     }
 
     private static async Task RunAsync(string exe, IEnumerable<string> args, string stage, Action<CgToolProgress> onProgress,

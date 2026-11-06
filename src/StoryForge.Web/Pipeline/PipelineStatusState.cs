@@ -562,6 +562,15 @@ public sealed class PipelineStatusState
                 continue;
             }
 
+            // 雲端同步 Wait merge: the playscript is read-only inside StoryForge until its merge finishes.
+            if (StoryForge.Core.Cloud.WaitMergeStore.IsWaiting(_appSettings.ExternalDataFolder, item.NodeGuid))
+            {
+                failures.Add(new SheetScriptFailure { PlayscriptName = item.PlayscriptName, Reason = "等待合併中（雲端同步），這份劇本唯讀" });
+                SheetScriptProcessedCount++;
+                OnSheetScriptProgress?.Invoke();
+                continue;
+            }
+
             var hasLocalContent = NodeScriptTableStore.HasContentAt(_appSettings.ExternalDataFolder, item.PlayscriptName, item.NodeGuid);
             if (!hasLocalContent)
             {
@@ -783,6 +792,16 @@ public sealed class PipelineStatusState
         if (_projectRoot == null)
         {
             StatusMessage = "請先按重新整理一次。";
+            return Array.Empty<string>();
+        }
+
+        // 雲端同步 Wait merge: while any playscript is parked for an external merge, the whole export is
+        // blocked, so Unity never gets C# built from half-merged tables.
+        var waiting = StoryForge.Core.Cloud.WaitMergeStore.All(_appSettings.ExternalDataFolder);
+        if (waiting.Count > 0)
+        {
+            StatusMessage = $"有 {waiting.Count} 份劇本在等待合併（{string.Join("、", waiting.Select(w => w.PlayscriptName))}），" +
+                            "匯出成C# 已擋下。請先到「雲端同步」分頁完成或取消合併。";
             return Array.Empty<string>();
         }
 
@@ -1157,15 +1176,27 @@ public sealed class PipelineStatusState
         }
     }
 
-    public void LocateInLdtk(string playscriptName)
+    // FlowGraphPanel's node right-click menu gates 跳到管線狀態/定位到LDtk on these — both read the last
+    // refresh's snapshot only, never trigger one (a renamed node stays disabled until the next 重新整理).
+    public bool HasRow(string playscriptName) =>
+        !string.IsNullOrEmpty(playscriptName) && Rows.Any(r => r.PlayscriptName == playscriptName);
+
+    public bool HasLdtkLocation(string playscriptName) =>
+        _ldtkPath != null && !string.IsNullOrEmpty(playscriptName) && _ldtkLocations.ContainsKey(playscriptName);
+
+    public void SetStatusMessage(string message) => StatusMessage = message;
+
+    // Returns the resulting status text (null = nothing happened) so a caller on another tab — FlowGraphPanel —
+    // can show it in its own status line; it's also left in this panel's StatusMessage either way.
+    public string? LocateInLdtk(string playscriptName)
     {
         if (_ldtkPath == null || !_ldtkLocations.TryGetValue(playscriptName, out var location))
-            return;
+            return null;
 
         if (string.IsNullOrWhiteSpace(_appSettings.LdtkExecutablePath) || !File.Exists(_appSettings.LdtkExecutablePath))
         {
             StatusMessage = "找不到LDtk執行檔，請先在「設定」裡填入LDtk執行檔路徑。";
-            return;
+            return StatusMessage;
         }
 
         var startInfo = new ProcessStartInfo(_appSettings.LdtkExecutablePath) { UseShellExecute = false };
@@ -1189,6 +1220,8 @@ public sealed class PipelineStatusState
         {
             StatusMessage = $"定位到LDtk失敗：{e.Message}";
         }
+
+        return StatusMessage;
     }
 
     private void OpenFileWithDefaultProgram(string path, string failureStatusPrefix)

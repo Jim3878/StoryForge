@@ -14,14 +14,26 @@ builder.Services.AddRazorComponents()
 // same freshness guarantee GraphEditorState already gives the graph itself. Shared with the Settings page
 // via DI so an edit there is immediately visible to GraphEditorState within the same circuit, with no
 // separate reload/refresh plumbing needed.
-builder.Services.AddScoped(_ => AppSettings.LoadOrDefault());
+builder.Services.AddScoped(_ =>
+{
+    var settings = AppSettings.LoadOrDefault();
+    // Test-instance overrides (in memory only; saving the settings dialog would persist them, so only the
+    // storyforge-web-test launch config sets these): a copy of the data folder and a test cloud workspace.
+    if (Environment.GetEnvironmentVariable("STORYFORGE_TEST_DATA_FOLDER") is { Length: > 0 } dataFolder)
+        settings.ExternalDataFolder = dataFolder;
+    if (Environment.GetEnvironmentVariable("STORYFORGE_TEST_CLOUD_WORKSPACE") is { Length: > 0 } workspace)
+        settings.CloudWorkspaceId = workspace;
+    return settings;
+});
 builder.Services.AddScoped<GraphEditorState>();
 builder.Services.AddScoped<StoryForge.Web.CharacterCard.CharacterCardState>();
 builder.Services.AddScoped<StoryForge.Web.StoryOutline.StoryOutlineState>();
 builder.Services.AddScoped<StoryForge.Web.Pipeline.PipelineStatusState>();
 builder.Services.AddScoped<StoryForge.Web.Cg.CgManagerState>();
+builder.Services.AddScoped<StoryForge.Web.Cloud.CloudSyncState>();
 builder.Services.AddScoped<StoryForge.Web.ReloadCoordinator>();
 builder.Services.AddScoped<StoryForge.Web.FlowGraphFocusCoordinator>();
+builder.Services.AddScoped<StoryForge.Web.PipelineFocusCoordinator>();
 // Singleton, not scoped — see UpdateCheckService's own comment: one GitHub check result shared by the
 // whole process, not one per browser tab/circuit.
 builder.Services.AddSingleton<UpdateCheckService>();
@@ -34,6 +46,11 @@ builder.Services.AddSingleton<StoryForge.Web.Audio.AudioWaveformCacheService>();
 builder.Services.AddServerSideBlazor(options =>
 {
     options.DetailedErrors = true;
+
+    // 連線斷掉後 circuit（含所有分頁狀態）保留多久等瀏覽器重連。預設 3 分鐘太短：電腦睡眠、視窗縮小被
+    // Chrome 節流都會斷線超過這麼久，回來時 circuit 已被丟掉，只能整頁重新載入。單人本機工具不必省這點記憶體；
+    // 正常關分頁／重新整理時 blazor.web.js 會主動通知關閉，不會留到這裡。
+    options.DisconnectedCircuitRetentionPeriod = TimeSpan.FromDays(1);
 });
 builder.Services.Configure<HubOptions>(options =>
 {

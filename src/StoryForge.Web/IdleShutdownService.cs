@@ -2,96 +2,85 @@ using Microsoft.AspNetCore.Components.Server.Circuits;
 
 namespace StoryForge.Web;
 
-// 目前有幾個瀏覽器分頁連著後端（Blazor circuit 的連線數）。Singleton：整個程序共用一份。
+// 目前有幾個瀏覽器分頁還開著（還沒關閉的 Blazor circuit 數）。Singleton：整個程序共用一份。
+// 算的是 circuit 而不是連線：電腦睡眠、視窗縮小被 Chrome 節流、網路抖一下都會讓連線暫時中斷，但分頁其實還開著，
+// 等一下就會自己重連；只有真的關掉分頁（或重新整理）時 blazor.web.js 才會送出 disconnect 通知讓 circuit 關閉。
 public sealed class ClientConnectionTracker
 {
     private readonly object _gate = new();
-    private int _connections;
+    private int _openCircuits;
     private bool _everConnected;
-    private DateTime _lastChangeUtc = DateTime.UtcNow;
 
-    public void ConnectionUp()
+    public void CircuitOpened()
     {
         lock (_gate)
         {
-            _connections++;
+            _openCircuits++;
             _everConnected = true;
-            _lastChangeUtc = DateTime.UtcNow;
         }
     }
 
-    public void ConnectionDown()
+    public void CircuitClosed()
     {
         lock (_gate)
-        {
-            _connections = Math.Max(0, _connections - 1);
-            _lastChangeUtc = DateTime.UtcNow;
-        }
+            _openCircuits = Math.Max(0, _openCircuits - 1);
     }
 
-    public (int Connections, bool EverConnected, DateTime LastChangeUtc) Snapshot()
+    public (int OpenCircuits, bool EverConnected) Snapshot()
     {
         lock (_gate)
-            return (_connections, _everConnected, _lastChangeUtc);
+            return (_openCircuits, _everConnected);
     }
 }
 
-// 每個 circuit 一個實例：連線建立／中斷時通知 ClientConnectionTracker。
-// circuit 關閉時若連線還算在線上（例如沒有先收到 ConnectionDown），也補扣一次，避免計數殘留。
+// 每個 circuit 一個實例：circuit 開啟／關閉時通知 ClientConnectionTracker。
 public sealed class ClientConnectionCircuitHandler : CircuitHandler
 {
     private readonly ClientConnectionTracker _tracker;
-    private bool _isUp;
+    private bool _isOpen;
 
     public ClientConnectionCircuitHandler(ClientConnectionTracker tracker)
     {
         _tracker = tracker;
     }
 
-    public override Task OnConnectionUpAsync(Circuit circuit, CancellationToken cancellationToken)
+    public override Task OnCircuitOpenedAsync(Circuit circuit, CancellationToken cancellationToken)
     {
-        if (!_isUp)
+        if (!_isOpen)
         {
-            _isUp = true;
-            _tracker.ConnectionUp();
+            _isOpen = true;
+            _tracker.CircuitOpened();
         }
 
         return Task.CompletedTask;
     }
 
-    public override Task OnConnectionDownAsync(Circuit circuit, CancellationToken cancellationToken)
-    {
-        MarkDown();
-        return Task.CompletedTask;
-    }
-
     public override Task OnCircuitClosedAsync(Circuit circuit, CancellationToken cancellationToken)
     {
-        MarkDown();
+        if (_isOpen)
+        {
+            _isOpen = false;
+            _tracker.CircuitClosed();
+        }
+
         return Task.CompletedTask;
-    }
-
-    private void MarkDown()
-    {
-        if (!_isUp)
-            return;
-
-        _isUp = false;
-        _tracker.ConnectionDown();
     }
 }
 
-// 由 Launcher 啟動時（環境變數 STORYFORGE_EXIT_WHEN_NO_CLIENT=1）才啟用：所有瀏覽器連線都中斷超過
-// IdleTimeout 就自行結束程序。Chrome 的 app 視窗關閉後有時仍在背景執行，Launcher 會一直等不到它結束，
+// 由 Launcher 啟動時（環境變數 STORYFORGE_EXIT_WHEN_NO_CLIENT=1）才啟用：所有分頁都關閉超過 IdleTimeout
+// 就自行結束程序。Chrome 的 app 視窗關閉後有時仍在背景執行，Launcher 會一直等不到它結束，
 // 這時靠後端自己收掉，不會再留下來鎖住 publish 資料夾。
-// 重新整理頁面會短暫斷線再重連，所以要等一段時間才判定為關閉；啟動後若一直沒有任何連線（例如 Chrome
+// 重新整理頁面會先關掉舊 circuit 再開新的，所以要等一段時間才判定為關閉；啟動後若一直沒有任何連線（例如 Chrome
 // 沒能開啟），用較長的 StartupTimeout。用 dotnet watch 開發時沒有這個環境變數，不受影響。
+// 閒置時間是一輪一輪累加、每輪最多算 MaxCountedPerPoll，不是拿現在時間去減：電腦睡眠醒來時這個迴圈
+// 會一次看到好幾小時過去，若照實算，瀏覽器還來不及重連後端就先自己結束了。
 public sealed class IdleShutdownService : BackgroundService
 {
     private const string EnableVariable = "STORYFORGE_EXIT_WHEN_NO_CLIENT";
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan MaxCountedPerPoll = TimeSpan.FromSeconds(2);
 
     private readonly ClientConnectionTracker _tracker;
     private readonly IHostApplicationLifetime _lifetime;
@@ -110,22 +99,32 @@ public sealed class IdleShutdownService : BackgroundService
         if (Environment.GetEnvironmentVariable(EnableVariable) != "1")
             return;
 
-        _logger.LogInformation("沒有瀏覽器連線 {Idle} 秒後將自動結束（啟動後 {Startup} 秒內必須連線）。",
+        _logger.LogInformation("所有分頁關閉 {Idle} 秒後將自動結束（啟動後 {Startup} 秒內必須連線）。",
             IdleTimeout.TotalSeconds, StartupTimeout.TotalSeconds);
 
+        var idle = TimeSpan.Zero;
+        var lastPollUtc = DateTime.UtcNow;
         while (!stoppingToken.IsCancellationRequested)
         {
             await Task.Delay(PollInterval, stoppingToken).ConfigureAwait(false);
 
-            var (connections, everConnected, lastChangeUtc) = _tracker.Snapshot();
-            if (connections > 0)
-                continue;
+            var nowUtc = DateTime.UtcNow;
+            var elapsed = nowUtc - lastPollUtc;
+            lastPollUtc = nowUtc;
 
+            var (openCircuits, everConnected) = _tracker.Snapshot();
+            if (openCircuits > 0)
+            {
+                idle = TimeSpan.Zero;
+                continue;
+            }
+
+            idle += elapsed < MaxCountedPerPoll ? elapsed : MaxCountedPerPoll;
             var limit = everConnected ? IdleTimeout : StartupTimeout;
-            if (DateTime.UtcNow - lastChangeUtc < limit)
+            if (idle < limit)
                 continue;
 
-            _logger.LogInformation("已 {Seconds} 秒沒有瀏覽器連線，自動結束 StoryForge。", limit.TotalSeconds);
+            _logger.LogInformation("已 {Seconds} 秒沒有開著的分頁，自動結束 StoryForge。", limit.TotalSeconds);
             _lifetime.StopApplication();
             return;
         }

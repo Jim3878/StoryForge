@@ -6,6 +6,7 @@
 @inject IJSRuntime JS
 @inject ReloadCoordinator ReloadCoordinator
 @inject StoryForge.Web.FlowGraphFocusCoordinator FlowGraphFocusCoordinator
+@inject StoryForge.Web.PipelineFocusCoordinator PipelineFocusCoordinator
 
 <div class="ps-page">
     <div class="ps-toolbar">
@@ -72,7 +73,7 @@
         </div>
     }
     <div class="ps-grid-wrap">
-        <table class="ps-grid">
+        <table class="ps-grid" id="ps-grid">
             <thead>
                 <tr id="ps-header-row">
                     <th class="ps-select-col">
@@ -95,10 +96,14 @@
             <tbody>
                 @foreach (var row in FilteredRows)
                 {
-                    <tr @oncontextmenu="e => OnRowContextMenu(e, row)" @oncontextmenu:preventDefault="true">
+                    <tr class="@(_highlightedNames.Contains(row.PlayscriptName) ? "ps-row-highlighted" : null)"
+                        data-ps-name="@row.PlayscriptName"
+                        @onclick="e => OnRowClicked(row, e)"
+                        @oncontextmenu="e => OnRowContextMenu(e, row)" @oncontextmenu:preventDefault="true">
                         <td class="ps-select-col">
                             <input type="checkbox" checked="@_selectedNames.Contains(row.PlayscriptName)"
-                                   @onclick="e => OnRowCheckboxClicked(row, e)" @onclick:preventDefault="true" />
+                                   @onclick="e => OnRowCheckboxClicked(row, e)" @onclick:preventDefault="true"
+                                   @onclick:stopPropagation="true" />
                         </td>
                         @foreach (var col in _columns)
                         {
@@ -382,6 +387,8 @@
     .ps-sort-indicator { margin-left: 4px; opacity: 0.8; font-size: 11px; }
     .ps-grid td { padding: 5px 10px; border-bottom: 1px solid #2e2e2e; }
     .ps-grid tr:hover td { background: #2f2f2f; }
+    .ps-grid tr.ps-row-highlighted td { background: #264f78; }
+    .ps-grid tr.ps-row-highlighted:hover td { background: #2d5a87; }
     .ps-name { word-break: break-all; }
     .ps-check { text-align: center; color: #7fd77f; }
     .ps-unknown { text-align: center; opacity: 0.35; }
@@ -602,6 +609,37 @@
         State.OnUploadProgress += OnUploadProgress;
         State.OnCSharpExportProgress += OnCSharpExportProgress;
         State.OnRefreshProgress += OnRefreshProgress;
+        PipelineFocusCoordinator.SubscribeFocus(FocusOnPlayscript);
+    }
+
+    // FlowGraphPanel's node right-click "跳到管線狀態" — runs after Home.razor has switched to this tab (see
+    // PipelineFocusCoordinator). Makes the row visible first (re-adding its chapter to the saved chapter
+    // filter, clearing a search that hides it), then highlights only that row and scrolls it to the middle.
+    // The checkbox selection is left alone. The menu item is only enabled when State.HasRow said the row
+    // exists, so a miss here just means the data changed in between — nothing to do.
+    private async Task FocusOnPlayscript(string playscriptName)
+    {
+        var row = State.Rows.FirstOrDefault(r => r.PlayscriptName == playscriptName);
+        if (row == null)
+            return;
+
+        if (!_selectedChapters.Contains(row.Chapter))
+        {
+            _selectedChapters.Add(row.Chapter);
+            SaveChapterSelection();
+            State.SetStatusMessage($"已顯示章節 {row.Chapter}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(_searchText) &&
+            !row.PlayscriptName.Contains(_searchText, StringComparison.OrdinalIgnoreCase))
+            _searchText = string.Empty;
+
+        _highlightedNames.Clear();
+        _highlightedNames.Add(row.PlayscriptName);
+        _highlightAnchorName = row.PlayscriptName;
+
+        await InvokeAsync(StateHasChanged);
+        await JS.InvokeVoidAsync("storyForgeUi.scrollRowIntoViewWhenVisible", "ps-grid", row.PlayscriptName);
     }
 
     // Deferred to firstRender rather than done in OnInitialized so the page renders first. RefreshAsync
@@ -615,6 +653,7 @@
     {
         _selfRef ??= DotNetObjectReference.Create(this);
         await JS.InvokeVoidAsync("storyForgeColumnSort.init", "ps-header-row", _selfRef);
+        await JS.InvokeVoidAsync("storyForgeUi.bindRowHighlightKeys", "ps-grid", _selfRef);
 
         if (firstRender)
         {
@@ -656,6 +695,7 @@
         State.OnUploadProgress -= OnUploadProgress;
         State.OnCSharpExportProgress -= OnCSharpExportProgress;
         State.OnRefreshProgress -= OnRefreshProgress;
+        PipelineFocusCoordinator.UnsubscribeFocus(FocusOnPlayscript);
         _selfRef?.Dispose();
     }
 
@@ -904,8 +944,83 @@
         _lastClickedRowState = newState;
     }
 
+    // 反白（點列選取）— 跟上面給批次動作用的勾選框是兩回事：Ctrl+C 複製反白列的劇本名稱、空白鍵切換反白列的
+    // 勾選（見 ui-draggable.js 的 bindRowHighlightKeys）。跟勾選一樣不因篩選而清掉，但動作只作用在畫面上看得到的列。
+    private readonly HashSet<string> _highlightedNames = new();
+    private string? _highlightAnchorName;
+
+    private List<PipelineStatusRow> HighlightedVisibleRows =>
+        FilteredRows.Where(r => _highlightedNames.Contains(r.PlayscriptName)).ToList();
+
+    private void OnRowClicked(PipelineStatusRow row, MouseEventArgs e)
+    {
+        if (e.ShiftKey && _highlightAnchorName != null)
+        {
+            var visibleNames = FilteredRows.Select(r => r.PlayscriptName).ToList();
+            var anchorIndex = visibleNames.IndexOf(_highlightAnchorName);
+            var targetIndex = visibleNames.IndexOf(row.PlayscriptName);
+            if (anchorIndex >= 0 && targetIndex >= 0)
+            {
+                if (!e.CtrlKey && !e.MetaKey)
+                    _highlightedNames.Clear();
+                for (var i = Math.Min(anchorIndex, targetIndex); i <= Math.Max(anchorIndex, targetIndex); i++)
+                    _highlightedNames.Add(visibleNames[i]);
+                return;
+            }
+        }
+
+        if (e.CtrlKey || e.MetaKey)
+        {
+            if (!_highlightedNames.Remove(row.PlayscriptName))
+                _highlightedNames.Add(row.PlayscriptName);
+        }
+        else
+        {
+            _highlightedNames.Clear();
+            _highlightedNames.Add(row.PlayscriptName);
+        }
+        _highlightAnchorName = row.PlayscriptName;
+    }
+
+    // Ctrl+C：回傳反白列的劇本名稱（每個一行，照畫面順序），JS 端寫進剪貼簿；空字串 = 沒有反白列，交給瀏覽器
+    [JSInvokable]
+    public string GetHighlightedNamesForCopy()
+    {
+        var names = HighlightedVisibleRows.Select(r => r.PlayscriptName).ToList();
+        if (names.Count == 0)
+            return string.Empty;
+
+        ShowCopyNameFeedback(names.Count == 1 ? $"已複製：{names[0]}" : $"已複製 {names.Count} 個劇本名稱");
+        return string.Join("\n", names);
+    }
+
+    // 空白鍵：反白列全部已勾就全部取消，否則（全沒勾或有勾有不勾）全部打勾
+    [JSInvokable]
+    public void ToggleHighlightedRowsChecked()
+    {
+        var rows = HighlightedVisibleRows;
+        if (rows.Count == 0)
+            return;
+
+        var allChecked = rows.All(r => _selectedNames.Contains(r.PlayscriptName));
+        foreach (var r in rows)
+        {
+            if (allChecked)
+                _selectedNames.Remove(r.PlayscriptName);
+            else
+                _selectedNames.Add(r.PlayscriptName);
+        }
+        StateHasChanged();
+    }
+
     private void OnRowContextMenu(MouseEventArgs e, PipelineStatusRow row)
     {
+        if (!_highlightedNames.Contains(row.PlayscriptName))
+        {
+            _highlightedNames.Clear();
+            _highlightedNames.Add(row.PlayscriptName);
+            _highlightAnchorName = row.PlayscriptName;
+        }
         _contextMenuRow = row;
         _contextMenuX = e.ClientX;
         _contextMenuY = e.ClientY;
@@ -928,13 +1043,18 @@
         try
         {
             await JS.InvokeVoidAsync("navigator.clipboard.writeText", row.PlayscriptName);
-            _copyNameFeedback = $"已複製：{row.PlayscriptName}";
+            ShowCopyNameFeedback($"已複製：{row.PlayscriptName}");
         }
         catch (Exception)
         {
-            _copyNameFeedback = "複製失敗，瀏覽器不允許寫入剪貼簿";
+            ShowCopyNameFeedback("複製失敗，瀏覽器不允許寫入剪貼簿");
         }
+    }
 
+    private void ShowCopyNameFeedback(string message)
+    {
+        _copyNameFeedback = message;
+        StateHasChanged();
         var shown = _copyNameFeedback;
         _ = Task.Delay(TimeSpan.FromSeconds(3)).ContinueWith(_ => InvokeAsync(() =>
         {
@@ -970,7 +1090,7 @@
     private void LocateInLdtkFromMenu()
     {
         if (_contextMenuRow is { } row)
-            State.LocateInLdtk(row.PlayscriptName);
+            _ = State.LocateInLdtk(row.PlayscriptName);
         CloseContextMenu();
     }
 

@@ -682,26 +682,60 @@ window.storyForgeGraph = (function () {
         return distanceBetween(p, [a[0] + t * abx, a[1] + t * aby]);
     }
 
-    // LiteGraph 的 LINEAR_LINK（和 Unity GraphView 的連線同一種樣子）：從輸出點往右水平伸出 15、
-    // 斜直線、再水平 15 接進輸入點。15 是 LiteGraph renderLink 裡寫死的長度，這裡必須跟它一致，
-    // 點擊判斷才會和畫面上的線完全重合。
-    const LINEAR_LINK_STUB = 15;
+    // LiteGraph 的 LINEAR_LINK（和 Unity GraphView 的連線同一種樣子）：從輸出點往右水平伸出一段、
+    // 斜直線、再水平 15 接進輸入點。LiteGraph renderLink 裡兩端都寫死 15；輸出端改成較長的
+    // LINEAR_LINK_SOURCE_STUB（見 patchLinearLinkRendering），否則多個輸出 port 的線一出來就轉彎，
+    // 看不出哪條接哪個 port。輸入端通常只有一個 port，維持 15。這裡必須跟畫面一致，點擊判斷才會重合。
+    const LINEAR_LINK_SOURCE_STUB = 22.5;
+    const LINEAR_LINK_TARGET_STUB = 15;
 
     function linearLinkPoints(from, to) {
-        return [from, [from[0] + LINEAR_LINK_STUB, from[1]], [to[0] - LINEAR_LINK_STUB, to[1]], to];
+        return [from, [from[0] + LINEAR_LINK_SOURCE_STUB, from[1]], [to[0] - LINEAR_LINK_TARGET_STUB, to[1]], to];
     }
 
     // 連線改成直線（LINEAR_LINK），並拿掉每條線中間的小圓點。圓點和 highquality_render 綁在同一個條件
     // 裡、沒有獨立開關，所以只在畫連線的這一下把 highquality_render 關掉。LiteGraph 另外會把圓點位置
     // 記在 link._pos（點到那裡會開連線選單），它是用曲線公式算的、會落在直線外面，改成直線中段的中點。
+    // 輸出端的水平段長度：LiteGraph 的路徑是 moveTo(起點) → lineTo(起點 ± 15) → …，所以在這一下
+    // 暫時包住 ctx.moveTo/lineTo，把每個 moveTo 之後的第一個 lineTo 從 15 拉長成 LINEAR_LINK_SOURCE_STUB。
+    // 邊框和本體各畫一次同一條路徑，都會經過這裡，所以兩者一致。
     function patchLinearLinkRendering() {
         const originalRenderLink = LGraphCanvas.prototype.renderLink;
         LGraphCanvas.prototype.renderLink = function (ctx, from, to, link) {
             const highQuality = this.highquality_render;
             this.highquality_render = false;
+            const isLinear = this.links_render_mode === LiteGraph.LINEAR_LINK;
+            const ownMoveTo = Object.prototype.hasOwnProperty.call(ctx, "moveTo");
+            const ownLineTo = Object.prototype.hasOwnProperty.call(ctx, "lineTo");
+            const savedMoveTo = ctx.moveTo;
+            const savedLineTo = ctx.lineTo;
+            if (isLinear) {
+                let start = null;
+                ctx.moveTo = function (x, y) {
+                    start = [x, y];
+                    return savedMoveTo.call(this, x, y);
+                };
+                ctx.lineTo = function (x, y) {
+                    if (start) {
+                        const dx = x - start[0];
+                        const dy = y - start[1];
+                        if (Math.abs(Math.abs(dx) - 15) < 0.01 && Math.abs(dy) < 0.01) {
+                            x = start[0] + Math.sign(dx) * LINEAR_LINK_SOURCE_STUB;
+                        } else if (Math.abs(Math.abs(dy) - 15) < 0.01 && Math.abs(dx) < 0.01) {
+                            y = start[1] + Math.sign(dy) * LINEAR_LINK_SOURCE_STUB;
+                        }
+                        start = null;
+                    }
+                    return savedLineTo.call(this, x, y);
+                };
+            }
             try {
                 return originalRenderLink.apply(this, arguments);
             } finally {
+                if (isLinear) {
+                    if (ownMoveTo) ctx.moveTo = savedMoveTo; else delete ctx.moveTo;
+                    if (ownLineTo) ctx.lineTo = savedLineTo; else delete ctx.lineTo;
+                }
                 this.highquality_render = highQuality;
                 if (link && link._pos) {
                     link._pos[0] = (from[0] + to[0]) / 2;
@@ -1133,7 +1167,7 @@ window.storyForgeGraph = (function () {
     // Stock LiteGraph's right-click-on-a-node menu (Inputs/Outputs/Properties/Title/Mode/Resize/Collapse/
     // Pin/Colors/Shapes/Clone/Remove, all in English) was pure clutter here per earlier explicit user
     // feedback, and got removed outright (getNodeMenuOptions returning null). This replaces it with our own
-    // app-specific menu: 開啟劇本檔/複製劇本名稱 (劇本 nodes only) plus 刪除/複製 (every node).
+    // app-specific menu: 開啟劇本檔/複製劇本名稱/跳到管線狀態/定位到LDtk (劇本 nodes only) plus 刪除/複製 (every node).
     //
     // Overriding processContextMenu itself, not just getNodeMenuOptions, because two of those four items
     // need a live server read (whether the .md 劇本檔 actually exists on disk yet, the current playscriptId)
@@ -1189,10 +1223,14 @@ window.storyForgeGraph = (function () {
 
         let playscriptName = "";
         let hasScriptFile = false;
+        let isOnPipeline = false;
+        let hasLdtkLocation = false;
         if (isPlayscriptNode && guid) {
             const info = await selfRef.invokeMethodAsync("GetNodeContextMenuInfo", guid);
             playscriptName = (info && info.playscriptName) || "";
             hasScriptFile = !!(info && info.hasScriptFile);
+            isOnPipeline = !!(info && info.isOnPipeline);
+            hasLdtkLocation = !!(info && info.hasLdtkLocation);
         }
 
         const items = [];
@@ -1207,10 +1245,21 @@ window.storyForgeGraph = (function () {
                 disabled: !playscriptName,
                 callback: () => copyTextToClipboard(playscriptName),
             });
+            // Both gated on 管線狀態's last 重新整理 (server side) — never trigger a refresh themselves.
+            items.push({
+                content: "跳到管線狀態",
+                disabled: !isOnPipeline,
+                callback: () => selfRef.invokeMethodAsync("JumpToPipelineForGuid", guid),
+            });
+            items.push({
+                content: "定位到LDtk",
+                disabled: !hasLdtkLocation,
+                callback: () => selfRef.invokeMethodAsync("LocateInLdtkForGuid", guid),
+            });
             items.push(null);
         }
         items.push({ content: "刪除", callback: () => canvasInstance.deleteSelectedNodes() });
-        items.push({ content: "複製", callback: () => duplicateSelectedNodes(canvasInstance) });
+        items.push({ content: "建立節點副本", callback: () => duplicateSelectedNodes(canvasInstance) });
 
         new LiteGraph.ContextMenu(items, { event: event }, canvasInstance.getCanvasWindow());
     }
@@ -1237,10 +1286,15 @@ window.storyForgeGraph = (function () {
         await duplicateNodes(canvasInstance, Object.values(canvasInstance.selected_nodes || {}), [30, 30]);
     }
 
-    // offset：新節點相對來源節點的位移（右鍵「複製」固定往右下 30；Ctrl+V 則是讓整批落在滑鼠位置）
+    // offset：新節點相對來源節點的位移（右鍵「建立節點副本」固定往右下 30；Ctrl+D 則是讓整批落在滑鼠位置）
     async function duplicateNodes(canvasInstance, sourceNodes, offset) {
         if (sourceNodes.length === 0)
             return;
+
+        // 伺服器端依序替每個副本取「同系列最大號 +10」，所以先照名稱（數字按數值比）排好，
+        // 一次複製 s10、s20 時副本才會是 s40、s50，順序跟來源一致。
+        sourceNodes = [...sourceNodes].sort((a, b) =>
+            String(a._displayTitle || "").localeCompare(String(b._displayTitle || ""), undefined, { numeric: true }));
 
         beginUndoableChange();
 
@@ -1315,12 +1369,9 @@ window.storyForgeGraph = (function () {
         commitUndoableChange();
     }
 
-    // Ctrl+C / Ctrl+V — LiteGraph 原生的剪貼簿只複製畫布上的空殼節點：沒有 GUID（存檔時被略過，存完就消失）、
-    // 沒有標題，也沒有伺服器端的欄位與劇本內容。改成 Ctrl+C 只記住選取了哪些節點，Ctrl+V 走和右鍵「複製」
-    // 同一套 duplicateNodes，整批放到滑鼠位置（以這批節點的左上角對齊游標，相對位置不變）。
-    // 記的是 GUID 而不是節點物件：復原／重做會重建所有節點物件，GUID 才是穩定的。
-    let copiedNodeGuids = [];
-
+    // Ctrl+C — 把選取節點的劇本名稱（每個一行，由上到下、由左到右）放進系統剪貼簿；哪些節點算數由伺服器
+    // 決定（GraphEditorState.GetPlayscriptNamesForCopy）。都沒有劇本名稱時剪貼簿保持原樣。
+    // Ctrl+V 在畫布上不做任何事：LiteGraph 原生的貼上只會貼出沒有 GUID 的空殼節點（存檔時被略過）。
     function patchClipboardKeys() {
         const originalProcessKey = LGraphCanvas.prototype.processKey;
         LGraphCanvas.prototype.processKey = function (e) {
@@ -1329,24 +1380,49 @@ window.storyForgeGraph = (function () {
             if (!isEditableTarget && e.type === "keydown" && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
                 const key = (e.key || "").toLowerCase();
                 if (key === "c") {
-                    copiedNodeGuids = Object.values(this.selected_nodes || {})
-                        .map(node => guidByNode.get(node))
-                        .filter(Boolean);
+                    copySelectedPlayscriptNames(this);
                     e.preventDefault();
                     return false;
                 }
                 if (key === "v") {
-                    pasteCopiedNodes(this);
                     e.preventDefault();
                     return false;
                 }
             }
             return originalProcessKey.call(this, e);
         };
+
+        // Ctrl+D（建立節點副本）掛在 window 上而不是 processKey：只要流程圖分頁在畫面上、焦點不在文字輸入框，
+        // 就算焦點不在畫布上也要生效。Chrome「加入書籤」本身由 ui-draggable.js 的全域快捷鍵攔截處理。
+        window.addEventListener("keydown", function (e) {
+            if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || (e.key || "").toLowerCase() !== "d")
+                return;
+            e.preventDefault();
+            if (e.repeat || !canvas || !canvas.canvas || canvas.canvas.offsetParent === null)
+                return;
+            const target = e.target;
+            const targetName = target && target.localName;
+            if (targetName === "input" || targetName === "textarea" || targetName === "select" ||
+                (target && target.isContentEditable))
+                return;
+            duplicateSelectedNodesAtMouse(canvas);
+        }, true);
     }
 
-    function pasteCopiedNodes(canvasInstance) {
-        const sourceNodes = copiedNodeGuids.map(guid => nodesByGuid.get(guid))
+    async function copySelectedPlayscriptNames(canvasInstance) {
+        const guids = Object.values(canvasInstance.selected_nodes || {})
+            .sort((a, b) => (a.pos[1] - b.pos[1]) || (a.pos[0] - b.pos[0]))
+            .map(node => guidByNode.get(node))
+            .filter(Boolean);
+        if (guids.length === 0 || !selfRef)
+            return;
+        const text = await selfRef.invokeMethodAsync("CopyPlayscriptNames", guids);
+        copyTextToClipboard(text);
+    }
+
+    // 整批放到滑鼠位置（以這批節點的左上角對齊游標，相對位置不變）
+    function duplicateSelectedNodesAtMouse(canvasInstance) {
+        const sourceNodes = Object.values(canvasInstance.selected_nodes || {})
             .filter(node => node && node.graph === canvasInstance.graph);
         if (sourceNodes.length === 0)
             return;
@@ -1537,6 +1613,40 @@ window.storyForgeGraph = (function () {
         }
     }
 
+    // init() 每次 讀取／從Unity匯入 都會重跑，在同一個 <canvas> 上建新的 LGraphCanvas。舊的若不收掉，會繼續
+    // 收滑鼠事件、每幀重畫整張圖：每多讀取一次就多一份卡頓，而且舊畫布在新圖的 guidByNode 裡找不到自己的節點，
+    // 點節點時會送出 OnNodeSelectionChanged(null)，和新畫布送的 guid 搶先後，側邊欄就時有時無。
+    // 不用 LiteGraph 自己的 unbindEvents：它拿 mousedown 的 callback 去拆 move/up，capture 旗標也和 bindEvents
+    // 加的時候對不上，實際上幾乎什麼都沒拆掉。這裡照 bindEvents 加的方式逐一拆掉（含拖曳中掛到 document 的 move/up）。
+    function disposeCanvas(oldCanvas) {
+        if (!oldCanvas) return;
+
+        oldCanvas.stopRendering();
+        oldCanvas.onSelectionChange = null;
+        oldCanvas.onNodeMoved = null;
+        oldCanvas.onDrawOverlay = null;
+        if (oldCanvas._events_binded) {
+            const el = oldCanvas.canvas;
+            const doc = oldCanvas.getCanvasWindow().document;
+            LiteGraph.pointerListenerRemove(el, "down", oldCanvas._mousedown_callback, true);
+            LiteGraph.pointerListenerRemove(el, "up", oldCanvas._mouseup_callback, true);
+            LiteGraph.pointerListenerRemove(el, "move", oldCanvas._mousemove_callback);
+            LiteGraph.pointerListenerRemove(doc, "move", oldCanvas._mousemove_callback, true);
+            LiteGraph.pointerListenerRemove(doc, "up", oldCanvas._mouseup_callback, true);
+            el.removeEventListener("mousewheel", oldCanvas._mousewheel_callback, false);
+            el.removeEventListener("DOMMouseScroll", oldCanvas._mousewheel_callback, false);
+            el.removeEventListener("keydown", oldCanvas._key_callback, true);
+            doc.removeEventListener("keyup", oldCanvas._key_callback, true);
+            el.removeEventListener("contextmenu", oldCanvas._doNothing);
+            el.removeEventListener("dragover", oldCanvas._doNothing, false);
+            el.removeEventListener("dragend", oldCanvas._doNothing, false);
+            el.removeEventListener("drop", oldCanvas._ondrop_callback, false);
+            el.removeEventListener("dragenter", oldCanvas._doReturnTrue, false);
+            oldCanvas._events_binded = false;
+        }
+        oldCanvas.graph?.stop?.();
+    }
+
     function init(canvasElementId, payload, dotNetRef) {
         currentPayload = payload;
         selfRef = dotNetRef;
@@ -1549,6 +1659,7 @@ window.storyForgeGraph = (function () {
             groupTitleBarHeight = payload.settings.groupTitleBarHeight;
             searchMinZoom = payload.settings.searchMinZoom;
         }
+        disposeCanvas(canvas);
         graph = new LGraph();
         const canvasEl = document.getElementById(canvasElementId);
         canvas = new LGraphCanvas("#" + canvasElementId, graph);

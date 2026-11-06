@@ -20,6 +20,11 @@ public sealed record CgLogLine(DateTime Time, CgLogLevel Level, string Text);
 // 「輸出至 Unity」開始前，Unity 已經有這張 CG 時要問的一題。
 public sealed record CgOverwriteQuestion(CgEntry Entry, string Detail);
 
+public sealed record CgDeleteSkip(CgEntry Entry, string Reason);
+
+// 「從 Unity 刪除」確認對話框的內容：Unity 裡沒有檔案的 CG 不列入。
+public sealed record CgDeletePlan(List<CgEntry> Targets, List<CgDeleteSkip> Skipped);
+
 // CG 管理分頁（scoped per circuit）。工作（更新預覽、輸出 PNG、輸出至 Unity）全部進同一個佇列、一次跑一個，
 // 不鎖畫面；clip 渲染吃 GPU/記憶體，Unity batchmode 也不能同時開兩個。
 public sealed class CgManagerState : IDisposable
@@ -32,6 +37,7 @@ public sealed class CgManagerState : IDisposable
     private bool _workerRunning;
     private string? _projectRoot;
     private CgLocalState _local = CgLocalState.Load();
+    private CgSourceIndex? _sourceIndex;
 
     public CgManagerState(AppSettings settings)
     {
@@ -152,6 +158,7 @@ public sealed class CgManagerState : IDisposable
         }
 
         Entries = entries;
+        _sourceIndex = index;
         AllChapters = chapters;
         Shares = specialCases.Shares;
         PrefabNames = unity.PrefabNames.ToList();
@@ -287,6 +294,33 @@ public sealed class CgManagerState : IDisposable
             Process.Start(new ProcessStartInfo("explorer.exe", File.Exists(path) ? $"/select,\"{path}\"" : $"\"{folder}\"") { UseShellExecute = true });
     }
 
+    // 右鍵「從範本建立資料夾」的對象：共用 CG 的美術檔屬於主 CG，所以對主 CG 做。
+    public CgFolderPlan GetFolderPlan(CgEntry entry)
+    {
+        var target = entry.OwnerId;
+        var hasClip = _sourceIndex?.Resolve(new[] { target })[target].Clips.Count > 0;
+        return CgFolderTemplate.Plan(_settings.CgRootFolder, target, hasClip);
+    }
+
+    // 複製範本資料夾到 CG 根目錄、clip 改名成 {CG}.clip，選取新 clip 並重新掃描。
+    public async Task CreateFolderFromTemplateAsync(CgEntry entry)
+    {
+        var target = entry.OwnerId;
+        try
+        {
+            var (folder, clip) = CgFolderTemplate.Create(_settings.CgRootFolder, _settings.CgTemplateFolder, _settings.CgTemplateClip, target);
+            AddLog(CgLogLevel.Info, $"[{target}] 已從範本建立資料夾：{folder}");
+            OpenFolder(clip);
+        }
+        catch (Exception e) when (e is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            AddLog(CgLogLevel.Error, $"[{target}] 從範本建立資料夾失敗：{e.Message}");
+            return;
+        }
+
+        await ScanAsync();
+    }
+
     // ---- 工作佇列 ----
 
     private sealed class CgJob
@@ -332,6 +366,50 @@ public sealed class CgManagerState : IDisposable
 
     public void EnqueueUnityExport(IEnumerable<CgEntry> entries) =>
         Enqueue("輸出至 Unity", entries.ToList(), RunUnityExportAsync);
+
+    // 批次刪除只在章節篩選選了部分章節時開放，避免一鍵把整個 Unity 的 CG 刪光。
+    public bool CanBatchDeleteFromUnity
+    {
+        get
+        {
+            var selected = AllChapters.Count(SelectedChapters.Contains);
+            return selected > 0 && selected < AllChapters.Count;
+        }
+    }
+
+    public CgDeletePlan GetDeletePlan(IEnumerable<CgEntry> entries)
+    {
+        var unity = new CgUnityState(ProjectRoot);
+        bool HasFiles(CgEntry e) => e.Share != null
+            ? unity.GetDefinition(e.CgId) != null
+            : unity.GetDefinition(e.CgId) != null || unity.HasPrefab(e.CgId) || unity.IsPlaceholder(e.CgId);
+
+        var candidates = entries.Where(HasFiles).ToList();
+        var ids = new HashSet<string>(candidates.Select(e => e.CgId), StringComparer.Ordinal);
+        var targets = new List<CgEntry>();
+        var skipped = new List<CgDeleteSkip>();
+        foreach (var entry in candidates)
+        {
+            // 主 CG 的 prefab 還被範圍外的共用 CG 用著，刪了那張會壞。
+            var outside = entry.Share != null
+                ? new List<string>()
+                : Entries.Where(e => e.Share != null && e.OwnerId == entry.CgId && !ids.Contains(e.CgId) && unity.GetDefinition(e.CgId) != null)
+                    .Select(e => e.CgId).ToList();
+            if (outside.Count > 0)
+                skipped.Add(new CgDeleteSkip(entry, $"被 {string.Join(", ", outside)} 共用，未一起刪除"));
+            else
+                targets.Add(entry);
+        }
+
+        return new CgDeletePlan(targets, skipped);
+    }
+
+    public void EnqueueUnityDelete(CgDeletePlan plan)
+    {
+        foreach (var skip in plan.Skipped)
+            AddLog(CgLogLevel.Info, $"[{skip.Entry.CgId}] {skip.Reason}，略過。");
+        Enqueue("從 Unity 刪除", plan.Targets, RunUnityDeleteAsync);
+    }
 
     private void Enqueue(string name, List<CgEntry> entries, Func<CgJob, CancellationToken, Task> run)
     {
@@ -631,6 +709,34 @@ public sealed class CgManagerState : IDisposable
         }
     }
 
+    // ---- 從 Unity 刪除 ----
+
+    private async Task RunUnityDeleteAsync(CgJob job, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        var request = new UnityImportRequest();
+        foreach (var entry in job.Entries)
+            request.Items.Add(new UnityImportItem { CgId = entry.CgId, Kind = UnityImportKind.Delete, SharePrefabOf = entry.Share?.Prefab });
+
+        // 交給 Unity（不能取消）。
+        MarkActive(job.Entries, "處理中：Unity 刪除");
+        var result = await UnityCgImportClient.RunAsync(ProjectRoot, UnityExePath, request, OnToolProgress, CancellationToken.None);
+        foreach (var entry in job.Entries)
+        {
+            var itemResult = result.Items.FirstOrDefault(r => r.CgId == entry.CgId);
+            if (itemResult == null || !itemResult.Ok)
+            {
+                AddLog(CgLogLevel.Error, $"[{entry.CgId}] 刪除失敗：{itemResult?.Error ?? "Unity 沒有回報結果"}");
+                continue;
+            }
+
+            _local.ExportedSourceTimes.Remove(entry.CgId);
+            AddLog(CgLogLevel.Done, $"[{entry.CgId}] {itemResult.Log.LastOrDefault() ?? "已從 Unity 刪除。"}");
+        }
+
+        SaveLocal();
+    }
+
     private void LogExported(CgEntry entry)
     {
         var via = entry.ExportKind switch
@@ -680,13 +786,13 @@ public sealed class CgManagerState : IDisposable
                 item.Kind = UnityImportKind.Spine;
                 item.SpineProjectPath = entry.Spine;
                 item.SpineCliPath = _settings.SpineCliPath;
+                // 跟 clip 一樣每次重新產：沿用舊預覽會把舊版產生方式（例如還沒裁出血）的圖當成遊戲縮圖。
                 var preview = Path.Combine(Path.GetDirectoryName(entry.Spine!)!, CgNaming.PreviewFileName(entry.CgId, firstDiff));
+                var animations = await ExportSpinePreviewAsync(entry, token);
+                if (!animations.Contains(firstDiff) && animations.Count > 0)
+                    preview = Path.Combine(Path.GetDirectoryName(entry.Spine!)!, CgNaming.PreviewFileName(entry.CgId, animations[0]));
                 if (!File.Exists(preview))
-                {
-                    var animations = await ExportSpinePreviewAsync(entry, token);
-                    if (!animations.Contains(firstDiff) && animations.Count > 0)
-                        preview = Path.Combine(Path.GetDirectoryName(entry.Spine!)!, CgNaming.PreviewFileName(entry.CgId, animations[0]));
-                }
+                    throw new InvalidOperationException($"Spine 沒有輸出預覽圖 {Path.GetFileName(preview)}。");
                 File.Copy(preview, thumbnail, true);
                 break;
             }

@@ -1249,10 +1249,10 @@ public sealed class GraphEditorState
     // persisted has nothing to mark for a future deletion changelist — it should simply cease to exist.
     public void RemoveUnsavedNode(string guid) => _model?.MarkNodeForDeletion(guid);
 
-    // The server-side half of the node right-click menu's 複製 action — registers the new node (mirroring
-    // CreateNode) and copies every field, including playscriptId itself (UpdateNodeField's own uniqueness
-    // rule immediately resolves the resulting collision with the source by appending "_1"/"_2"/... — see
-    // MakeUniquePlayscriptId). Deliberately does NOT touch NodeContentStore/NodeScriptTableStore at all: a
+    // The server-side half of 建立節點副本 (right-click menu / Ctrl+D) — registers the new node (mirroring
+    // CreateNode) and copies every field. A playscriptId in the `場景_s10_描述` form gets the next free
+    // number in its series (PlayscriptIdNumbering); any other name keeps UpdateNodeField's own "_1"/"_2"/...
+    // collision rule (MakeUniquePlayscriptId). Deliberately does NOT touch NodeContentStore/NodeScriptTableStore at all: a
     // 劇本 node's content file is only ever created by the explicit 建立劇本檔 button (PipelineStatusState),
     // never as a side effect of another action — a duplicated node starts with no memo/衝突/變化 content,
     // the user fills it in fresh. Edge duplication (both within the duplicated set and to untouched
@@ -1270,7 +1270,13 @@ public sealed class GraphEditorState
 
         var newNode = _model.AddNode(schema, x, y, newGuid);
         foreach (var kv in source.Fields)
-            UpdateNodeField(newGuid, kv.Key, kv.Value?.ToString() ?? string.Empty);
+        {
+            var value = kv.Value?.ToString() ?? string.Empty;
+            if (kv.Key == "playscriptId" && DefinesPlayscript(newNode) &&
+                PlayscriptIdNumbering.TryNextInSeries(value, LivePlayscriptIds(), out var next))
+                value = next;
+            UpdateNodeField(newGuid, kv.Key, value);
+        }
 
         var titleInfo = GetNodeTitleInfo(newGuid)!;
 
@@ -1315,6 +1321,12 @@ public sealed class GraphEditorState
         _model?.Nodes.Where(n => !n.IsMarkedForDeletion && DefinesPlayscript(n) &&
                                  !string.IsNullOrEmpty(n.IdentityValue))
             .Select(n => n.IdentityValue!) ?? Enumerable.Empty<string>();
+
+    // 雲端同步: every live playscript-defining node as (guid, playscriptId). Cloud tables are keyed by guid.
+    public IReadOnlyList<(string Guid, string PlayscriptName)> GetPlayscriptNodes() =>
+        _model?.Nodes.Where(n => !n.IsMarkedForDeletion && DefinesPlayscript(n) && !string.IsNullOrEmpty(n.IdentityValue))
+            .Select(n => (n.Guid, n.IdentityValue!)).ToList()
+        ?? new List<(string, string)>();
 
     // Null when the playscript has no live graph node (listed in the Sheet index but never added to the
     // flow graph) — callers resolving a file path for it fall back to NodeContentStore's plain (non-guid)
@@ -1393,6 +1405,24 @@ public sealed class GraphEditorState
         StatusMessage = $"識別碼「{candidate}」與其他節點重複，已自動改為「{next}」";
         return next;
     }
+
+    private IEnumerable<string> LivePlayscriptIds() =>
+        _model?.Nodes.Where(n => !n.IsMarkedForDeletion && DefinesPlayscript(n))
+            .Select(n => n.Fields.TryGetValue("playscriptId", out var v) ? v?.ToString() : null)
+            .Where(v => !string.IsNullOrEmpty(v))
+            .Select(v => v!) ?? Enumerable.Empty<string>();
+
+    // Ctrl+C on the canvas — the playscriptIds of whichever of these nodes define a playscript (劇本/開啟劇本;
+    // never a flag or 劇本條件 node), in the order given (graph-editor.js already sorts by on-screen position).
+    public List<string> GetPlayscriptNamesForCopy(IEnumerable<string> guids) =>
+        guids.Select(g => _model?.FindNode(g))
+            .Where(n => n != null && !n.IsMarkedForDeletion && DefinesPlayscript(n))
+            .Select(n => n!.Fields.TryGetValue("playscriptId", out var v) ? v?.ToString() : null)
+            .Where(v => !string.IsNullOrEmpty(v))
+            .Select(v => v!)
+            .ToList();
+
+    public void SetStatusMessage(string message) => StatusMessage = message;
 
     public IReadOnlyDictionary<string, string>? GetNodeFields(string nodeGuid)
     {

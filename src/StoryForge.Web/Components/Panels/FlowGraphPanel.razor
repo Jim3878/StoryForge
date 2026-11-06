@@ -4,6 +4,8 @@
 @inject GraphEditorState State
 @inject ReloadCoordinator ReloadCoordinator
 @inject StoryForge.Web.FlowGraphFocusCoordinator FlowGraphFocusCoordinator
+@inject StoryForge.Web.PipelineFocusCoordinator PipelineFocusCoordinator
+@inject StoryForge.Web.Pipeline.PipelineStatusState PipelineState
 @inject IJSRuntime JS
 
 <div class="graph-page">
@@ -566,8 +568,37 @@
     // Called from graph-editor.js's node right-click menu just before it opens, to decide whether
     // 開啟劇本檔/複製劇本名稱 should be enabled — a live disk/model read rather than trusting the initial
     // payload snapshot, which can go stale after a sidebar field edit (see GraphEditorState.UpdateNodeField).
+    // 跳到管線狀態/定位到LDtk are gated on PipelineStatusState's last refresh (never triggers one).
     [JSInvokable]
-    public NodeContextMenuInfoDto GetNodeContextMenuInfo(string guid) => State.GetNodeContextMenuInfo(guid);
+    public NodeContextMenuInfoDto GetNodeContextMenuInfo(string guid)
+    {
+        var info = State.GetNodeContextMenuInfo(guid);
+        info.IsOnPipeline = PipelineState.HasRow(info.PlayscriptName);
+        info.HasLdtkLocation = PipelineState.HasLdtkLocation(info.PlayscriptName);
+        return info;
+    }
+
+    // Node right-click "跳到管線狀態" — the mirror image of PipelineStatusPanel's 跳到劇情節點.
+    [JSInvokable]
+    public async Task JumpToPipelineForGuid(string guid)
+    {
+        var name = State.GetNodeContextMenuInfo(guid).PlayscriptName;
+        if (PipelineState.HasRow(name))
+            await PipelineFocusCoordinator.RequestFocusAsync(name);
+    }
+
+    // Node right-click "定位到LDtk" — same action as PipelineStatusPanel's own menu item; its result goes to
+    // this tab's status line since the user is looking at the flow graph, not the pipeline tab.
+    [JSInvokable]
+    public void LocateInLdtkForGuid(string guid)
+    {
+        var message = PipelineState.LocateInLdtk(State.GetNodeContextMenuInfo(guid).PlayscriptName);
+        if (message != null)
+        {
+            State.SetStatusMessage(message);
+            StateHasChanged();
+        }
+    }
 
     // 開啟劇本檔 moved here from its old sidebar button — the right-click menu passes the guid explicitly
     // since it's never tied to whichever node the sidebar currently has selected.
@@ -578,7 +609,21 @@
         StateHasChanged();
     }
 
-    // The server-side half of the right-click menu's 複製 action — see GraphEditorState.DuplicateNode for
+    // Ctrl+C on the canvas: returns the newline-joined playscript names for graph-editor.js to put on the
+    // clipboard (empty = nothing to copy, clipboard left alone).
+    [JSInvokable]
+    public string CopyPlayscriptNames(string[] guids)
+    {
+        var names = State.GetPlayscriptNamesForCopy(guids);
+        if (names.Count == 0)
+            return string.Empty;
+
+        State.SetStatusMessage(names.Count == 1 ? $"已複製：{names[0]}" : $"已複製 {names.Count} 個劇本名稱");
+        StateHasChanged();
+        return string.Join("\n", names);
+    }
+
+    // The server-side half of 建立節點副本 (right-click menu / Ctrl+D) — see GraphEditorState.DuplicateNode for
     // what actually gets copied (every field including playscriptId, plus 劇本 content). Edge duplication
     // is entirely graph-editor.js's own responsibility since links never round-trip through this class
     // until 存檔.

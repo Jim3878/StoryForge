@@ -65,9 +65,11 @@ public static class NodeScriptTableStore
     // GooglePlayscriptSheetClient.DownloadScriptTableAsync) into its .md 劇本檔, unconditionally overwriting
     // whatever is already there — unlike SyncAll below, the caller (the "下載Sheet劇本" batch flow) has
     // already resolved any overwrite conflict with the user before calling this.
-    public static void WriteContent(string dataFolder, string playscriptName, string? guid, IReadOnlyList<string[]> rows)
+    public static void WriteContent(string dataFolder, string playscriptName, string? guid, IReadOnlyList<string[]> rows) =>
+        WriteContentAt(ResolvePath(dataFolder, playscriptName, guid), playscriptName, rows);
+
+    public static void WriteContentAt(string path, string playscriptName, IReadOnlyList<string[]> rows)
     {
-        var path = ResolvePath(dataFolder, playscriptName, guid);
         var directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
@@ -88,7 +90,11 @@ public static class NodeScriptTableStore
 
     // Path-based form of ReadRows, for callers that walk the Nodes folder themselves (CgScriptScanner)
     // instead of resolving one playscript name at a time.
-    public static List<string[]> ReadRowsFromFile(string path)
+    public static List<string[]> ReadRowsFromFile(string path) => ReadRowsFromFile(path, keepBlankRows: false);
+
+    // keepBlankRows: the cloud sync (Core/Cloud) round-trips a table losslessly, including the blank rows
+    // AGENTS.md asks for at the top and bottom of every table; every cell list is padded/cut to the 7 columns.
+    public static List<string[]> ReadRowsFromFile(string path, bool keepBlankRows)
     {
         if (!File.Exists(path))
             return new List<string[]>();
@@ -108,6 +114,12 @@ public static class NodeScriptTableStore
                 continue;
 
             var cells = ParseRowCells(line);
+            if (keepBlankRows)
+            {
+                rows.Add(Enumerable.Range(0, Headers.Length).Select(i => i < cells.Length ? cells[i] : string.Empty).ToArray());
+                continue;
+            }
+
             if (cells.All(string.IsNullOrEmpty))
                 continue;
 

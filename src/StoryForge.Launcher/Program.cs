@@ -40,6 +40,7 @@ internal static class Program
         // Reaching this line at all means the last self-update (if any) already started successfully, so a
         // leftover backup from it is safe to discard — see ApplyUpdateAndRestart/SpawnLauncherSelfUpdateHelper.
         CleanupStaleLauncherBackup();
+        ApplyStagedWebBuild();
 
         var webExePath = ResolveOrBuildWebExePath();
         if (webExePath == null)
@@ -159,6 +160,8 @@ internal static class Program
             var stagedLauncherDir = Path.Combine(stagingDir, "src", "StoryForge.Launcher", "bin", "Release", "net8.0");
 
             CopyDirectoryOverwrite(stagedWebDir, webPublishDir);
+            // 本機 publish.bat 留下、還沒換上的舊建置，不能在下次啟動時蓋掉剛下載的新版
+            DeleteDirectoryIfExists(WebPublishStagedDir);
             SpawnLauncherSelfUpdateHelper(launcherDir, stagedLauncherDir);
         }
         catch (Exception e)
@@ -242,6 +245,64 @@ internal static class Program
         });
 
         Environment.Exit(0);
+    }
+
+    private static string WebPublishParentDir => Path.GetFullPath(Path.Combine(
+        AppContext.BaseDirectory, "..", "..", "..", "..", "StoryForge.Web", "bin", "Release", "net8.0"));
+
+    private static string WebPublishStagedDir => Path.Combine(WebPublishParentDir, "publish-staged");
+
+    // publish.bat 不直接寫 publish（StoryForge 開著時檔案被後端鎖住，publish 會失敗），而是寫到 publish-staged，
+    // 成功後放一個 .complete 記號。這裡在後端還沒啟動、publish 沒被鎖住時把它換上：publish → publish-old、
+    // publish-staged → publish。沒有 .complete（publish 還在跑或失敗了）就不動；換不過去（例如上次的後端還沒結束）
+    // 就照舊用目前的版本，下次啟動再試。
+    private static void ApplyStagedWebBuild()
+    {
+        var stagedDir = WebPublishStagedDir;
+        if (!File.Exists(Path.Combine(stagedDir, ".complete")) ||
+            !File.Exists(Path.Combine(stagedDir, "StoryForge.Web.exe")))
+            return;
+
+        var publishDir = Path.Combine(WebPublishParentDir, "publish");
+        var oldDir = Path.Combine(WebPublishParentDir, "publish-old");
+        try
+        {
+            DeleteDirectoryIfExists(oldDir);
+            if (Directory.Exists(publishDir))
+                Directory.Move(publishDir, oldDir);
+
+            try
+            {
+                Directory.Move(stagedDir, publishDir);
+            }
+            catch
+            {
+                // 換新版失敗時把舊版放回去，至少還能照常開
+                if (!Directory.Exists(publishDir) && Directory.Exists(oldDir))
+                    Directory.Move(oldDir, publishDir);
+                throw;
+            }
+
+            File.Delete(Path.Combine(publishDir, ".complete"));
+            DeleteDirectoryIfExists(oldDir);
+        }
+        catch (Exception e)
+        {
+            LogError(e);
+        }
+    }
+
+    private static void DeleteDirectoryIfExists(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch (Exception e)
+        {
+            LogError(e);
+        }
     }
 
     private static void CleanupStaleLauncherBackup()

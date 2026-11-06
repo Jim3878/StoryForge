@@ -40,8 +40,11 @@
 
 - 512×288、16:9，比例不符置中補黑邊，放在來源檔同級資料夾，檔名 `{CG}_{差分}.preview.png`。
 - clip：每個圖層構圖一張，範圍與正式輸出相同（有裁切框用 `trim`，沒有用整張畫布；舊 Unity 工具也是 trim）。
-- spine：每個動畫第 0 幀一張。Spine CLI 先匯出骨架 JSON 取動畫清單與 `bg` slot 範圍（＝遊戲鏡頭框，用來裁切），
-  再一次啟動串接所有動畫的 PNG 匯出（每次啟動約 14 秒）。沒有 `bg` slot 時輸出整個骨架範圍。
+- spine：每個動畫第 0 幀一張。Spine CLI 先匯出骨架 JSON 取動畫清單，再一次啟動串接所有動畫的 PNG 匯出（每次啟動約 14 秒）。
+  裁切框是遊戲鏡頭範圍（以骨架原點為中心 3555×2000，見 `CgCatalogConstants.SpineCameraHeight`），不用 `bg` slot（bg 圖含出血）。
+  輸出至 Unity 時每次都重新產（跟 clip 一樣），不沿用舊預覽當縮圖。
+  PNG 是從改過的骨架 JSON 輸出：名稱 `censor_` 開頭的 slot（遮擋用）alpha 設 0 並拿掉動畫顏色時間軸，不擷進預覽；
+  JSON 的 `images` 改成絕對路徑（原本相對 `.spine`）。
 - 美術 png 直接當預覽時，伺服器端縮成 512×288 再送（記憶體快取）。
 - 顯示順序：clip 預覽 → png → spine 預覽 → 暫代圖。有來源但預覽未產生時，往下一順位顯示並標「預覽未產生」。
 - 左右箭頭切換「這張 CG 擁有的差分」，底下顯示差分名稱與歸屬。來源缺劇本要的差分 → 該頁暫代圖＋紅字。
@@ -62,6 +65,15 @@
   - 兩者都呼叫 `CgImportQueue.ProcessPending()`，回寫進度檔與結果檔。Forge 等結果檔才標「已完成」。
   - 狀態列階段：準備檔案 i/N → 等待 Unity（請切回 Unity）/ Unity 啟動中（秒數＋log 末行）→ Unity 匯入 i/N → 完成。
 
+- **從 Unity 刪除**（2026-10-30 與使用者逐題確認定案，打包試玩版用）：
+  - 範圍：目前篩選出來、Unity 裡有檔案的 CG（共用 CG 看自己的 definition；其他看 definition / prefab / 暫代圖），不分 Unity 狀態整套刪：
+    prefab、`Gallery/` 與 `_Placeholder/` 差分圖、`SkeletonData/{CG}/`、縮圖、definition，並移除 Addressables 登記。
+    共用 CG 只刪自己的 definition 與縮圖。美術來源、clip 匯出的 PNG / 預覽、`CgSpecialCases.json` 不動；不做備份，要回來就重新輸出或從 git 拿回。
+  - 主 CG 的 prefab 還被這次範圍外（且 Unity 裡有 definition）的共用 CG 使用 → 整張略過並記 Log。
+  - 由 Unity 端 `CgImportQueue` 執行（`pending.json` 的 `Delete` 項目，走 hook / batchmode 同一條路）。成功後清掉本機的輸出記錄。
+  - 工具列按鈕只在章節篩選「選了部分章節」時可用（全選或全不選時停用）；卡片右鍵可刪單張。
+  - 兩段確認：清單（依章節分組＋略過的主 CG）→「刪除」→ 小對話框「確定刪除 / 取消」，預設焦點在取消。
+
 ## Csp 工具
 
 - 新增 `clip_layer_comp_exporter.exe --batch job.json`（`clip_batch_export.py`）：一個 clip 只載入一次，一次輸出多構圖、多尺寸；
@@ -71,10 +83,16 @@
 
 ## 介面
 
-- 工具列：章節多選｜缺檔/缺 spine/異常/已完成 計數（可點篩選）｜預覽大小滑桿｜重新掃描｜更新預覽圖｜輸出 PNG｜輸出至 Unity｜CG 共用表｜取消。
+- 工具列：章節多選｜缺檔/缺 spine/異常/已完成 計數（可點篩選）｜預覽大小滑桿｜重新掃描｜更新預覽圖｜輸出 PNG｜輸出至 Unity｜從 Unity 刪除｜CG 共用表｜取消。
   批次按鈕只作用於目前篩選出的 CG。
 - 卡片：預覽＋差分切換、CG 名稱、`clip`/`png`/`spine` 標籤、Unity 狀態標籤、類型下拉、更新預覽、輸出至 Unity、劇本名稱（點擊跳流程圖節點）。
-- 右鍵：複製 CG 名稱｜開啟 clip 檔｜開啟 spine 檔（無則灰）｜開啟 clip 資料夾｜開啟 spine 資料夾｜輸出 PNG｜開啟劇本檔（.md）｜跳到流程圖節點（多劇本時二級選單）。
+- 右鍵：複製 CG 名稱｜開啟 clip 檔｜開啟 spine 檔（無則灰）｜開啟 clip 資料夾｜開啟 spine 資料夾｜輸出 PNG｜從範本建立資料夾（見下）｜開啟劇本檔（.md）｜跳到流程圖節點（多劇本時二級選單）｜從 Unity 刪除。
+- 右鍵「從範本建立資料夾」（2026-10-15 與使用者逐題確認定案）：
+  - 對象：一般 CG 是自己；共用 CG 的美術屬於主 CG，改對主 CG 做，選項標「（主 CG：xxx）」。
+  - 對象已有 clip → 停用。沒有 clip，但 CG 根目錄第一層有名字（依檔名比對規則）對得上的資料夾 → 改成「開啟既有資料夾（找不到 clip，檔名可能錯）」，
+    只打開不建立（clip 檔名錯或空資料夾時，避免同一張 CG 出現兩個資料夾）。都沒有 → 從範本建立。
+  - 建立：整個範本資料夾複製到 CG 根目錄，資料夾名 = CG 名稱（去零寬字元，例如 `CG_A10_ReN1`），範本 clip 原位改名成 `{CG}.clip`；
+    複製到一半失敗就刪掉這次建的資料夾。完成後檔案總管選取新 clip、重新掃描。
 - 底部 Log 可收合、可複製。
 - 工作在背景佇列一次跑一個，不鎖畫面；狀態列顯示階段/秒數/心跳，處理中的卡片蓋遮罩、排隊中標示；取消 = 當前這張結束後停止（已交給 Unity 的不能取消）。
 - 掃描時機：切到 CG 分頁自動掃一次＋手動重新掃描；兩份 JSON 檔案監看。
@@ -82,6 +100,8 @@
 ## Unity 端
 
 - 新增 `CgImportQueue`（待匯入清單 → 產 prefab/definition → 進度檔/結果檔），供 hook 與 batchmode 共用。
+- spine 縮放（2026-10-30 定案）：CG 一律 2 倍繪製，每次輸出 spine 都強制 prefab 根物件 `1`、`SpineVisual` `(0.5, 0.5, 1)`，
+  不沿用舊 prefab 上的值（以前手動改，A7 改在根物件、其他改在 SpineVisual，A5 是 0.49）。
 - `CgImportQueue` 沿用 `SpriteCgImportService` / `SpineCgImportService`；縮圖用 Forge 提供的檔案（不在 Unity 截圖），
   共用 prefab 的 definition 與主 CG 的差分過濾也由它寫。
 - 新增 CG 共用表視窗（`素材/CG/CG 共用表`，`CgShareTableWindow`，編輯 `CgSpecialCases.json`）。
@@ -91,4 +111,4 @@
 
 ## 設定頁新增
 
-CG 根目錄、Csp EXE 路徑、Spine CLI 路徑、Unity.exe 路徑（預設依 `ProjectVersion.txt` 推 Hub 路徑）。
+CG 根目錄、Csp EXE 路徑、Spine CLI 路徑、Unity.exe 路徑（預設依 `ProjectVersion.txt` 推 Hub 路徑）、CG 範本資料夾（預設 `CG圖\Sample`）、範本 clip（範本資料夾底下的相對路徑，預設 `01_source\FalseBadgeCG.clip`）。
