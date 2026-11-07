@@ -2,6 +2,7 @@
 // web editor and the MCP extension read and write exactly the same structure. Run after changing either.
 // Usage: node scripts/copy-schema-to-affine.mjs [<AFFiNE repo root>]
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -21,7 +22,14 @@ for (const file of ["schema.ts", "rules.ts", "flowgraph.ts"]) {
 const webRoot = path.resolve(here, "..", "..", "src/StoryForge.Web/wwwroot");
 const assets = path.join(affine, "packages/frontend/core/public/sf-assets");
 mkdirSync(assets, { recursive: true });
+const hash = createHash("sha1");
 for (const [from, to] of [["lib/litegraph/litegraph.min.js", "litegraph.min.js"], ["lib/litegraph/litegraph.css", "litegraph.css"], ["js/graph-editor.js", "graph-editor.js"]]) {
-  writeFileSync(path.join(assets, to), readFileSync(path.join(webRoot, from)));
+  const bytes = readFileSync(path.join(webRoot, from));
+  hash.update(bytes);
+  writeFileSync(path.join(assets, to), bytes);
 }
+// The server caches /sf-assets for hours, so the page loads them as ?v=<this>: a new copy is a new URL.
+writeFileSync(path.join(target, "assets-version.ts"),
+  header + `export const SF_ASSETS_VERSION = "${hash.digest("hex").slice(0, 10)}";
+`);
 console.log(`schema copied to ${target}; canvas scripts copied to ${assets}`);
