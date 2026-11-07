@@ -1534,6 +1534,48 @@ window.storyForgeGraph = (function () {
     // memberNodeGuids for groups) by design. Assumes graph/nodesByGuid/guidByNode have already been reset by
     // the caller and node TYPES are already registered (registerNodeTypes only ever needs to run once, at
     // the real init() — a snapshot never contains a type the server payload didn't already register).
+    // One payload node -> one LiteGraph node, registered in nodesByGuid/guidByNode. Shared by the initial
+    // build and applyRemoteChanges (the cloud editor adding nodes someone else created).
+    function createCanvasNode(nodeDto) {
+        const liteType = "storyforge/" + sanitize(nodeDto.typeName);
+        const node = LiteGraph.createNode(liteType);
+        if (!node) {
+            console.error("storyForgeGraph: unknown node type", nodeDto.typeName);
+            return null;
+        }
+        node.pos = [nodeDto.x, nodeDto.y];
+        // The saved width/height came from the old tool's layout, back when a multi-connection field
+        // needed one row per wire (see the AllowMultiple slot-splitting this port used to do, before
+        // patchLiteGraphForMultiInputLinks made a single slot able to hold them all) — so it's often
+        // taller than this node needs now that it's back to exactly one row per field. computeSize()
+        // asks LiteGraph itself for the box that actually fits the ports this node has today; only the
+        // saved width is still honored (as a minimum, not a fixed value — a node with a short title
+        // shouldn't shrink from whatever width the original graph laid it out at).
+        const naturalSize = node.computeSize();
+        node.size = [Math.max(nodeDto.width || 0, naturalSize[0]), naturalSize[1]];
+        // " " not "" — see the group loop above for why an actually-empty title backfires.
+        node.title = " ";
+        node._displayTitle = nodeDto.title;
+        node._hasIdentityTitle = !!nodeDto.hasIdentityTitle;
+        // LiteGraph also draws a small default color badge in the title bar's corner regardless of
+        // title text — an unset boxcolor rendered as a plain gray circle sitting on top of our label.
+        // No-op override is the officially-supported way to suppress it (see drawNodeShape: it only
+        // draws the badge itself when the node has no onDrawTitleBox of its own).
+        node.onDrawTitleBox = function () {};
+        // A reasonable width at "natural" (unfrozen) zoom — drawFrozenLabels grows this further, every
+        // frame, for whatever the *current* zoom actually needs, all the way down to the frozen floor;
+        // this is just a stable starting point so a node doesn't visibly jump in width on first render.
+        canvas.ctx.font = NATURAL_NODE_WORLD_SIZE + "px sans-serif";
+        const titleWidth = canvas.ctx.measureText(nodeDto.title).width + 8;
+        if (node.size[0] < titleWidth)
+            node.size[0] = titleWidth;
+        node._baseWidth = node.size[0];
+        graph.add(node);
+        nodesByGuid.set(nodeDto.guid, node);
+        guidByNode.set(node, nodeDto.guid);
+        return node;
+    }
+
     function buildGraphFromData(nodeDtos, edgeDtos, groupDtos) {
         for (const groupDto of groupDtos) {
             // " " not "" — an empty title makes LiteGraph fall back to drawing a default/type label of
@@ -1554,44 +1596,8 @@ window.storyForgeGraph = (function () {
             graph.add(group);
         }
 
-        for (const nodeDto of nodeDtos) {
-            const liteType = "storyforge/" + sanitize(nodeDto.typeName);
-            const node = LiteGraph.createNode(liteType);
-            if (!node) {
-                console.error("storyForgeGraph: unknown node type", nodeDto.typeName);
-                continue;
-            }
-            node.pos = [nodeDto.x, nodeDto.y];
-            // The saved width/height came from the old tool's layout, back when a multi-connection field
-            // needed one row per wire (see the AllowMultiple slot-splitting this port used to do, before
-            // patchLiteGraphForMultiInputLinks made a single slot able to hold them all) — so it's often
-            // taller than this node needs now that it's back to exactly one row per field. computeSize()
-            // asks LiteGraph itself for the box that actually fits the ports this node has today; only the
-            // saved width is still honored (as a minimum, not a fixed value — a node with a short title
-            // shouldn't shrink from whatever width the original graph laid it out at).
-            const naturalSize = node.computeSize();
-            node.size = [Math.max(nodeDto.width || 0, naturalSize[0]), naturalSize[1]];
-            // " " not "" — see the group loop above for why an actually-empty title backfires.
-            node.title = " ";
-            node._displayTitle = nodeDto.title;
-            node._hasIdentityTitle = !!nodeDto.hasIdentityTitle;
-            // LiteGraph also draws a small default color badge in the title bar's corner regardless of
-            // title text — an unset boxcolor rendered as a plain gray circle sitting on top of our label.
-            // No-op override is the officially-supported way to suppress it (see drawNodeShape: it only
-            // draws the badge itself when the node has no onDrawTitleBox of its own).
-            node.onDrawTitleBox = function () {};
-            // A reasonable width at "natural" (unfrozen) zoom — drawFrozenLabels grows this further, every
-            // frame, for whatever the *current* zoom actually needs, all the way down to the frozen floor;
-            // this is just a stable starting point so a node doesn't visibly jump in width on first render.
-            canvas.ctx.font = NATURAL_NODE_WORLD_SIZE + "px sans-serif";
-            const titleWidth = canvas.ctx.measureText(nodeDto.title).width + 8;
-            if (node.size[0] < titleWidth)
-                node.size[0] = titleWidth;
-            node._baseWidth = node.size[0];
-            graph.add(node);
-            nodesByGuid.set(nodeDto.guid, node);
-            guidByNode.set(node, nodeDto.guid);
-        }
+        for (const nodeDto of nodeDtos)
+            createCanvasNode(nodeDto);
 
         const nodeTypeByGuid = new Map(nodeDtos.map(n => [n.guid, n.typeName]));
         for (const edgeDto of edgeDtos) {
@@ -2331,6 +2337,75 @@ window.storyForgeGraph = (function () {
     // LoadGraph. _baseWidth is recomputed the same way buildGraphFromData/duplicateSelectedNodes do it for
     // a node's initial size — drawFrozenLabels' own per-frame widening then takes over from here at
     // whatever the current zoom needs.
+    // Cloud editor (AFFiNE): applies what someone else saved without rebuilding the canvas — removed/added
+    // nodes, removed/added links, moved nodes, retitled nodes, group title/colour/membership. Nothing here
+    // counts as a local edit: no remove notifications, and a canvas that was clean stays clean.
+    // changes: { removeNodes: [guid], addNodes: [nodeDto], removeEdges: [edgeDto], addEdges: [edgeDto],
+    //            positions: [{ guid, x, y }], titles: [{ guid, title, hasIdentityTitle }],
+    //            groups: [{ clientId, title, color, memberNodeGuids }] }
+    function applyRemoteChanges(changes) {
+        if (!graph || !canvas) return;
+        const wasClean = !hasCanvasChanges();
+        const typeOf = guid => (currentPayload.nodes.find(n => n.guid === guid) || {}).typeName;
+        const findLink = edge => {
+            const from = nodesByGuid.get(edge.fromNodeGuid), to = nodesByGuid.get(edge.toNodeGuid);
+            if (!from || !to) return null;
+            const out = (outputSlotsByType.get(typeOf(edge.fromNodeGuid)) || {})[edge.fromPort];
+            const inp = (inputSlotsByType.get(typeOf(edge.toNodeGuid)) || {})[edge.toPort];
+            for (const id in graph.links) {
+                const l = graph.links[id];
+                if (l && l.origin_id === from.id && l.target_id === to.id && l.origin_slot === out && l.target_slot === inp)
+                    return { link: l, from, to, out, inp };
+            }
+            return { link: null, from, to, out, inp };
+        };
+        restoringSnapshot = true;
+        try {
+            for (const edge of changes.removeEdges || []) {
+                const hit = findLink(edge);
+                if (hit && hit.link) graph.removeLink(hit.link.id);
+            }
+            for (const guid of changes.removeNodes || []) {
+                const node = nodesByGuid.get(guid);
+                if (!node) continue;
+                graph.remove(node);
+                nodesByGuid.delete(guid);
+                guidByNode.delete(node);
+                initialNodeGuids.delete(guid);
+                newNodeGuids.delete(guid);
+                currentPayload.nodes = currentPayload.nodes.filter(n => n.guid !== guid);
+            }
+            for (const dto of changes.addNodes || []) {
+                if (nodesByGuid.has(dto.guid)) continue;
+                if (!createCanvasNode(dto)) continue;
+                initialNodeGuids.add(dto.guid);
+                currentPayload.nodes.push(dto);
+            }
+            for (const edge of changes.addEdges || []) {
+                const hit = findLink(edge);
+                if (hit && !hit.link && hit.out !== undefined && hit.inp !== undefined)
+                    hit.from.connect(hit.out, hit.to, hit.inp);
+            }
+            for (const p of changes.positions || []) {
+                const node = nodesByGuid.get(p.guid);
+                if (node) { node.pos[0] = p.x; node.pos[1] = p.y; }
+            }
+            for (const t of changes.titles || []) updateNodeTitle(t.guid, t.title, t.hasIdentityTitle);
+            for (const g of changes.groups || []) {
+                const group = findGroupByClientId(g.clientId);
+                if (!group) continue;
+                group._displayTitle = g.title;
+                group.color = g.color;
+                group._memberGuids = new Set(g.memberNodeGuids || []);
+            }
+            for (const group of graph._groups || []) recomputeGroupBounds(group);
+        } finally {
+            restoringSnapshot = false;
+        }
+        canvas.setDirty(true, true);
+        if (wasClean) markCanvasClean();
+    }
+
     function updateNodeTitle(guid, title, hasIdentityTitle) {
         const node = nodesByGuid.get(guid);
         if (!node) return;
@@ -2365,6 +2440,7 @@ window.storyForgeGraph = (function () {
         fitView: fitViewAndRedraw,
         updateSettings: updateSettings,
         updateNodeTitle: updateNodeTitle,
+        applyRemoteChanges: applyRemoteChanges,
         searchNode: searchNode,
         focusOnPlayscriptWhenVisible: focusOnPlayscriptWhenVisible,
         _debug: {
