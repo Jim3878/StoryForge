@@ -30,6 +30,21 @@ public sealed class CloudGraphPull
     public string Sv { get; set; } = string.Empty;
 }
 
+public sealed class CloudSyncPull
+{
+    public int SchemaVersion { get; set; }
+    public bool Exists { get; set; }
+    // False when the extension read everything (no --since, or a host without doc timestamps).
+    public bool Incremental { get; set; }
+    // Server time (ms) to pass as `since` next time.
+    public long ServerTime { get; set; }
+    public List<CloudPlayscript> Index { get; set; } = new();
+    // Null when the flow graph did not change since `since`.
+    public CloudGraphPull? Graph { get; set; }
+    // Only the tables that changed since `since` (all of them without it).
+    public List<CloudPlayscript> Playscripts { get; set; } = new();
+}
+
 public sealed class CloudPushItem
 {
     public string Guid { get; set; } = string.Empty;
@@ -62,6 +77,32 @@ public sealed class SfCloudClient
     {
         _command = string.IsNullOrWhiteSpace(command) ? "affine-mcp.cmd" : command.Trim();
         _workspaceId = workspaceId.Trim();
+    }
+
+    /// <summary>One connection: index, and the flow graph / tables that changed after <paramref name="since"/>.</summary>
+    public async Task<CloudSyncPull> SyncPullAsync(long? since, IReadOnlyCollection<string>? only = null,
+        CancellationToken ct = default)
+    {
+        var outPath = TempFile("sync-pull");
+        try
+        {
+            var args = new List<string> { "sf", "sync-pull", "--workspace", _workspaceId, "--out", outPath };
+            if (since is { } s)
+                args.AddRange(new[] { "--since", s.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+            if (only is { Count: > 0 })
+                args.AddRange(new[] { "--only", string.Join(",", only) });
+            await RunAsync(args, ct);
+            var result = JsonConvert.DeserializeObject<CloudSyncPull>(await File.ReadAllTextAsync(outPath, ct))
+                         ?? throw new InvalidOperationException("sf sync-pull 沒有回傳資料");
+            if (result.SchemaVersion > SupportedSchemaVersion)
+                throw new InvalidOperationException(
+                    $"雲端資料的 schemaVersion 是 {result.SchemaVersion}，這個 StoryForge 只支援到 {SupportedSchemaVersion}。請先更新 StoryForge。");
+            return result;
+        }
+        finally
+        {
+            TryDelete(outPath);
+        }
     }
 
     public async Task<CloudPullResult> PullAsync(CancellationToken ct = default)
@@ -163,7 +204,8 @@ public sealed class SfCloudClient
         if (string.IsNullOrWhiteSpace(_workspaceId))
             throw new InvalidOperationException("還沒設定雲端 workspace id（設定 → 雲端）。");
 
-        var psi = new ProcessStartInfo(_command)
+        var (exe, prefix) = ResolveLauncher(_command);
+        var psi = new ProcessStartInfo(exe)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -172,6 +214,8 @@ public sealed class SfCloudClient
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
         };
+        foreach (var a in prefix)
+            psi.ArgumentList.Add(a);
         foreach (var a in args)
             psi.ArgumentList.Add(a);
 
@@ -210,6 +254,27 @@ public sealed class SfCloudClient
             var lastLine = text.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.Length > 0) ?? $"exit code {process.ExitCode}";
             throw new InvalidOperationException(lastLine.TrimStart('✗', ' '));
         }
+    }
+
+    // The default command goes straight to node + affine-mcp's lean extension entry (dist/ext-cli.js, which
+    // also reuses its sign-in between runs) instead of the .cmd shim and the full MCP server entry: about
+    // two seconds less per call. Anything else configured is run as given.
+    private static (string Exe, string[] Prefix) ResolveLauncher(string command)
+    {
+        var name = Path.GetFileName(command).ToLowerInvariant();
+        if (name is "affine-mcp.cmd" or "affine-mcp" or "affine-mcp-ext.cmd" or "affine-mcp-ext")
+        {
+            var dir = Path.GetDirectoryName(command);
+            if (string.IsNullOrEmpty(dir))
+                dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm");
+            var entry = Path.Combine(dir, "node_modules", "affine-mcp-server", "dist", "ext-cli.js");
+            if (File.Exists(entry))
+                return ("node", new[] { entry });
+            var ext = Path.Combine(dir, "affine-mcp-ext.cmd");
+            if (File.Exists(ext))
+                return (ext, Array.Empty<string>());
+        }
+        return (command, Array.Empty<string>());
     }
 
     private static string TempFile(string tag) =>

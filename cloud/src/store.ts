@@ -34,7 +34,7 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   return out;
 }
 
-const CONCURRENCY = 8;
+const CONCURRENCY = 24;
 
 export function createStore(ctx: HostContext) {
   const { Y } = ctx;
@@ -137,6 +137,41 @@ export function createStore(ctx: HostContext) {
     return results;
   }
 
+  // ----- one-connection incremental download (sf sync-pull) -----
+
+  /**
+   * Everything local StoryForge's 下載 needs, over one connection: the playscript index (always), the flow
+   * graph and the tables — but with `since` (server ms from the previous call) only the docs changed after
+   * it are read. `serverTime` is what to pass as `since` next time. Hosts without timestamps get everything.
+   */
+  async function syncPull(s: DocSession, since: number | null, only?: string[]) {
+    const ws = s.workspaceId;
+    let changed: Record<string, number> | null = null;
+    if (since !== null && s.timestamps) changed = await s.timestamps(since);
+    const all = changed === null && s.timestamps ? await s.timestamps(0).catch(() => null) : null;
+    const serverTime = Math.max(since ?? 0, ...Object.values(changed ?? all ?? {}));
+    const isChanged = (docId: string) => changed === null || docId in changed;
+
+    const p = await project(s);
+    let graph: Awaited<ReturnType<typeof pullGraph>> | null = null;
+    if (!only?.length && (isChanged(flowgraphDocId(ws)) || isChanged(rulesDocId(ws)))) graph = await pullGraph(s);
+    const onlySet = only?.length ? new Set(only) : null;
+    const targets = p.playscripts.filter(e => (onlySet ? onlySet.has(e.guid) : isChanged(playscriptDocId(ws, e.guid))));
+    const playscripts = await mapLimit(targets, CONCURRENCY, async e => {
+      const ps = await readPlayscript(s, e.guid);
+      return { ...e, rows: ps.rows.map(r => r.cells), sv: ps.sv };
+    });
+    return {
+      schemaVersion: p.schemaVersion,
+      exists: p.exists,
+      incremental: changed !== null,
+      serverTime,
+      index: p.playscripts,
+      graph,
+      playscripts,
+    };
+  }
+
   // ----- flow graph (cloud is the master once seeded) -----
 
   async function pullGraph(s: DocSession) {
@@ -183,7 +218,7 @@ export function createStore(ctx: HostContext) {
     return { status: "ok" as const, stats };
   }
 
-  return { flow, pullGraph, pushGraph, schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
+  return { flow, syncPull, pullGraph, pushGraph, schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
 }
 
 export type Store = ReturnType<typeof createStore>;

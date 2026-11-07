@@ -9,6 +9,8 @@ export type DocSession = {
   load(docId: string): Promise<YType.Doc>;
   /** Pushes everything in `doc` that is newer than `before` (a state vector from right after load). */
   push(docId: string, doc: YType.Doc, before: Uint8Array): Promise<void>;
+  /** docId -> last update time (server ms) for docs changed after `since`; missing on older hosts. */
+  timestamps?(since: number): Promise<Record<string, number>>;
   close(): void;
 };
 

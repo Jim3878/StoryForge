@@ -115,8 +115,13 @@ Playscript tables also live in an AFFiNE workspace (`AppSettings.CloudWorkspaceI
 layout is defined once in `cloud/src/schema.ts` (TypeScript), which is used by the nineday affine-mcp fork's
 StoryForge extension (`cloud/` builds it; `npm run install-into-mcp` copies it into
 `E:\Devffine-mcp-server\extensions\storyforge`) and copied into the AFFiNE fork's web editor by
-`cloud/scripts/copy-schema-to-affine.mjs`. C# never talks Yjs: `Core/Cloud/SfCloudClient` runs
-`affine-mcp sf pull|push` and exchanges JSON files with it; login lives in affine-mcp's own config.
+`cloud/scripts/copy-schema-to-affine.mjs`. C# never talks Yjs: `Core/Cloud/SfCloudClient` runs the extension's `sf`
+commands and exchanges JSON files with them; login lives in affine-mcp's own config. For speed it runs `node` on
+affine-mcp's lean entry `dist/ext-cli.js` (no MCP tool modules, sign-in cookie cached in `ext-session.json` next
+to the affine-mcp config) rather than the `affine-mcp.cmd` shim. 下載 is one `sf sync-pull` call: the playscript
+index always, and — after the first download — only the flow graph / tables AFFiNE reports as changed since the
+server time stored in `cloud-base/<ws>/pull-state.json` (`space:load-doc-timestamps`). 上傳 skips the rules JSON
+when its hash equals `cloud-base/<ws>/rules-hash.txt`.
 
 Sync is git-style and per whole playscript. The base (last agreed version) is per machine in
 `%LocalAppData%\StoryForge\cloud-base\<ws>\<guid>.json` (`CloudBaseStore`). 上傳 is fast-forward only: the

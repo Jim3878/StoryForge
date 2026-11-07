@@ -4,6 +4,7 @@
 //   sf pull  --workspace <id> --out <file>
 //   sf push  --workspace <id> --in <file> --out <file>
 //   sf info  --workspace <id>
+//   sf sync-pull --workspace <id> [--since <server ms>] [--only guid,guid] --out <file>   (index + changed graph/tables, one connection)
 //   sf graph-pull --workspace <id> --out <file>
 //   sf graph-push --workspace <id> --in <file> --out <file>   (body: { graph, memos?, nodeSchema?, mode: seed|overwrite })
 
@@ -45,6 +46,13 @@ export async function runCli(args: string[], ctx: HostContext) {
       writeJson(out, { results: await store.withSession(workspaceId, s => store.pushAll(s, body.playscripts ?? [], body.rules ?? undefined)) });
       return;
     }
+    case "sync-pull": {
+      const sinceRaw = flag(rest, "since");
+      const since = sinceRaw ? Number(sinceRaw) : null;
+      const only = flag(rest, "only")?.split(",").filter(Boolean);
+      writeJson(out, await store.withSession(workspaceId, s => store.syncPull(s, Number.isFinite(since) ? since : null, only)));
+      return;
+    }
     case "graph-pull":
       writeJson(out, await store.withSession(workspaceId, s => store.pullGraph(s)));
       return;
@@ -56,6 +64,6 @@ export async function runCli(args: string[], ctx: HostContext) {
       return;
     }
     default:
-      throw new Error("用法：affine-mcp sf info|pull|push|graph-pull|graph-push --workspace <id> [--in file] [--out file]");
+      throw new Error("用法：affine-mcp sf info|pull|push|sync-pull|graph-pull|graph-push --workspace <id> [--in file] [--out file]");
   }
 }

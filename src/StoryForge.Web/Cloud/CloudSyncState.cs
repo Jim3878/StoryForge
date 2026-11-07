@@ -44,6 +44,7 @@ public sealed class CloudSyncState
     private readonly Dictionary<string, CloudPlayscript> _lastCloud = new(StringComparer.Ordinal);
     private readonly HashSet<string> _conflicts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _rejected = new(StringComparer.Ordinal);
+    private List<CloudPlayscript> _cloudIndex = new();
 
     public CloudSyncState(AppSettings settings, GraphEditorState graph, ReloadCoordinator reload)
     {
@@ -103,7 +104,7 @@ public sealed class CloudSyncState
             items.Add(item);
         }
 
-        foreach (var cloud in _lastCloud.Values.Where(c => !nodeGuids.Contains(c.Guid)))
+        foreach (var cloud in _cloudIndex.Where(c => !c.Orphan && !nodeGuids.Contains(c.Guid)))
             items.Add(new CloudItem { Guid = cloud.Guid, Name = cloud.Name, Status = CloudItemStatus.NotOnGraph, Message = "本機流程圖沒有這個節點，先略過" });
 
         Items = items
@@ -125,19 +126,28 @@ public sealed class CloudSyncState
             return;
         try
         {
-            var graphSummary = await DownloadFlowGraphAsync();
-            var pull = await Client().PullAsync();
+            // One call, and after the first download only what changed since the previous one (server time).
+            var baseStore = Base();
+            var pull = await Client().SyncPullAsync(baseStore.LastPullServerTime);
+            var graphSummary = pull.Graph is { Exists: true, Graph: not null } ? await ApplyFlowGraphAsync(pull.Graph) : null;
             LastPullAt = DateTime.Now;
-            _lastCloud.Clear();
+            _cloudIndex = pull.Index;
+            if (!pull.Incremental)
+            {
+                _lastCloud.Clear();
+                _conflicts.Clear();
+                _rejected.Clear();
+            }
             foreach (var p in pull.Playscripts)
+            {
                 _lastCloud[p.Guid] = p;
+                _conflicts.Remove(p.Guid);
+                _rejected.Remove(p.Guid);
+            }
 
             var nodes = _graph.GetPlayscriptNodes().ToDictionary(n => n.Guid, n => n.PlayscriptName, StringComparer.Ordinal);
-            var baseStore = Base();
             int written = 0, conflicts = 0, waitingChanged = 0;
             string? backupDir = null;
-            _rejected.Clear();
-            _conflicts.Clear();
 
             foreach (var cloud in pull.Playscripts)
             {
@@ -185,7 +195,9 @@ public sealed class CloudSyncState
             if (conflicts > 0) parts.Add($"{conflicts} 份兩邊都改過，請逐份選擇");
             if (waitingChanged > 0) parts.Add($"{waitingChanged} 份等待合併中的劇本雲端又改了（按「繼續合併」時會處理）");
             if (backupDir != null) parts.Add($"覆寫前的檔案備份在 {backupDir}");
-            StatusMessage = "下載完成：" + string.Join("；", parts) + "。";
+            baseStore.LastPullServerTime = pull.ServerTime;
+            var scope = pull.Incremental ? $"（只讀了上次之後有變動的 {pull.Playscripts.Count} 份）" : "";
+            StatusMessage = "下載完成" + scope + "：" + string.Join("；", parts) + "。";
         }
         catch (Exception e)
         {
@@ -220,6 +232,8 @@ public sealed class CloudSyncState
             }
 
             var rules = TryBuildRules(out var rulesWarning);
+            if (rules != null && rules.Value.Hash == baseStore.LastRulesHash)
+                rules = null; // already in the cloud
             if (items.Count == 0 && rules == null)
             {
                 StatusMessage = "沒有要上傳的改動。" + (rulesWarning ?? "");
@@ -227,6 +241,8 @@ public sealed class CloudSyncState
             }
 
             var results = await Client().PushAsync(items, rules);
+            if (rules != null)
+                baseStore.LastRulesHash = rules.Value.Hash;
             var names = items.ToDictionary(i => i.Guid, i => i.Name, StringComparer.Ordinal);
             int ok = 0, rejected = 0;
             _rejected.Clear();
@@ -263,9 +279,8 @@ public sealed class CloudSyncState
 
     // Pulls the cloud flow graph (if one was uploaded) into blueprint.json and reloads the canvas, before the
     // tables are downloaded so nodes created in the web editor already exist locally. Null = no cloud graph.
-    private async Task<string?> DownloadFlowGraphAsync()
+    private async Task<string?> ApplyFlowGraphAsync(CloudGraphPull pull)
     {
-        var pull = await Client().PullGraphAsync();
         if (!pull.Exists || pull.Graph == null)
             return null;
         Base().SetFlowGraphManaged();
@@ -412,7 +427,7 @@ public sealed class CloudSyncState
                 return;
             }
 
-            var pull = await Client().PullAsync();
+            var pull = await Client().SyncPullAsync(null, new[] { guid });
             var cloud = pull.Playscripts.FirstOrDefault(p => p.Guid == guid);
             var cloudRows = CloudRows.Normalize(cloud?.Rows);
             if (cloud != null) _lastCloud[guid] = cloud;

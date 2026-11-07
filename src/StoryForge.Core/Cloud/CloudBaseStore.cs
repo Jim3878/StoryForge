@@ -71,6 +71,45 @@ public sealed class CloudBaseStore
     public static bool FlowGraphManagedFor(Graph.AppSettings settings) =>
         !string.IsNullOrWhiteSpace(settings.CloudWorkspaceId) && new CloudBaseStore(settings.CloudWorkspaceId.Trim()).IsFlowGraphManaged;
 
+    // Server time (ms) of the last complete 下載; the next one only reads docs changed after it.
+    private string PullStatePath => Path.Combine(_folder, "pull-state.json");
+
+    public long? LastPullServerTime
+    {
+        get
+        {
+            try
+            {
+                return File.Exists(PullStatePath)
+                    ? Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(PullStatePath)).Value<long?>("serverTime")
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+        set
+        {
+            Directory.CreateDirectory(_folder);
+            if (value == null) { if (File.Exists(PullStatePath)) File.Delete(PullStatePath); return; }
+            File.WriteAllText(PullStatePath, JsonConvert.SerializeObject(new { serverTime = value, at = DateTime.Now }));
+        }
+    }
+
+    // Hash of the rules JSON last uploaded from here; unchanged rules are not sent again.
+    private string RulesHashPath => Path.Combine(_folder, "rules-hash.txt");
+
+    public string? LastRulesHash
+    {
+        get => File.Exists(RulesHashPath) ? File.ReadAllText(RulesHashPath).Trim() : null;
+        set
+        {
+            Directory.CreateDirectory(_folder);
+            File.WriteAllText(RulesHashPath, value ?? string.Empty);
+        }
+    }
+
     private string PathFor(string guid) => Path.Combine(_folder, Sanitize(guid) + ".json");
 
     private static string Sanitize(string s) =>
