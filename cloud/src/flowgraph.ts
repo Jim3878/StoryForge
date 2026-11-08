@@ -8,6 +8,8 @@
 //   groups      id -> Y.Map { title, color (plain), x, y, width, height, nodes (string[]), extra }
 //   stickyNotes id -> plain object (CanonicalStickyNote)
 //   memos       node id -> Y.Text (the node's Memo from NodeContentStore; not part of the canonical graph)
+//   content     node id -> Y.Map { conflict, change, characters, location: Y.Text } (the node's other
+//               NodeContentStore fields — 衝突 / 變化 / 角色 / 地點)
 //
 // The node schema (ProcessNodeSchema.json, which ports and identity fields each node type has) is stored as a
 // JSON string under "nodeSchema" in the rules doc.
@@ -55,6 +57,10 @@ const parse = (s: unknown): Extra => {
   try { return JSON.parse(s) as Extra; } catch { return {}; }
 };
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+export const NODE_TEXT_FIELDS = ["conflict", "change", "characters", "location"] as const;
+export type NodeTextField = (typeof NODE_TEXT_FIELDS)[number];
+export type NodeContent = Partial<Record<NodeTextField, string>>;
 
 export type GraphChangeStats = { nodes: number; edges: number; groups: number; stickyNotes: number; memos: number };
 
@@ -244,7 +250,44 @@ export function createFlowGraph(Y: typeof YType) {
     return n;
   }
 
-  return { readGraph, writeGraph, isEmpty, readMemos, memoText, writeMemos, setText };
+  function readContent(doc: YType.Doc): Record<string, NodeContent> {
+    const out: Record<string, NodeContent> = {};
+    doc.getMap<YType.Map<YType.Text>>("content").forEach((m, id) => {
+      if (!(m instanceof Y.Map)) return;
+      const c: NodeContent = {};
+      for (const f of NODE_TEXT_FIELDS) {
+        const v = m.get(f)?.toString() ?? "";
+        if (v) c[f] = v;
+      }
+      if (Object.keys(c).length) out[id] = c;
+    });
+    return out;
+  }
+
+  function contentText(doc: YType.Doc, id: string, field: NodeTextField) {
+    const all = doc.getMap<YType.Map<YType.Text>>("content");
+    let m = all.get(id);
+    if (!(m instanceof Y.Map)) { m = new Y.Map<YType.Text>(); all.set(id, m); }
+    let t = m.get(field);
+    if (!(t instanceof Y.Text)) { t = new Y.Text(); m.set(field, t); }
+    return t;
+  }
+
+  /** Same base/target rule as writeMemos, per field. */
+  function writeContent(doc: YType.Doc, target: Record<string, NodeContent>, base?: Record<string, NodeContent>) {
+    const from = base ?? readContent(doc);
+    let n = 0;
+    for (const id of new Set([...Object.keys(target), ...Object.keys(from)])) {
+      for (const f of NODE_TEXT_FIELDS) {
+        const v = target[id]?.[f] ?? "";
+        if ((from[id]?.[f] ?? "") === v) continue;
+        if (setText(contentText(doc, id, f), v)) n++;
+      }
+    }
+    return n;
+  }
+
+  return { readGraph, writeGraph, isEmpty, readMemos, memoText, writeMemos, readContent, contentText, writeContent, setText };
 }
 
 export type FlowGraph = ReturnType<typeof createFlowGraph>;

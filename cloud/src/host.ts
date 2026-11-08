@@ -11,7 +11,18 @@ export type DocSession = {
   push(docId: string, doc: YType.Doc, before: Uint8Array): Promise<void>;
   /** docId -> last update time (server ms) for docs changed after `since`; missing on older hosts. */
   timestamps?(since: number): Promise<Record<string, number>>;
+  /** Joins a doc's awareness room (local doc id, e.g. `db$sf.flowgraph.main`); missing on older hosts. */
+  presence?(docId: string): Promise<PresenceChannel>;
+  /** False once the connection dropped (missing on older hosts). */
+  alive?(): boolean;
   close(): void;
+};
+
+export type PresenceChannel = {
+  send(update: Uint8Array): void;
+  onUpdate(cb: (update: Uint8Array) => void): void;
+  onCollect(cb: () => void): void;
+  leave(): void;
 };
 
 export type ToolResult = { content: { type: "text"; text: string }[]; structuredContent?: unknown; isError?: boolean };
@@ -22,6 +33,8 @@ export type HostContext = {
   hostVersion: string;
   defaultWorkspaceId?: string;
   openSession(workspaceId?: string): Promise<DocSession>;
+  /** The signed-in account (missing on older hosts). */
+  currentUser?(): Promise<{ name: string; email: string }>;
   /** Registers a tool through the host's own wrapping (error handling, profile filtering). */
   registerTool(
     name: string,

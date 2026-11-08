@@ -118,10 +118,12 @@ StoryForge extension (`cloud/` builds it; `npm run install-into-mcp` copies it i
 `cloud/scripts/copy-schema-to-affine.mjs`. C# never talks Yjs: `Core/Cloud/SfCloudClient` runs the extension's `sf`
 commands and exchanges JSON files with them; login lives in affine-mcp's own config. For speed it runs `node` on
 affine-mcp's lean entry `dist/ext-cli.js` (no MCP tool modules, sign-in cookie cached in `ext-session.json` next
-to the affine-mcp config) rather than the `affine-mcp.cmd` shim. 下載 is one `sf sync-pull` call: the playscript
-index always, and — after the first download — only the flow graph / tables AFFiNE reports as changed since the
-server time stored in `cloud-base/<ws>/pull-state.json` (`space:load-doc-timestamps`). 上傳 skips the rules JSON
-when its hash equals `cloud-base/<ws>/rules-hash.txt`.
+to the affine-mcp config) rather than the `affine-mcp.cmd` shim. 上傳 and 下載 each cover two parts, 劇本表格 and
+流程圖 (two checkboxes, both on by default, `CloudSyncState.SyncTables`/`SyncGraph`). 下載 is one `sf sync-pull` call:
+the playscript index always, and — after the first download — only the flow graph / tables AFFiNE reports as
+changed since the server times stored in `cloud-base/<ws>/pull-state.json` (`space:load-doc-timestamps`), one time
+per part so a download that left a part out never makes the next one miss its changes. 上傳 is one `sf push`
+call; it skips the rules JSON when its hash equals `cloud-base/<ws>/rules-hash.txt`.
 
 Sync is git-style and per whole playscript. The base (last agreed version) is per machine in
 `%LocalAppData%\StoryForge\cloud-base\<ws>\<guid>.json` (`CloudBaseStore`). 上傳 is fast-forward only: the
@@ -135,14 +137,32 @@ validation), then `MergeProvenance` (rows nobody wrote / rows a side added that 
 Blank rows are kept in sync (`ReadRowsFromFile(path, keepBlankRows: true)`), but an all-blank table equals an
 empty one (`CloudRows.Normalize`).
 
-**Flow graph:** once uploaded (雲端同步 → 上傳流程圖, `sf graph-push`), the cloud copy `db$<ws>$sf.flowgraph.main`
+**Flow graph:** the first 上傳 with 流程圖 checked seeds it (the `graph` part of `sf push`, refused if the cloud
+already has one — then the cloud one is adopted as the master); from then on the cloud copy `db$<ws>$sf.flowgraph.main`
 (`cloud/src/flowgraph.ts`: the canonical graph as Y maps, plus per-node Memo Y.Texts) is the master. It is edited
 in the AFFiNE web editor (the same `graph-editor.js` canvas, saved as per-field changes relative to what that
 editor loaded); 下載 pulls it into blueprint.json's `graph` (keeping `baseGraph`, so 匯出至Unity still merges
 against Unity), writes the Memos to the nodes' .json and moves renamed nodes' files. The marker
 `cloud-base/<ws>/flowgraph-managed.json` makes the local flow graph tab read-only (`GraphEditorState.IsCloudManaged`
-refuses 存檔 / 從Unity匯入 / field and Memo edits; the canvas gets `read_only`). 用本機流程圖覆蓋雲端 is the explicit,
-confirmed escape hatch. The node schema (ProcessNodeSchema.json) travels with the graph upload into the rules doc.
+refuses 存檔 / 從Unity匯入 / field and Memo edits; the canvas gets `read_only`). There is deliberately no "overwrite the
+cloud with the local graph" action: the local copy is only the last download, so it could only throw away
+everyone's later edits (restoring and Unity-side changes need their own features). The node schema (ProcessNodeSchema.json) travels with the graph upload into the rules doc.
+The nodes' other `NodeContentStore` texts (衝突/變化/角色/地點) live in the same doc's `content` map. A graph uploaded
+before that existed has none, so 下載 applies them only once the doc's `meta.contentSeeded` is set — the next 上傳
+seeds them (`contentSeed`, written only while unseeded); until then the MCP tools refuse to write them.
+
+**AI tools (MCP, `cloud/src/mcp.ts` + `mcp-graph.ts`)** are for an AI that has no local data folder. 上傳 also sends
+the files AGENTS.md tells the AI to read (AGENTS.md, StoryOutline, CharacterCards, AudioNotes, LdtkTransports,
+GuidePathPoints, PlayscriptNames; `CloudSyncState.ReferenceFiles`) into `db$<ws>$sf.references`, skipping unchanged
+ones (`cloud-base/<ws>/references-hash.json`). `sf_read_guide` returns AGENTS.md behind a cloud preface (in
+`mcp-graph.ts`) mapping each local file / action to its tool — **a change to what AGENTS.md references, or a new
+tool, needs that preface updated too**. Flow-graph tools (`sf_find_nodes`, `sf_read_node`, `sf_update_node`,
+`sf_add_node`, `sf_connect`, `sf_disconnect`; no delete) write straight into the shared graph doc. Before each write
+the AI joins the graph's awareness room (`cloud/src/presence.ts`: y-protocols wire format by hand; AFFiNE keys
+awareness by the *local* doc id `db$sf.flowgraph.main`, not the server id), is refused on any node a person holds
+(`flowLocked`), and shows up as "<account> 的 AI" with selection/cursor; table writes join the table's room too
+and report who else is in it. In the MCP server one pooled connection per workspace (`session-pool.ts`) serves all
+calls; the CLI still connects per call.
 
 `Core/Cloud/CloudRulesExport` builds the rules JSON (function list from `PlayscriptFunctionCatalog`, 名字 lists from
 the enum labels, each character card's 表情 labels); it is uploaded with every 上傳 and read by the MCP tools and the

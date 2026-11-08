@@ -34,6 +34,33 @@ public sealed class MergeCheckResult
     public ProvenanceReport? Provenance { get; init; } // ④: shown for confirmation
 }
 
+// What the progress bar shows while a 下載 / 上傳 runs.
+public sealed class CloudProgressInfo
+{
+    public required string Title { get; init; }
+    public DateTime StartedAt { get; } = DateTime.Now;
+    public string Phase { get; set; } = "啟動";
+    public int? Done { get; set; }
+    public int? Total { get; set; }
+    public double Percent { get; set; }
+    // Where the bar is heading (the end of an uncountable phase like connecting, or the next count of a
+    // countable one) and since when: the bar creeps toward it so it never sits still between reports.
+    public double CreepTo { get; set; } = 5;
+    public DateTime CreepSince { get; set; } = DateTime.Now;
+
+    public double DisplayPercent
+    {
+        get
+        {
+            var t = (DateTime.Now - CreepSince).TotalSeconds;
+            return Percent + Math.Max(0, CreepTo - Percent) * 0.9 * (1 - Math.Exp(-t / 1.2));
+        }
+    }
+}
+
+// The outcome of the last 下載 / 上傳, shown as a banner until dismissed or the next run.
+public sealed record CloudRunResult(bool Success, string Title, string Message, TimeSpan Elapsed, DateTime At);
+
 // 雲端同步 tab. Git-style: 下載 = pull (whole-playscript decisions), 上傳 = push (fast-forward only, per
 // playscript). The cloud side is reached only through SfCloudClient (affine-mcp's StoryForge extension).
 public sealed class CloudSyncState
@@ -55,19 +82,28 @@ public sealed class CloudSyncState
 
     public bool IsFlowGraphManaged => IsConfigured && Base().IsFlowGraphManaged;
 
+    // Which parts 上傳 / 下載 include (the two checkboxes; both by default, not remembered).
+    public bool SyncTables { get; set; } = true;
+    public bool SyncGraph { get; set; } = true;
+
     public bool IsBusy { get; private set; }
     public string? StatusMessage { get; private set; }
     public DateTime? LastPullAt { get; private set; }
     public List<CloudItem> Items { get; private set; } = new();
     public int LocalPlayscriptCount { get; private set; }
     public MergeCheckResult? PendingMergeCheck { get; private set; }
+    public CloudProgressInfo? Progress { get; private set; }
+    public CloudRunResult? LastResult { get; private set; }
     public event Action? Changed;
 
     public bool IsConfigured => !string.IsNullOrWhiteSpace(_settings.CloudWorkspaceId);
     public string WorkspaceId => _settings.CloudWorkspaceId.Trim();
     private string DataFolder => _settings.ExternalDataFolder;
 
-    private SfCloudClient Client() => new(_settings.AffineMcpCommand, WorkspaceId);
+    private SfCloudClient Client() => new(_settings.AffineMcpCommand, WorkspaceId)
+    {
+        Progress = p => SetPhase(p.Phase, p.Done, p.Total),
+    };
     private CloudBaseStore Base() => new(WorkspaceId);
 
     public IReadOnlyList<WaitMergeState> Waiting => WaitMergeStore.All(DataFolder);
@@ -122,16 +158,33 @@ public sealed class CloudSyncState
 
     public async Task DownloadAsync()
     {
-        if (!await BeginAsync("下載中…"))
+        bool tables = SyncTables, graph = SyncGraph;
+        if (!tables && !graph)
+            return;
+        if (!await BeginAsync("下載中…", "下載"))
             return;
         try
         {
-            // One call, and after the first download only what changed since the previous one (server time).
+            // One call, and after the first download only what changed since the previous one (server time),
+            // kept separately for the tables and the flow graph.
             var baseStore = Base();
-            var pull = await Client().SyncPullAsync(baseStore.LastPullServerTime);
-            var graphSummary = pull.Graph is { Exists: true, Graph: not null } ? await ApplyFlowGraphAsync(pull.Graph) : null;
+            var pull = await Client().SyncPullAsync(baseStore.LastPullServerTime, baseStore.LastGraphPullServerTime, tables, graph);
+            SetPhase("套用流程圖");
+            string? graphSummary = null;
+            if (graph && pull.Graph is { Exists: true, Graph: not null })
+                graphSummary = await ApplyFlowGraphAsync(pull.Graph);
+            else if (graph && pull.Graph is { Exists: false } && !baseStore.IsFlowGraphManaged)
+                graphSummary = "雲端還沒有流程圖（按「上傳」會把本機的流程圖一起傳上去）";
+            if (graph)
+                baseStore.LastGraphPullServerTime = pull.ServerTime;
             LastPullAt = DateTime.Now;
             _cloudIndex = pull.Index;
+            if (!tables)
+            {
+                StatusMessage = null;
+                Finish(true, "下載完成（只有流程圖）", (graphSummary ?? "流程圖沒有變動") + "。");
+                return;
+            }
             if (!pull.Incremental)
             {
                 _lastCloud.Clear();
@@ -149,8 +202,14 @@ public sealed class CloudSyncState
             int written = 0, conflicts = 0, waitingChanged = 0;
             string? backupDir = null;
 
+            var applied = 0;
             foreach (var cloud in pull.Playscripts)
             {
+                if (applied++ % 20 == 0)
+                {
+                    SetPhase("寫入本機", applied - 1, pull.Playscripts.Count);
+                    await Task.Yield(); // let the progress bar render between batches
+                }
                 if (!nodes.TryGetValue(cloud.Guid, out var name))
                     continue;
                 if (WaitMergeStore.IsWaiting(DataFolder, cloud.Guid))
@@ -197,11 +256,14 @@ public sealed class CloudSyncState
             if (backupDir != null) parts.Add($"覆寫前的檔案備份在 {backupDir}");
             baseStore.LastPullServerTime = pull.ServerTime;
             var scope = pull.Incremental ? $"（只讀了上次之後有變動的 {pull.Playscripts.Count} 份）" : "";
-            StatusMessage = "下載完成" + scope + "：" + string.Join("；", parts) + "。";
+            if (!graph) scope += "（沒有下載流程圖）";
+            StatusMessage = null;
+            Finish(true, "下載完成" + scope, string.Join("；", parts) + "。");
         }
         catch (Exception e)
         {
-            StatusMessage = $"下載失敗：{e.Message}";
+            StatusMessage = null;
+            Finish(false, "下載失敗", e.Message);
         }
         finally
         {
@@ -213,15 +275,25 @@ public sealed class CloudSyncState
 
     public async Task UploadAsync()
     {
-        if (!await BeginAsync("上傳中…"))
+        bool tables = SyncTables, graph = SyncGraph;
+        if (!tables && !graph)
+            return;
+        if (!await BeginAsync("上傳中…", "上傳"))
             return;
         try
         {
             var baseStore = Base();
             var items = new List<CloudPushItem>();
             var skippedWaiting = 0;
-            foreach (var (guid, name) in _graph.GetPlayscriptNodes())
+            IReadOnlyList<(string Guid, string PlayscriptName)> nodes = tables ? _graph.GetPlayscriptNodes() : Array.Empty<(string, string)>();
+            var scanned = 0;
+            foreach (var (guid, name) in nodes)
             {
+                if (scanned++ % 50 == 0)
+                {
+                    SetPhase("比對本機", scanned - 1, nodes.Count);
+                    await Task.Yield();
+                }
                 if (WaitMergeStore.IsWaiting(DataFolder, guid)) { skippedWaiting++; continue; }
                 if (_conflicts.Contains(guid)) continue;
                 var local = ReadLocal(name, guid);
@@ -234,15 +306,56 @@ public sealed class CloudSyncState
             var rules = TryBuildRules(out var rulesWarning);
             if (rules != null && rules.Value.Hash == baseStore.LastRulesHash)
                 rules = null; // already in the cloud
-            if (items.Count == 0 && rules == null)
+            var sentHashes = baseStore.ReferenceHashes;
+            var references = BuildReferences().Where(r => !sentHashes.TryGetValue(r.Name, out var h) || h != r.Hash).ToList();
+            // The flow graph goes up only the first time (the cloud has none yet): after that the cloud copy is
+            // the master and the local one is a read-only download of it.
+            CloudGraphSeed? graphSeed = null;
+            string? graphNote = null;
+            if (graph && !baseStore.IsFlowGraphManaged)
             {
-                StatusMessage = "沒有要上傳的改動。" + (rulesWarning ?? "");
+                if (_graph.HasUnsavedChanges())
+                    graphNote = "流程圖分頁還有沒存檔的修改，流程圖這次沒有上傳（存檔後再按上傳）";
+                else if (_graph.BuildCloudUpload() is { } up)
+                    graphSeed = new CloudGraphSeed(up.GraphJson, up.Memos, up.Content, ReadNodeSchema());
+                else
+                    graphNote = "還沒有藍圖（blueprint.json），流程圖沒有上傳；請先在流程圖分頁存檔一次";
+            }
+            var contentSeed = graph && graphSeed == null && baseStore.IsFlowGraphManaged && !baseStore.NodeContentSeeded
+                ? _graph.BuildCloudNodeContent() : null;
+            if (items.Count == 0 && rules == null && references.Count == 0 && contentSeed == null && graphSeed == null)
+            {
+                StatusMessage = null;
+                Finish(graphNote == null, "上傳完成", "沒有要上傳的改動。" + (graphNote != null ? graphNote + "。" : "") + (rulesWarning ?? ""));
                 return;
             }
 
-            var results = await Client().PushAsync(items, rules);
+            var outcome = await Client().PushAsync(items, rules, references, contentSeed, graphSeed);
+            if (outcome.Graph is { } gr)
+            {
+                // Rejected = the cloud already has a flow graph (someone uploaded it): it is the master now too.
+                baseStore.SetFlowGraphManaged();
+                if (gr.Status == "ok")
+                {
+                    baseStore.NodeContentSeeded = true;
+                    graphNote = "流程圖已上傳，之後請在 AFFiNE 網頁版編輯，本機流程圖分頁改成唯讀";
+                }
+                else
+                {
+                    graphNote = "雲端已經有流程圖，改以雲端為主（本機流程圖分頁改成唯讀），按「下載」取得雲端的版本";
+                }
+                await _reload.RequestReloadAsync();
+            }
+            var results = outcome.Results;
             if (rules != null)
                 baseStore.LastRulesHash = rules.Value.Hash;
+            if (references.Count > 0)
+            {
+                foreach (var r in references) sentHashes[r.Name] = r.Hash;
+                baseStore.ReferenceHashes = sentHashes;
+            }
+            if (outcome.ContentSeeded == true)
+                baseStore.NodeContentSeeded = true;
             var names = items.ToDictionary(i => i.Guid, i => i.Name, StringComparer.Ordinal);
             int ok = 0, rejected = 0;
             _rejected.Clear();
@@ -260,14 +373,20 @@ public sealed class CloudSyncState
                 }
             }
 
-            StatusMessage = $"上傳完成：{ok} 份" +
-                            (rejected > 0 ? $"；{rejected} 份被擋下（雲端在上次下載後又改過，請先下載）" : "") +
-                            (skippedWaiting > 0 ? $"；{skippedWaiting} 份等待合併中，沒有上傳" : "") +
-                            (rulesWarning != null ? $"；{rulesWarning}" : "") + "。";
+            StatusMessage = null;
+            Finish(rejected == 0, rejected == 0 ? "上傳完成" : "上傳完成，但有劇本被擋下",
+                (graphNote != null ? graphNote + "；" : "") +
+                (tables ? $"劇本上傳 {ok} 份" : "沒有上傳劇本表格") +
+                (rejected > 0 ? $"；{rejected} 份被擋下（雲端在上次下載後又改過，請先下載）" : "") +
+                (skippedWaiting > 0 ? $"；{skippedWaiting} 份等待合併中，沒有上傳" : "") +
+                (references.Count > 0 ? $"；AI 參考資料更新 {references.Count} 份（{string.Join("、", references.Select(r => r.Name))}）" : "") +
+                (contentSeed != null && outcome.ContentSeeded == true ? "；節點的衝突／變化等內容已送上雲端" : "") +
+                (rulesWarning != null ? $"；{rulesWarning}" : "") + "。");
         }
         catch (Exception e)
         {
-            StatusMessage = $"上傳失敗：{e.Message}";
+            StatusMessage = null;
+            Finish(false, "上傳失敗", e.Message);
         }
         finally
         {
@@ -285,52 +404,42 @@ public sealed class CloudSyncState
             return null;
         Base().SetFlowGraphManaged();
         var graph = CanonicalGraphJson.Parse(pull.Graph.ToString(Newtonsoft.Json.Formatting.None));
-        var summary = _graph.ApplyCloudGraph(graph, pull.Memos);
+        var summary = _graph.ApplyCloudGraph(graph, pull.Memos, pull.ContentSeeded ? pull.Content : null);
+        if (pull.ContentSeeded)
+            Base().NodeContentSeeded = true;
         await _reload.RequestReloadAsync();
         var collisions = _graph.SyncRenamedFilesAfterCloudDownload();
         return collisions > 0 ? $"{summary}（{collisions} 個改名的劇本檔撞名，沒有搬，請到流程圖分頁處理）" : summary;
     }
 
-    // First upload of the local flow graph (seed), or — explicitly confirmed — replacing the cloud graph with
-    // the local one. Afterwards the local flow graph tab is read-only.
-    public async Task UploadFlowGraphAsync(bool overwrite)
+    // Files an AI that only has MCP needs (AGENTS.md tells it to read them), uploaded read-only for
+    // sf_read_guide / sf_read_reference. Missing files are skipped.
+    private static readonly (string Name, string File)[] ReferenceFiles =
     {
-        if (!await BeginAsync(overwrite ? "用本機流程圖覆蓋雲端…" : "上傳流程圖…"))
-            return;
-        try
+        ("AGENTS.md", "AGENTS.md"), ("StoryOutline", "StoryOutline.json"), ("CharacterCards", "CharacterCards.json"),
+        ("AudioNotes", "AudioNotes.json"), ("LdtkTransports", "LdtkTransports.json"), ("GuidePathPoints", "GuidePathPoints.json"),
+        ("PlayscriptNames", "PlayscriptNames.json"),
+    };
+
+    private List<CloudReference> BuildReferences()
+    {
+        var list = new List<CloudReference>();
+        foreach (var (name, file) in ReferenceFiles)
         {
-            if (_graph.HasUnsavedChanges())
-            {
-                StatusMessage = "流程圖分頁還有沒存檔的修改，請先存檔再上傳。";
-                return;
-            }
-            var upload = _graph.BuildCloudUpload()
-                         ?? throw new InvalidOperationException("還沒有藍圖（blueprint.json），請先在流程圖分頁存檔一次。");
-            string? nodeSchema = null;
-            var schemaPath = Path.Combine(ProjectPaths.ResolveUnityProjectRoot(), "Assets", "06.Definition",
-                "PlayscriptOfflineExport", "ProcessNodeSchema.json");
-            if (File.Exists(schemaPath))
-                nodeSchema = await File.ReadAllTextAsync(schemaPath);
-            var refused = await Client().PushGraphAsync(upload.GraphJson, upload.Memos, nodeSchema, overwrite ? "overwrite" : "seed");
-            if (refused != null)
-            {
-                StatusMessage = $"流程圖沒有上傳：{refused}";
-                return;
-            }
-            Base().SetFlowGraphManaged();
-            await _reload.RequestReloadAsync();
-            StatusMessage = overwrite
-                ? "已用本機流程圖覆蓋雲端。本機流程圖分頁現在是唯讀，之後請在網頁版編輯。"
-                : "流程圖已上傳。之後請在 AFFiNE 網頁版的「StoryForge 流程圖」編輯，本機流程圖分頁改成唯讀，按「下載」取得最新版。";
+            var path = Path.Combine(DataFolder, file);
+            if (!File.Exists(path)) continue;
+            var text = File.ReadAllText(path).TrimStart('\uFEFF');
+            var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+            list.Add(new CloudReference(name, text, hash));
         }
-        catch (Exception e)
-        {
-            StatusMessage = $"上傳流程圖失敗：{e.Message}";
-        }
-        finally
-        {
-            End();
-        }
+        return list;
+    }
+
+    private static string? ReadNodeSchema()
+    {
+        var path = Path.Combine(ProjectPaths.ResolveUnityProjectRoot(), "Assets", "06.Definition",
+            "PlayscriptOfflineExport", "ProcessNodeSchema.json");
+        return File.Exists(path) ? File.ReadAllText(path) : null;
     }
 
     private (string Json, string Hash)? TryBuildRules(out string? warning)
@@ -412,7 +521,7 @@ public sealed class CloudSyncState
     public async Task ContinueMergeAsync(string guid)
     {
         var state = Waiting.FirstOrDefault(w => w.Guid == guid);
-        if (state == null || !await BeginAsync("檢查合併結果…"))
+        if (state == null || !await BeginAsync("檢查合併結果…", "檢查合併結果"))
             return;
         try
         {
@@ -427,7 +536,7 @@ public sealed class CloudSyncState
                 return;
             }
 
-            var pull = await Client().SyncPullAsync(null, new[] { guid });
+            var pull = await Client().SyncPullAsync(null, null, tables: true, graph: false, only: new[] { guid });
             var cloud = pull.Playscripts.FirstOrDefault(p => p.Guid == guid);
             var cloudRows = CloudRows.Normalize(cloud?.Rows);
             if (cloud != null) _lastCloud[guid] = cloud;
@@ -528,7 +637,58 @@ public sealed class CloudSyncState
     private static string SafeName(string s) =>
         string.Concat(s.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
 
-    private async Task<bool> BeginAsync(string message)
+    // Phase -> share of the bar it covers, in the order the phases happen.
+    private static readonly Dictionary<string, (double From, double To)> PhaseRanges = new()
+    {
+        ["啟動"] = (0, 5), ["比對本機"] = (0, 10), ["連線"] = (10, 25), ["比對變動"] = (25, 28), ["檢查雲端"] = (25, 30),
+        ["讀取索引"] = (28, 32), ["讀取流程圖"] = (32, 40), ["上傳規則"] = (30, 35), ["上傳流程圖"] = (30, 85),
+        ["讀取劇本"] = (40, 85), ["上傳節點內容"] = (22, 28), ["上傳參考資料"] = (33, 38), ["上傳劇本"] = (38, 95), ["更新索引"] = (95, 99), ["套用流程圖"] = (85, 90),
+        ["寫入本機"] = (90, 100),
+    };
+
+    private DateTime _lastProgressNotify;
+
+    private void SetPhase(string phase, int? done = null, int? total = null)
+    {
+        var p = Progress;
+        if (p == null) return;
+        bool phaseChanged;
+        lock (p)
+        {
+            var (from, to) = PhaseRanges.TryGetValue(phase, out var r) ? r : (p.Percent, p.Percent);
+            var pct = total is > 0 && done is { } d ? from + (to - from) * Math.Clamp(d / (double)total.Value, 0, 1) : from;
+            phaseChanged = p.Phase != phase;
+            var shown = p.DisplayPercent;
+            p.Phase = phase;
+            p.Done = done;
+            p.Total = total;
+            // Never moves backwards, including from where the creep already got to.
+            p.Percent = Math.Max(Math.Max(p.Percent, pct), Math.Min(shown, total is > 0 ? to : from));
+            p.CreepTo = total is > 0 && done is { } dn && dn < total
+                ? from + (to - from) * (dn + 1) / (double)total.Value
+                : to;
+            p.CreepSince = DateTime.Now;
+        }
+        // Progress lines can come many times a second; the bar only needs ~10 redraws per second.
+        var now = DateTime.UtcNow;
+        if (!phaseChanged && done != total && (now - _lastProgressNotify).TotalMilliseconds < 100) return;
+        _lastProgressNotify = now;
+        Notify();
+    }
+
+    private void Finish(bool success, string title, string message)
+    {
+        var elapsed = Progress != null ? DateTime.Now - Progress.StartedAt : TimeSpan.Zero;
+        LastResult = new CloudRunResult(success, title, message, elapsed, DateTime.Now);
+    }
+
+    public void DismissResult()
+    {
+        LastResult = null;
+        Notify();
+    }
+
+    private async Task<bool> BeginAsync(string message, string title)
     {
         if (IsBusy) return false;
         if (!IsConfigured)
@@ -539,6 +699,8 @@ public sealed class CloudSyncState
         }
         IsBusy = true;
         StatusMessage = message;
+        LastResult = null;
+        Progress = new CloudProgressInfo { Title = title };
         Notify();
         await Task.Yield();
         return true;
@@ -547,6 +709,7 @@ public sealed class CloudSyncState
     private void End()
     {
         IsBusy = false;
+        Progress = null;
         RefreshLocal();
     }
 

@@ -4,6 +4,9 @@ import type { HostContext, ToolResult } from "./host.js";
 import { createStore } from "./store.js";
 import { COLUMNS, COLUMN_KEYS, normalizeRow, playscriptDocId, type ColumnKey, type Row } from "./schema.js";
 import { checkRows, type RowIssue } from "./rules.js";
+import { registerGraphTools } from "./mcp-graph.js";
+import { AiPresence, playscriptRoom } from "./presence.js";
+import { SessionPool } from "./session-pool.js";
 
 function ok(data: unknown): ToolResult {
   const structured = data !== null && typeof data === "object" && !Array.isArray(data) ? data : { value: data };
@@ -42,7 +45,11 @@ function rowObject(cells: Row) {
 
 export function registerTools(ctx: HostContext) {
   const { z } = ctx;
-  const store = createStore(ctx);
+  // The MCP server lives long: keep one connection per workspace instead of reconnecting on every call.
+  const pool = new SessionPool(ctx);
+  const store = createStore(ctx, undefined, pool);
+  const presence = new AiPresence(ctx, pool);
+  registerGraphTools(ctx, store, presence);
   const ws = z.string().optional().describe("AFFiNE workspace id；省略時用預設 workspace");
   const playscript = z.string().describe("劇本的 guid，或劇本名稱（playscriptId）。名稱重複時要用 guid");
   const rowInput = z.union([z.record(z.string()), z.array(z.string())]);
@@ -99,21 +106,33 @@ export function registerTools(ctx: HostContext) {
     return ok({ valid: issues.length === 0, issues });
   }), { readOnly: true });
 
-  async function write(workspaceId: string | undefined, name: string, fn: (doc: any, s: any, current: { rowId: string; cells: Row }[]) => Promise<{ check: Check; result: unknown } | ToolResult>) {
+  type WriteOut = { check: Check; result: unknown; focus?: { rowId: string; col: ColumnKey } };
+
+  async function write(workspaceId: string | undefined, name: string, fn: (doc: any, s: any, current: { rowId: string; cells: Row }[]) => Promise<WriteOut | ToolResult>) {
     return store.withSession(workspaceId, async s => {
       await store.requireWritable(s);
       const hit = await store.resolveGuid(s, name);
       const docId = playscriptDocId(s.workspaceId, hit.guid);
+      // The table's presence room: the AI shows up in the table like a person, and the result says who
+      // else is in it (cell edits merge per character, so nobody is blocked).
+      const roomP = presence.room(s.workspaceId, playscriptRoom(hit.guid)).catch(() => null);
       const doc = await s.load(docId);
       const before = ctx.Y.encodeStateVector(doc);
       const current = store.schema.readPlayscript(doc).rows;
       const out = await fn(doc, s, current);
       if ("content" in (out as any)) return out as ToolResult;
-      const o = out as { check: Check; result: unknown };
+      const o = out as WriteOut;
       const issues = await guarded(o.check, s);
       if (issues.length) return fail("有不合規的內容，什麼都沒有寫入。請照 allowed 修正後再試。", { issues });
+      const room = await roomP;
+      room?.set({ sf: o.focus ?? null });
       await s.push(docId, doc, before);
-      return ok({ guid: hit.guid, name: hit.name, ...(o.result as object) });
+      const rowNo = new Map(store.schema.readPlayscript(doc).rows.map((r, i) => [r.rowId, i + 1]));
+      const others = room?.others().map(p => ({
+        name: p.user.name,
+        row: p.state.sf?.rowId ? rowNo.get(p.state.sf.rowId) : undefined,
+      }));
+      return ok({ guid: hit.guid, name: hit.name, ...(o.result as object), othersEditing: others?.length ? others : undefined });
     });
   }
 
@@ -138,7 +157,10 @@ export function registerTools(ctx: HostContext) {
     doc.transact(() => {
       for (const e of edits) if (store.schema.updateCell(doc, e.rowId, LABEL_TO_KEY.get(e.column)!, e.value)) changed++;
     });
-    return { check: touched.map(t => ({ cells: t.cells, row: t.i + 1 })), result: { changedCells: changed } };
+    return {
+      check: touched.map(t => ({ cells: t.cells, row: t.i + 1 })), result: { changedCells: changed },
+      focus: { rowId: edits[0].rowId, col: LABEL_TO_KEY.get(edits[0].column)! },
+    };
   }), { readOnly: false });
 
   ctx.registerTool("sf_insert_rows", {
@@ -156,7 +178,7 @@ export function registerTools(ctx: HostContext) {
     }
     let ids: string[] = [];
     doc.transact(() => { ids = store.schema.insertRows(doc, index, newRows); });
-    return { check: seq(newRows, index + 1), result: { insertedRowIds: ids, at: index + 1 } };
+    return { check: seq(newRows, index + 1), result: { insertedRowIds: ids, at: index + 1 }, focus: ids[0] ? { rowId: ids[0], col: "text" as ColumnKey } : undefined };
   }), { readOnly: false });
 
   ctx.registerTool("sf_delete_rows", {

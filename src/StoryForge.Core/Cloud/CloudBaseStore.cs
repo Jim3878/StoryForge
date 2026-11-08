@@ -71,30 +71,49 @@ public sealed class CloudBaseStore
     public static bool FlowGraphManagedFor(Graph.AppSettings settings) =>
         !string.IsNullOrWhiteSpace(settings.CloudWorkspaceId) && new CloudBaseStore(settings.CloudWorkspaceId.Trim()).IsFlowGraphManaged;
 
-    // Server time (ms) of the last complete 下載; the next one only reads docs changed after it.
+    // Server time (ms) of the last 下載 of the tables / of the flow graph; the next one only reads docs changed
+    // after it. Two times because a download can leave either part out. (Older files have only serverTime,
+    // which then counts for both.)
     private string PullStatePath => Path.Combine(_folder, "pull-state.json");
+
+    private Newtonsoft.Json.Linq.JObject ReadPullState()
+    {
+        try
+        {
+            return File.Exists(PullStatePath) ? Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(PullStatePath)) : new();
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    private void WritePullState(string key, long? value)
+    {
+        Directory.CreateDirectory(_folder);
+        var o = ReadPullState();
+        if (o["graphServerTime"] == null && o["serverTime"] != null)
+            o["graphServerTime"] = o["serverTime"]; // keep the old shared time for the part not written now
+        if (value == null) o.Remove(key);
+        else o[key] = value;
+        o["at"] = DateTime.Now;
+        File.WriteAllText(PullStatePath, o.ToString(Formatting.Indented));
+    }
 
     public long? LastPullServerTime
     {
+        get => ReadPullState().Value<long?>("serverTime");
+        set => WritePullState("serverTime", value);
+    }
+
+    public long? LastGraphPullServerTime
+    {
         get
         {
-            try
-            {
-                return File.Exists(PullStatePath)
-                    ? Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(PullStatePath)).Value<long?>("serverTime")
-                    : null;
-            }
-            catch
-            {
-                return null;
-            }
+            var o = ReadPullState();
+            return o["graphServerTime"] != null ? o.Value<long?>("graphServerTime") : o.Value<long?>("serverTime");
         }
-        set
-        {
-            Directory.CreateDirectory(_folder);
-            if (value == null) { if (File.Exists(PullStatePath)) File.Delete(PullStatePath); return; }
-            File.WriteAllText(PullStatePath, JsonConvert.SerializeObject(new { serverTime = value, at = DateTime.Now }));
-        }
+        set => WritePullState("graphServerTime", value);
     }
 
     // Hash of the rules JSON last uploaded from here; unchanged rules are not sent again.
@@ -107,6 +126,46 @@ public sealed class CloudBaseStore
         {
             Directory.CreateDirectory(_folder);
             File.WriteAllText(RulesHashPath, value ?? string.Empty);
+        }
+    }
+
+    // Hash of each reference file (AGENTS.md, StoryOutline, ...) last uploaded from here; unchanged ones are
+    // not sent again.
+    private string ReferenceHashesPath => Path.Combine(_folder, "references-hash.json");
+
+    public Dictionary<string, string> ReferenceHashes
+    {
+        get
+        {
+            try
+            {
+                return File.Exists(ReferenceHashesPath)
+                    ? JsonConvert.DeserializeObject<Dictionary<string, string>>(File.ReadAllText(ReferenceHashesPath)) ?? new()
+                    : new();
+            }
+            catch
+            {
+                return new();
+            }
+        }
+        set
+        {
+            Directory.CreateDirectory(_folder);
+            File.WriteAllText(ReferenceHashesPath, JsonConvert.SerializeObject(value, Formatting.Indented));
+        }
+    }
+
+    // Set once the cloud flow graph is known to hold the nodes' 衝突/變化/角色/地點 (seeded by an upload).
+    private string ContentSeededMarker => Path.Combine(_folder, "flowgraph-content-seeded.json");
+
+    public bool NodeContentSeeded
+    {
+        get => File.Exists(ContentSeededMarker);
+        set
+        {
+            Directory.CreateDirectory(_folder);
+            if (value) File.WriteAllText(ContentSeededMarker, JsonConvert.SerializeObject(new { since = DateTime.Now }));
+            else if (File.Exists(ContentSeededMarker)) File.Delete(ContentSeededMarker);
         }
     }
 

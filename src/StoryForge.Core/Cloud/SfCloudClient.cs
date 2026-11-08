@@ -27,7 +27,34 @@ public sealed class CloudGraphPull
     public bool Enabled { get; set; }
     public Newtonsoft.Json.Linq.JObject? Graph { get; set; }
     public Dictionary<string, string> Memos { get; set; } = new();
+    // node id -> { conflict, change, characters, location }; only meaningful once ContentSeeded.
+    public Dictionary<string, Dictionary<string, string>> Content { get; set; } = new();
+    // False for a graph uploaded before node content was synced: its empty Content means "never sent", not
+    // "cleared", so a download must leave local 衝突/變化/... alone.
+    public bool ContentSeeded { get; set; }
     public string Sv { get; set; } = string.Empty;
+}
+
+public sealed class CloudGraphPushResult
+{
+    public string Status { get; set; } = string.Empty;
+    public string? Message { get; set; }
+}
+
+/// <summary>The local flow graph sent with an upload, used only if the cloud has none yet.</summary>
+public sealed record CloudGraphSeed(string GraphJson, IReadOnlyDictionary<string, string> Memos,
+    IReadOnlyDictionary<string, Dictionary<string, string>> Content, string? NodeSchemaJson);
+
+/// <summary>A reference file uploaded for MCP-only AIs (AGENTS.md, the world book, ...).</summary>
+public sealed record CloudReference(string Name, string Text, string Hash);
+
+public sealed class CloudPushOutcome
+{
+    public List<CloudPushResult> Results { get; set; } = new();
+    // Set when a flow graph seed was sent: status "ok" or "rejected" (the cloud already has one) + message.
+    public CloudGraphPushResult? Graph { get; set; }
+    // Set when contentSeed was sent: true once the cloud graph has node content (now or already before).
+    public bool? ContentSeeded { get; set; }
 }
 
 public sealed class CloudSyncPull
@@ -44,6 +71,9 @@ public sealed class CloudSyncPull
     // Only the tables that changed since `since` (all of them without it).
     public List<CloudPlayscript> Playscripts { get; set; } = new();
 }
+
+/// <summary>One progress report from the extension: a phase and, when countable, how far along it is.</summary>
+public sealed record CloudProgress(string Phase, int? Done, int? Total);
 
 public sealed class CloudPushItem
 {
@@ -73,22 +103,33 @@ public sealed class SfCloudClient
     private readonly string _command;
     private readonly string _workspaceId;
 
+    /// <summary>Called (on a thread-pool thread) for each `@sf-progress` line the extension prints.</summary>
+    public Action<CloudProgress>? Progress { get; set; }
+
     public SfCloudClient(string command, string workspaceId)
     {
         _command = string.IsNullOrWhiteSpace(command) ? "affine-mcp.cmd" : command.Trim();
         _workspaceId = workspaceId.Trim();
     }
 
-    /// <summary>One connection: index, and the flow graph / tables that changed after <paramref name="since"/>.</summary>
-    public async Task<CloudSyncPull> SyncPullAsync(long? since, IReadOnlyCollection<string>? only = null,
-        CancellationToken ct = default)
+    /// <summary>
+    /// One connection: index, and the tables changed after <paramref name="since"/> / the flow graph changed after
+    /// <paramref name="graphSince"/> (null = read it all), each only when asked for.
+    /// </summary>
+    public async Task<CloudSyncPull> SyncPullAsync(long? since, long? graphSince, bool tables = true, bool graph = true,
+        IReadOnlyCollection<string>? only = null, CancellationToken ct = default)
     {
         var outPath = TempFile("sync-pull");
         try
         {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
             var args = new List<string> { "sf", "sync-pull", "--workspace", _workspaceId, "--out", outPath };
             if (since is { } s)
-                args.AddRange(new[] { "--since", s.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+                args.AddRange(new[] { "--since", s.ToString(inv) });
+            args.Add("--graph-since");
+            args.Add(graphSince is { } g ? g.ToString(inv) : "");
+            if (!tables) args.Add("--no-tables");
+            if (!graph) args.Add("--no-graph");
             if (only is { Count: > 0 })
                 args.AddRange(new[] { "--only", string.Join(",", only) });
             await RunAsync(args, ct);
@@ -124,7 +165,10 @@ public sealed class SfCloudClient
         }
     }
 
-    public async Task<List<CloudPushResult>> PushAsync(IReadOnlyList<CloudPushItem> items, (string Json, string Hash)? rules,
+    public async Task<CloudPushOutcome> PushAsync(IReadOnlyList<CloudPushItem> items, (string Json, string Hash)? rules,
+        IReadOnlyList<CloudReference>? references = null,
+        IReadOnlyDictionary<string, Dictionary<string, string>>? contentSeed = null,
+        CloudGraphSeed? graphSeed = null,
         CancellationToken ct = default)
     {
         var inPath = TempFile("push-in");
@@ -140,12 +184,19 @@ public sealed class SfCloudClient
                     baseRows = i.BaseRows == null ? null : CloudRows.Normalize(i.BaseRows),
                 }),
                 rules = rules == null ? null : new { json = rules.Value.Json, hash = rules.Value.Hash },
+                references = references is { Count: > 0 } ? references.Select(r => new { name = r.Name, text = r.Text, hash = r.Hash }) : null,
+                contentSeed,
+                graph = graphSeed == null ? null : new Newtonsoft.Json.Linq.JObject
+                {
+                    ["graph"] = Newtonsoft.Json.Linq.JObject.Parse(graphSeed.GraphJson),
+                    ["memos"] = Newtonsoft.Json.Linq.JObject.FromObject(graphSeed.Memos),
+                    ["content"] = Newtonsoft.Json.Linq.JObject.FromObject(graphSeed.Content),
+                    ["nodeSchema"] = graphSeed.NodeSchemaJson,
+                },
             };
             await File.WriteAllTextAsync(inPath, JsonConvert.SerializeObject(body), new UTF8Encoding(false), ct);
             await RunAsync(new[] { "sf", "push", "--workspace", _workspaceId, "--in", inPath, "--out", outPath }, ct);
-            var parsed = JsonConvert.DeserializeAnonymousType(await File.ReadAllTextAsync(outPath, ct),
-                new { results = new List<CloudPushResult>() });
-            return parsed?.results ?? new List<CloudPushResult>();
+            return JsonConvert.DeserializeObject<CloudPushOutcome>(await File.ReadAllTextAsync(outPath, ct)) ?? new CloudPushOutcome();
         }
         finally
         {
@@ -165,36 +216,6 @@ public sealed class SfCloudClient
         }
         finally
         {
-            TryDelete(outPath);
-        }
-    }
-
-    /// <param name="graphJson">canonical graph JSON (the blueprint's `graph`)</param>
-    /// <param name="mode">"seed" (only into an empty cloud graph) or "overwrite"</param>
-    /// <returns>null on success, otherwise the reason it was refused</returns>
-    public async Task<string?> PushGraphAsync(string graphJson, IReadOnlyDictionary<string, string> memos, string? nodeSchemaJson,
-        string mode, CancellationToken ct = default)
-    {
-        var inPath = TempFile("graph-in");
-        var outPath = TempFile("graph-out");
-        try
-        {
-            var body = new Newtonsoft.Json.Linq.JObject
-            {
-                ["graph"] = Newtonsoft.Json.Linq.JObject.Parse(graphJson),
-                ["memos"] = Newtonsoft.Json.Linq.JObject.FromObject(memos),
-                ["mode"] = mode,
-            };
-            if (nodeSchemaJson != null)
-                body["nodeSchema"] = nodeSchemaJson;
-            await File.WriteAllTextAsync(inPath, body.ToString(Formatting.None), new UTF8Encoding(false), ct);
-            await RunAsync(new[] { "sf", "graph-push", "--workspace", _workspaceId, "--in", inPath, "--out", outPath }, ct);
-            var result = Newtonsoft.Json.Linq.JObject.Parse(await File.ReadAllTextAsync(outPath, ct));
-            return result.Value<string>("status") == "ok" ? null : result.Value<string>("message") ?? "雲端拒絕了上傳";
-        }
-        finally
-        {
-            TryDelete(inPath);
             TryDelete(outPath);
         }
     }
@@ -223,7 +244,16 @@ public sealed class SfCloudClient
         var stderr = new StringBuilder();
         // Drain both pipes — an undrained pipe deadlocks the child once its buffer fills (see the Launcher).
         process.OutputDataReceived += (_, _) => { };
-        process.ErrorDataReceived += (_, e) => { if (e.Data != null) lock (stderr) stderr.AppendLine(e.Data); };
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data == null) return;
+            if (e.Data.StartsWith(ProgressPrefix, StringComparison.Ordinal))
+            {
+                ReportProgress(e.Data[ProgressPrefix.Length..]);
+                return;
+            }
+            lock (stderr) stderr.AppendLine(e.Data);
+        };
         try
         {
             process.Start();
@@ -253,6 +283,22 @@ public sealed class SfCloudClient
             lock (stderr) text = stderr.ToString();
             var lastLine = text.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.Length > 0) ?? $"exit code {process.ExitCode}";
             throw new InvalidOperationException(lastLine.TrimStart('✗', ' '));
+        }
+    }
+
+    private const string ProgressPrefix = "@sf-progress ";
+
+    private void ReportProgress(string json)
+    {
+        if (Progress == null) return;
+        try
+        {
+            var o = Newtonsoft.Json.Linq.JObject.Parse(json);
+            Progress(new CloudProgress(o.Value<string>("phase") ?? string.Empty, o.Value<int?>("done"), o.Value<int?>("total")));
+        }
+        catch
+        {
+            // A malformed progress line only costs the progress bar an update.
         }
     }
 

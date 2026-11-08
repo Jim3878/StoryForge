@@ -7,12 +7,39 @@
    docs: the StoryForge cloud design canvas, zone ④). Conflicts are per whole playscript. *@
 <div class="cs-page">
     <div class="cs-toolbar">
-        <button @onclick="State.DownloadAsync" disabled="@(State.IsBusy || !State.IsConfigured)">⬇ 下載</button>
-        <button @onclick="State.UploadAsync" disabled="@(State.IsBusy || !State.IsConfigured || HasConflicts)"
-                title="@(HasConflicts ? "還有衝突沒處理，處理完才能上傳" : "")">⬆ 上傳</button>
+        <button @onclick="State.DownloadAsync" disabled="@(State.IsBusy || !State.IsConfigured || NothingPicked)">⬇ 下載</button>
+        <button @onclick="State.UploadAsync" disabled="@(State.IsBusy || !State.IsConfigured || NothingPicked || (State.SyncTables && HasConflicts))"
+                title="@(State.SyncTables && HasConflicts ? "還有衝突沒處理，處理完才能上傳" : "")">⬆ 上傳</button>
+        <label class="cs-check"><input type="checkbox" @bind="State.SyncTables" disabled="@State.IsBusy" /> 劇本表格</label>
+        <label class="cs-check"><input type="checkbox" @bind="State.SyncGraph" disabled="@State.IsBusy" /> 流程圖</label>
         <button @onclick="State.RefreshLocal" disabled="@State.IsBusy">重新整理</button>
-        <span class="cs-status">@State.StatusMessage</span>
+        @if (State.Progress is { } prog)
+        {
+            <div class="cs-progress">
+                <div class="cs-progress-text">
+                    <b>@prog.Title</b>　@prog.Phase@(prog.Total is > 0 ? $" {prog.Done}/{prog.Total}" : "")…
+                    <span class="cs-progress-time">@Seconds(DateTime.Now - prog.StartedAt)</span>
+                </div>
+                <div class="cs-progress-track"><div class="cs-progress-fill" style="width:@(prog.DisplayPercent.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture))%"></div></div>
+            </div>
+        }
+        else
+        {
+            <span class="cs-status">@State.StatusMessage</span>
+        }
     </div>
+
+    @if (!State.IsBusy && State.LastResult is { } result)
+    {
+        <div class="cs-result @(result.Success ? "cs-result-ok" : "cs-result-fail")" @key="result.At">
+            <span class="cs-result-icon">@(result.Success ? "✓" : "✗")</span>
+            <div class="cs-result-body">
+                <div><b>@result.Title</b> <span class="cs-result-meta">（@Seconds(result.Elapsed)，@result.At.ToString("HH:mm:ss")）</span></div>
+                <div class="cs-result-msg">@result.Message</div>
+            </div>
+            <button class="cs-result-close" @onclick="State.DismissResult" title="關閉">×</button>
+        </div>
+    }
 
     <div class="cs-body">
         <div class="cs-side">
@@ -37,25 +64,10 @@
                 @if (State.IsFlowGraphManaged)
                 {
                     <div>由雲端管理。請在 AFFiNE 網頁版編輯，按「下載」取得最新版；本機流程圖分頁是唯讀。</div>
-                    <div class="cs-actions" style="margin-top:8px">
-                        @if (_confirmOverwrite)
-                        {
-                            <span class="cs-warn">會用本機的流程圖蓋掉雲端（網頁上別人的修改會不見）。確定？</span>
-                            <button @onclick="OverwriteGraph" disabled="@State.IsBusy">確定覆蓋</button>
-                            <button @onclick="() => _confirmOverwrite = false">取消</button>
-                        }
-                        else
-                        {
-                            <button @onclick="() => _confirmOverwrite = true" disabled="@State.IsBusy">用本機流程圖覆蓋雲端…</button>
-                        }
-                    </div>
                 }
                 else
                 {
-                    <div>還沒上傳。上傳後雲端就是主版本：大家在網頁版編輯，本機流程圖分頁改成唯讀。</div>
-                    <div class="cs-actions" style="margin-top:8px">
-                        <button @onclick="() => State.UploadFlowGraphAsync(false)" disabled="@(State.IsBusy || !State.IsConfigured)">⬆ 上傳流程圖</button>
-                    </div>
+                    <div>還沒上傳。勾著「流程圖」按「上傳」就會一起傳上去；之後雲端是主版本，大家在網頁版編輯，本機流程圖分頁改成唯讀。</div>
                 }
             </div>
 
@@ -159,7 +171,25 @@
 <style>
     .cs-page { height: 100%; width: 100%; display: flex; flex-direction: column; font-family: sans-serif; color: #ddd; position: relative; }
     .cs-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1e1e1e; }
+    .cs-check { display: flex; align-items: center; gap: 4px; font-size: 13px; opacity: 0.9; cursor: pointer; user-select: none; }
     .cs-status { margin-left: 8px; opacity: 0.85; font-size: 13px; }
+    .cs-progress { flex: 1 1 auto; max-width: 560px; margin-left: 8px; font-size: 13px; }
+    .cs-progress-text { display: flex; gap: 4px; align-items: baseline; margin-bottom: 4px; white-space: nowrap; overflow: hidden; }
+    .cs-progress-time { margin-left: auto; opacity: 0.6; font-variant-numeric: tabular-nums; }
+    .cs-progress-track { height: 6px; background: #333; border-radius: 3px; overflow: hidden; }
+    .cs-progress-fill { height: 100%; background: linear-gradient(90deg, #3d7bd9, #5aa0ff); border-radius: 3px; transition: width 0.15s linear; }
+    .cs-result { flex: 0 0 auto; display: flex; gap: 10px; align-items: flex-start; padding: 8px 12px; font-size: 13px; animation: cs-flash 1.2s ease-out; }
+    .cs-result-ok { background: #1f3a27; border-bottom: 1px solid #2f6b3f; color: #c9f0d2; }
+    .cs-result-fail { background: #3e2222; border-bottom: 1px solid #7a3434; color: #ffcfc9; }
+    .cs-result-icon { font-size: 18px; font-weight: 700; line-height: 1.2; }
+    .cs-result-ok .cs-result-icon { color: #6fdc8c; }
+    .cs-result-fail .cs-result-icon { color: #ff8a80; }
+    .cs-result-body { flex: 1 1 auto; line-height: 1.5; }
+    .cs-result-meta { opacity: 0.65; font-size: 12px; }
+    .cs-result-msg { word-break: break-all; }
+    .cs-result-close { background: none; border: none; color: inherit; font-size: 18px; cursor: pointer; opacity: 0.6; line-height: 1; }
+    .cs-result-close:hover { opacity: 1; }
+    @@keyframes cs-flash { from { filter: brightness(1.8); } to { filter: brightness(1); } }
     .cs-body { flex: 1 1 auto; display: flex; min-height: 0; background: #262626; }
     .cs-side { flex: 0 0 340px; overflow-y: auto; border-right: 1px solid #333; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
     .cs-card { background: #2c2c2c; border: 1px solid #3a3a3a; border-radius: 6px; padding: 10px 12px; font-size: 13px; }
@@ -197,13 +227,7 @@
 </style>
 
 @code {
-    private bool _confirmOverwrite;
-
-    private async Task OverwriteGraph()
-    {
-        _confirmOverwrite = false;
-        await State.UploadFlowGraphAsync(true);
-    }
+    private bool NothingPicked => !State.SyncTables && !State.SyncGraph;
 
     private bool HasConflicts => State.Items.Any(i => i.Status == CloudItemStatus.Conflict);
 
@@ -230,7 +254,20 @@
     [Parameter] public bool IsActive { get; set; }
     private bool _wasActive;
 
-    protected override void OnInitialized() => State.Changed += OnChanged;
+    private static string Seconds(TimeSpan t) => $"{t.TotalSeconds:0.0} 秒";
+
+    // Ticks the elapsed-seconds counter while a run is in progress (progress lines alone can pause for a
+    // second or two while the extension connects).
+    private System.Threading.Timer? _ticker;
+
+    protected override void OnInitialized()
+    {
+        State.Changed += OnChanged;
+        _ticker = new System.Threading.Timer(_ =>
+        {
+            if (State.IsBusy) InvokeAsync(StateHasChanged);
+        }, null, 200, 200);
+    }
 
     protected override void OnParametersSet()
     {
@@ -241,5 +278,9 @@
 
     private void OnChanged() => InvokeAsync(StateHasChanged);
 
-    public void Dispose() => State.Changed -= OnChanged;
+    public void Dispose()
+    {
+        State.Changed -= OnChanged;
+        _ticker?.Dispose();
+    }
 }

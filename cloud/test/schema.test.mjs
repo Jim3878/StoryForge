@@ -146,3 +146,25 @@ test("a link to a node someone else deleted is dropped", () => {
   assert.equal(g.nodes.length, 1);
   assert.equal(g.edges.length, 0);
 });
+
+test("awareness updates round-trip in the y-protocols wire format", async () => {
+  const { encodeAwareness, decodeAwareness } = await import("../dist/presence.js");
+  const entries = [
+    { clientId: 4123456789, clock: 300, state: { user: { name: "jim3878 的 AI", color: "#5c940d", ai: true }, flowLocked: { a: 1 } } },
+    { clientId: 7, clock: 2, state: null },
+  ];
+  assert.deepEqual(decodeAwareness(encodeAwareness(entries)), entries);
+});
+
+test("node content fields merge per field", async () => {
+  const { createFlowGraph } = await import("../dist/flowgraph.js");
+  const F = createFlowGraph(Y);
+  const a = new Y.Doc(), b = new Y.Doc();
+  F.writeContent(a, { n1: { conflict: "跟澪音", change: "和好" } });
+  sync(a, b);
+  F.writeContent(a, { n1: { conflict: "跟澪音吵架", change: "和好" } });
+  F.writeContent(b, { n1: { conflict: "跟澪音", change: "和好了", location: "公寓" } });
+  sync(a, b);
+  assert.deepEqual(F.readContent(a), { n1: { conflict: "跟澪音吵架", change: "和好了", location: "公寓" } });
+  assert.deepEqual(F.readContent(b), F.readContent(a));
+});

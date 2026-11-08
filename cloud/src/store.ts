@@ -8,7 +8,12 @@ import {
 } from "./schema.js";
 import { parseRules, type Rules } from "./rules.js";
 import { EXTENSION_VERSION } from "./version.js";
-import { createFlowGraph, flowgraphDocId, type CanonicalGraph } from "./flowgraph.js";
+import type { SessionPool } from "./session-pool.js";
+import { createFlowGraph, flowgraphDocId, type CanonicalGraph, type NodeContent } from "./flowgraph.js";
+
+/** Reference files local StoryForge uploads for AIs that only have MCP (AGENTS.md, the world book, ...). */
+export function referencesDocId(ws: string) { return `db$${ws}$sf.references`; }
+export type ReferenceUpload = { name: string; text: string; hash: string };
 
 function cmpVersion(a: string, b: string) {
   const pa = a.split(/[.-]/).map(x => parseInt(x, 10) || 0);
@@ -36,12 +41,17 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 
 const CONCURRENCY = 24;
 
-export function createStore(ctx: HostContext) {
+/** Progress for a long CLI call: a phase name and, when it is countable, how far along it is. */
+export type Progress = (phase: string, done?: number, total?: number) => void;
+
+export function createStore(ctx: HostContext, progress: Progress = () => {}, pool?: SessionPool) {
   const { Y } = ctx;
   const schema = createSchema(Y);
   const flow = createFlowGraph(Y);
 
   async function withSession<T>(workspaceId: string | undefined, fn: (s: DocSession) => Promise<T>): Promise<T> {
+    if (pool) return pool.run(workspaceId, fn);
+    progress("連線");
     const s = await ctx.openSession(workspaceId);
     try { return await fn(s); } finally { s.close(); }
   }
@@ -101,13 +111,61 @@ export function createStore(ctx: HostContext) {
 
   type PushItem = PlayscriptIndexEntry & { rows: Row[]; baseRows: Row[] | null };
 
-  async function pushAll(s: DocSession, items: PushItem[], rulesUpload?: { json: string; hash: string }) {
-    await requireWritable(s);
+  async function pushAll(s: DocSession, items: PushItem[], rulesUpload?: { json: string; hash: string }, references?: ReferenceUpload[]) {
+    return (await pushAllEx(s, items, rulesUpload, references)).results;
+  }
+
+  /**
+   * pushAll plus, when `contentSeed` is given, the one-time seeding of the flow graph's node content
+   * (衝突 / 變化 / 角色 / 地點): graphs uploaded before those fields existed have none in the cloud, and a
+   * download must not read that as "cleared". Written only while the doc is not marked seeded yet.
+   */
+  async function pushAllEx(s: DocSession, items: PushItem[], rulesUpload?: { json: string; hash: string }, references?: ReferenceUpload[],
+    contentSeed?: Record<string, NodeContent>, graphSeed?: GraphPush) {
+    let contentSeeded: boolean | undefined;
+    // First upload of the flow graph, in the same call (seed only: never over an existing cloud graph).
+    let graph: Awaited<ReturnType<typeof pushGraph>> | undefined;
+    if (graphSeed) {
+      graph = await pushGraph(s, { ...graphSeed, mode: "seed" });
+      if (graph.status === "ok") { contentSeeded = true; contentSeed = undefined; }
+    }
+    if (contentSeed) {
+      const docId = flowgraphDocId(s.workspaceId);
+      const doc = await s.load(docId);
+      if (!flow.isEmpty(doc)) {
+        if (doc.getMap("meta").get("contentSeeded") !== true) {
+          progress("上傳節點內容");
+          const before = Y.encodeStateVector(doc);
+          doc.transact(() => {
+            flow.writeContent(doc, contentSeed);
+            doc.getMap("meta").set("contentSeeded", true);
+          });
+          await s.push(docId, doc, before);
+        }
+        contentSeeded = true;
+      }
+    }
+    return { results: await pushTables(s, items, rulesUpload, references), contentSeeded, graph };
+  }
+
+  async function pushTables(s: DocSession, items: PushItem[], rulesUpload?: { json: string; hash: string }, references?: ReferenceUpload[]) {
+    progress("檢查雲端");
+    const p = await requireWritable(s);
     if (rulesUpload) {
+      progress("上傳規則");
       await mutate(s, rulesDocId(s.workspaceId), doc => { schema.writeRules(doc, rulesUpload.json, rulesUpload.hash); });
     }
+    if (references?.length) {
+      progress("上傳參考資料");
+      await writeReferences(s, references);
+    }
     type Result = { guid: string; status: "ok" | "unchanged" | "rejected"; message?: string; rows?: Row[]; sv?: string };
+    let pushed = 0;
+    progress("上傳劇本", 0, items.length);
     const results: Result[] = await mapLimit(items, CONCURRENCY, async (item): Promise<Result> => {
+      try { return await pushOne(item); } finally { progress("上傳劇本", ++pushed, items.length); }
+    });
+    async function pushOne(item: PushItem): Promise<Result> {
       const docId = playscriptDocId(s.workspaceId, item.guid);
       const doc = await s.load(docId);
       const current = schema.readPlayscript(doc).rows.map(r => r.cells);
@@ -124,9 +182,18 @@ export function createStore(ctx: HostContext) {
       });
       await s.push(docId, doc, before);
       return { guid: item.guid, status: "ok", rows: schema.readPlayscript(doc).rows.map(r => r.cells), sv: sv() };
+    }
+    // Only touch the index when an entry is new or its name / chapter / orphan flag changed: rewriting the
+    // index doc costs a load + push (~1 s) on every upload otherwise.
+    const indexed = new Map(p.playscripts.map(e => [e.guid, e]));
+    const accepted = items.filter((item, i) => {
+      if (results[i].status === "rejected") return false;
+      const e = indexed.get(item.guid);
+      return !e || e.name !== item.name || e.chapter !== item.chapter
+        || (item.orphan !== undefined && (e.orphan === true) !== item.orphan);
     });
-    const accepted = items.filter((_, i) => results[i].status !== "rejected");
-    if (accepted.length) {
+    if (accepted.length || !p.exists) {
+      progress("更新索引");
       await mutate(s, projectDocId(s.workspaceId), doc => {
         doc.transact(() => {
           schema.ensureProject(doc);
@@ -139,37 +206,85 @@ export function createStore(ctx: HostContext) {
 
   // ----- one-connection incremental download (sf sync-pull) -----
 
+  type SyncPullOptions = {
+    /** Server ms of the previous table download (null = read every table). */
+    since: number | null;
+    /** Same for the flow graph; it has its own, since a download can leave either part out. */
+    graphSince?: number | null;
+    tables?: boolean;
+    graph?: boolean;
+    only?: string[];
+  };
+
   /**
    * Everything local StoryForge's 下載 needs, over one connection: the playscript index (always), the flow
-   * graph and the tables — but with `since` (server ms from the previous call) only the docs changed after
-   * it are read. `serverTime` is what to pass as `since` next time. Hosts without timestamps get everything.
+   * graph and the tables — each part only when asked for, and with its `since` (server ms from the previous
+   * call) only if changed after it. `serverTime` is what to pass as `since` next time for the parts that
+   * were read. Hosts without timestamps get everything.
    */
-  async function syncPull(s: DocSession, since: number | null, only?: string[]) {
+  async function syncPull(s: DocSession, options: SyncPullOptions) {
     const ws = s.workspaceId;
-    let changed: Record<string, number> | null = null;
-    if (since !== null && s.timestamps) changed = await s.timestamps(since);
-    const all = changed === null && s.timestamps ? await s.timestamps(0).catch(() => null) : null;
-    const serverTime = Math.max(since ?? 0, ...Object.values(changed ?? all ?? {}));
-    const isChanged = (docId: string) => changed === null || docId in changed;
+    const { since, only } = options;
+    const graphSince = options.graphSince === undefined ? since : options.graphSince;
+    const wantTables = options.tables !== false;
+    const wantGraph = options.graph !== false && !only?.length;
+    progress("比對變動");
+    // One timestamps query covers both parts: from the earlier of their two times.
+    const lows = [wantTables ? since : 0, wantGraph ? graphSince : 0].filter((x): x is number => x !== null && x !== undefined);
+    const needAll = (wantTables && since === null) || (wantGraph && graphSince === null) || !s.timestamps;
+    const changed = s.timestamps ? await s.timestamps(needAll ? 0 : Math.min(...lows)).catch(() => null) : null;
+    const serverTime = Math.max(since ?? 0, graphSince ?? 0, ...Object.values(changed ?? {}));
+    const changedAfter = (docId: string, t: number | null | undefined) =>
+      changed === null || t === null || t === undefined || (docId in changed && changed[docId] > t);
 
+    progress("讀取索引");
     const p = await project(s);
     let graph: Awaited<ReturnType<typeof pullGraph>> | null = null;
-    if (!only?.length && (isChanged(flowgraphDocId(ws)) || isChanged(rulesDocId(ws)))) graph = await pullGraph(s);
+    if (wantGraph && (changedAfter(flowgraphDocId(ws), graphSince) || changedAfter(rulesDocId(ws), graphSince)
+      || changedAfter(projectDocId(ws), graphSince))) {
+      progress("讀取流程圖");
+      graph = await pullGraph(s);
+    }
     const onlySet = only?.length ? new Set(only) : null;
-    const targets = p.playscripts.filter(e => (onlySet ? onlySet.has(e.guid) : isChanged(playscriptDocId(ws, e.guid))));
+    const targets = !wantTables && !onlySet ? []
+      : p.playscripts.filter(e => (onlySet ? onlySet.has(e.guid) : changedAfter(playscriptDocId(ws, e.guid), since)));
+    let read = 0;
+    progress("讀取劇本", 0, targets.length);
     const playscripts = await mapLimit(targets, CONCURRENCY, async e => {
       const ps = await readPlayscript(s, e.guid);
+      progress("讀取劇本", ++read, targets.length);
       return { ...e, rows: ps.rows.map(r => r.cells), sv: ps.sv };
     });
     return {
       schemaVersion: p.schemaVersion,
       exists: p.exists,
-      incremental: changed !== null,
+      incremental: changed !== null && since !== null,
       serverTime,
       index: p.playscripts,
       graph,
       playscripts,
     };
+  }
+
+  // ----- reference files -----
+
+  type RefEntry = { text: string; hash: string; updatedAt: number };
+
+  async function writeReferences(s: DocSession, refs: ReferenceUpload[]) {
+    await mutate(s, referencesDocId(s.workspaceId), doc => doc.transact(() => {
+      const files = doc.getMap<RefEntry>("files");
+      for (const r of refs) {
+        if (files.get(r.name)?.hash === r.hash) continue;
+        files.set(r.name, { text: r.text, hash: r.hash, updatedAt: Date.now() });
+      }
+    }));
+  }
+
+  async function readReferences(s: DocSession) {
+    const doc = await s.load(referencesDocId(s.workspaceId));
+    const out: Record<string, RefEntry> = {};
+    doc.getMap<RefEntry>("files").forEach((v, k) => { if (typeof v?.text === "string") out[k] = v; });
+    return out;
   }
 
   // ----- flow graph (cloud is the master once seeded) -----
@@ -182,6 +297,8 @@ export function createStore(ctx: HostContext) {
       enabled: p.flowGraphEnabled,
       graph: flow.isEmpty(doc) ? null : flow.readGraph(doc),
       memos: flow.readMemos(doc),
+      content: flow.readContent(doc),
+      contentSeeded: doc.getMap("meta").get("contentSeeded") === true,
       sv: Buffer.from(Y.encodeStateVector(doc)).toString("base64"),
     };
   }
@@ -189,23 +306,30 @@ export function createStore(ctx: HostContext) {
   type GraphPush = {
     graph: CanonicalGraph;
     memos?: Record<string, string>;
+    content?: Record<string, NodeContent>;
     nodeSchema?: string;
     // seed: only into an empty cloud graph. overwrite: replace the cloud graph with this one (two-way).
     mode: "seed" | "overwrite";
   };
 
   async function pushGraph(s: DocSession, body: GraphPush) {
+    progress("檢查雲端");
     await requireWritable(s);
+    progress("上傳流程圖");
     const docId = flowgraphDocId(s.workspaceId);
     const doc = await s.load(docId);
     if (body.mode === "seed" && !flow.isEmpty(doc)) {
-      return { status: "rejected" as const, message: "雲端已經有流程圖了。要用本機的蓋掉雲端，請改用「用本機流程圖覆蓋雲端」。" };
+      return { status: "rejected" as const, message: "雲端已經有流程圖了，以雲端的為主（按「下載」取得）。" };
     }
     const before = Y.encodeStateVector(doc);
     let stats: unknown;
     doc.transact(() => {
       stats = flow.writeGraph(doc, body.graph);
       if (body.memos) flow.writeMemos(doc, body.memos);
+      if (body.content) {
+        flow.writeContent(doc, body.content);
+        doc.getMap("meta").set("contentSeeded", true);
+      }
     });
     await s.push(docId, doc, before);
     if (body.nodeSchema) {
@@ -218,7 +342,7 @@ export function createStore(ctx: HostContext) {
     return { status: "ok" as const, stats };
   }
 
-  return { flow, syncPull, pullGraph, pushGraph, schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
+  return { flow, pushAllEx, writeReferences, readReferences, syncPull, pullGraph, pushGraph, schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
 }
 
 export type Store = ReturnType<typeof createStore>;

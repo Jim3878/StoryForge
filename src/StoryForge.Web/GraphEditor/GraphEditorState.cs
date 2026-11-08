@@ -426,31 +426,64 @@ public sealed class GraphEditorState
         return true;
     }
 
-    // What 雲端同步 uploads the first time: the saved graph (as on disk, not unsaved canvas edits) and memos.
-    public (string GraphJson, Dictionary<string, string> Memos)? BuildCloudUpload()
+    // What 雲端同步 uploads the first time: the saved graph (as on disk, not unsaved canvas edits), memos and
+    // the nodes' other content fields.
+    public (string GraphJson, Dictionary<string, string> Memos, Dictionary<string, Dictionary<string, string>> Content)? BuildCloudUpload()
     {
         if (_blueprintPath == null || !File.Exists(_blueprintPath))
             return null;
         var blueprint = CanonicalGraphJson.ParseBlueprint(File.ReadAllText(_blueprintPath));
+        var (memos, content) = ReadNodeTexts(blueprint.Graph.Nodes);
+        return (CanonicalGraphJson.Serialize(blueprint.Graph, _model?.Schema), memos, content);
+    }
+
+    /// <summary>衝突/變化/角色/地點 of every 劇本 node in the saved graph (for seeding the cloud copy once).</summary>
+    public Dictionary<string, Dictionary<string, string>>? BuildCloudNodeContent()
+    {
+        if (_blueprintPath == null || !File.Exists(_blueprintPath))
+            return null;
+        return ReadNodeTexts(CanonicalGraphJson.ParseBlueprint(File.ReadAllText(_blueprintPath)).Graph.Nodes).Content;
+    }
+
+    // The cloud's field names for NodeContentEntry's texts (cloud/src/flowgraph.ts NODE_TEXT_FIELDS).
+    private static readonly (string Key, Func<NodeContentEntry, string> Get, Action<NodeContentEntry, string> Set)[] CloudTextFields =
+    {
+        ("conflict", e => e.Conflict, (e, v) => e.Conflict = v),
+        ("change", e => e.Change, (e, v) => e.Change = v),
+        ("characters", e => e.Characters, (e, v) => e.Characters = v),
+        ("location", e => e.Location, (e, v) => e.Location = v),
+    };
+
+    private (Dictionary<string, string> Memos, Dictionary<string, Dictionary<string, string>> Content) ReadNodeTexts(
+        IEnumerable<CanonicalGraphNode> nodes)
+    {
         var memos = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var node in blueprint.Graph.Nodes)
+        var content = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+        foreach (var node in nodes)
         {
             if (node.Type != PlayscriptProcessNodeTypeName)
                 continue;
             var name = node.Data.Value<string>("playscriptId");
             if (string.IsNullOrEmpty(name))
                 continue;
-            var memo = NodeContentStore.Read(_appSettings.ExternalDataFolder, name, node.Id)?.Memo;
-            if (!string.IsNullOrEmpty(memo))
-                memos[node.Id] = memo;
+            var entry = NodeContentStore.Read(_appSettings.ExternalDataFolder, name, node.Id);
+            if (entry == null)
+                continue;
+            if (!string.IsNullOrEmpty(entry.Memo))
+                memos[node.Id] = entry.Memo;
+            var texts = CloudTextFields.Where(f => !string.IsNullOrEmpty(f.Get(entry))).ToDictionary(f => f.Key, f => f.Get(entry));
+            if (texts.Count > 0)
+                content[node.Id] = texts;
         }
-        return (CanonicalGraphJson.Serialize(blueprint.Graph, _model?.Schema), memos);
+        return (memos, content);
     }
 
     // 下載: the cloud graph replaces the blueprint's `graph`; `baseGraph` (what Unity last saw) stays, so
     // 匯出至Unity still merges against Unity correctly. Memos go to the nodes' .json files. Returns a summary;
     // the caller reloads the canvas afterwards (ReloadCoordinator).
-    public string ApplyCloudGraph(CanonicalGraphDocument cloudGraph, IReadOnlyDictionary<string, string> memos)
+    /// <param name="content">衝突/變化/角色/地點 per node id; null = the cloud has none yet, keep the local ones.</param>
+    public string ApplyCloudGraph(CanonicalGraphDocument cloudGraph, IReadOnlyDictionary<string, string> memos,
+        IReadOnlyDictionary<string, Dictionary<string, string>>? content)
     {
         if (_blueprintPath == null || _baseGraph == null || _model == null)
             throw new InvalidOperationException("流程圖尚未載入，請先切換到流程圖分頁。");
@@ -474,10 +507,17 @@ public sealed class GraphEditorState
             memos.TryGetValue(node.Id, out var memo);
             memo ??= string.Empty;
             var entry = NodeContentStore.Read(_appSettings.ExternalDataFolder, name, node.Id);
-            if ((entry?.Memo ?? string.Empty) == memo)
+            var texts = content == null ? null : content.TryGetValue(node.Id, out var t) ? t : new Dictionary<string, string>();
+            var changed = (entry?.Memo ?? string.Empty) != memo;
+            if (texts != null)
+                changed |= CloudTextFields.Any(f => (entry == null ? string.Empty : f.Get(entry)) != (texts.TryGetValue(f.Key, out var v) ? v : string.Empty));
+            if (!changed)
                 continue;
             entry ??= new NodeContentEntry { Guid = node.Id, PlayscriptName = name };
             entry.Memo = memo;
+            if (texts != null)
+                foreach (var f in CloudTextFields)
+                    f.Set(entry, texts.TryGetValue(f.Key, out var v) ? v : string.Empty);
             NodeContentStore.Write(_appSettings.ExternalDataFolder, entry);
             memoWrites++;
         }
@@ -495,7 +535,7 @@ public sealed class GraphEditorState
             NodeScriptTableStore.SyncAll(_appSettings.ExternalDataFolder, added);
         }
 
-        var summary = changes == 0 && memoWrites == 0 ? "流程圖沒有變動" : $"流程圖 {changes} 處變動、{memoWrites} 份 Memo 更新";
+        var summary = changes == 0 && memoWrites == 0 ? "流程圖沒有變動" : $"流程圖 {changes} 處變動、{memoWrites} 份節點內容（Memo、衝突、變化等）更新";
         return added.Count > 0 ? $"{summary}、新劇本 {added.Count} 份（已建立劇本檔）" : summary;
     }
 
