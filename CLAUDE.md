@@ -112,10 +112,13 @@ previews through the Spine CLI, and the actual prefab/definition import through 
 Playscript tables also live in an AFFiNE workspace (`AppSettings.CloudWorkspaceId`) as StoryForge module docs:
 `db$<ws>$sf.project` (index of playscripts by node guid), `db$<ws>$sf.rules` (rules JSON) and one
 `db$<ws>$sf.playscript.<node guid>` per table (`order` Y.Array of rowIds, `rows` rowId → column → Y.Text). The
-layout is defined once in `cloud/src/schema.ts` (TypeScript), which is used by the nineday affine-mcp fork's
-StoryForge extension (`cloud/` builds it; `npm run install-into-mcp` copies it into
-`E:\Devffine-mcp-server\extensions\storyforge`) and copied into the AFFiNE fork's web editor by
-`cloud/scripts/copy-schema-to-affine.mjs`. C# never talks Yjs: `Core/Cloud/SfCloudClient` runs the extension's `sf`
+layout is defined once in `cloud/src/schema.ts` (TypeScript). `cloud/` is the npm package
+`@nineday/storyforge-cloud` (see `cloud/README.md`): its default export is the nineday affine-mcp fork's
+StoryForge extension (for now still copied into `E:\Dev\affine-mcp-server\extensions\storyforge` by
+`npm run install-into-mcp`, until that fork depends on the package), and its `./layout` entry plus `./assets/*`
+(the flow graph canvas) are what the AFFiNE fork's web editor depends on: bump the exact version in that fork's
+`core/package.json`; nothing is copied any more. Publishing: push a `cloud-v<version>` tag and
+`.github/workflows/publish-cloud.yml` does the rest. C# never talks Yjs: `Core/Cloud/SfCloudClient` runs the extension's `sf`
 commands and exchanges JSON files with them; login lives in affine-mcp's own config. For speed it runs `node` on
 affine-mcp's lean entry `dist/ext-cli.js` (no MCP tool modules, sign-in cookie cached in `ext-session.json` next
 to the affine-mcp config) rather than the `affine-mcp.cmd` shim. 上傳 and 下載 each cover two parts, 劇本表格 and
