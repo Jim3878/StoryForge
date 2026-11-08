@@ -113,11 +113,11 @@ Playscript tables also live in an AFFiNE workspace (`AppSettings.CloudWorkspaceI
 `db$<ws>$sf.project` (index of playscripts by node guid), `db$<ws>$sf.rules` (rules JSON) and one
 `db$<ws>$sf.playscript.<node guid>` per table (`order` Y.Array of rowIds, `rows` rowId → column → Y.Text). The
 layout is defined once in `cloud/src/schema.ts` (TypeScript). `cloud/` is the npm package
-`@nineday/storyforge-cloud` (see `cloud/README.md`): its default export is the nineday affine-mcp fork's
-StoryForge extension (for now still copied into `E:\Dev\affine-mcp-server\extensions\storyforge` by
-`npm run install-into-mcp`, until that fork depends on the package), and its `./layout` entry plus `./assets/*`
-(the flow graph canvas) are what the AFFiNE fork's web editor depends on: bump the exact version in that fork's
-`core/package.json`; nothing is copied any more. Publishing: push a `cloud-v<version>` tag and
+`@nineday/storyforge-cloud` (see `cloud/README.md`). Its default export is the StoryForge extension, which the
+nineday affine-mcp fork (`E:\Dev\affine-mcp-server`) lists in package.json `affineMcpExtensions` and depends on
+at an exact version; its `./layout` entry plus `./assets/*` (the flow graph canvas) are what the AFFiNE fork's
+web editor depends on (`core/package.json`). Nothing is copied into either fork any more: to ship a change,
+publish a new version and bump the exact version in each fork. Publishing: push a `cloud-v<version>` tag and
 `.github/workflows/publish-cloud.yml` does the rest. C# never talks Yjs: `Core/Cloud/SfCloudClient` runs the extension's `sf`
 commands and exchanges JSON files with them; login lives in affine-mcp's own config. For speed it runs `node` on
 affine-mcp's lean entry `dist/ext-cli.js` (no MCP tool modules, sign-in cookie cached in `ext-session.json` next

@@ -26,6 +26,14 @@ npm test
 ```
 
 本機同時改 AFFiNE 時，在 AFFiNE repo 用 `yarn link <此資料夾>` 指向這裡；那一行 resolutions 不要 commit。
+同時改 affine-mcp 時，設 `AFFINE_MCP_EXTENSIONS=<此資料夾>/dist/index.js` 讓它載入本機 build。
+
+## 消費端
+
+| repo | 在哪裡釘版本 | 換新版 |
+|---|---|---|
+| `Jim3878/AFFiNE`（`nineday` 分支） | `packages/frontend/core/package.json` | 改版本號、`yarn install`、推上去讓 CI 出新映像 |
+| `Jim3878/affine-mcp-server`（`nineday` 分支） | `package.json` 的 `dependencies`（`affineMcpExtensions` 列名稱） | 改版本號、`npm install`、`npm pack` 出新 tgz |
 
 ## 發佈
 

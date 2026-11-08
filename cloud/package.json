@@ -38,8 +38,7 @@
     "generate": "node scripts/gen-version.mjs && node scripts/copy-assets.mjs",
     "build": "npm run generate && tsc -p tsconfig.json",
     "test": "npm run build && node --test test/schema.test.mjs",
-    "prepublishOnly": "npm test",
-    "install-into-mcp": "npm run build && node scripts/install-into-mcp.mjs"
+    "prepublishOnly": "npm test"
   },
   "peerDependencies": {
     "yjs": "^13.6.0"
