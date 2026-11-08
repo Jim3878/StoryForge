@@ -1,14 +1,53 @@
 {
-  "name": "@nineday/storyforge-mcp",
-  "version": "1.0.0",
-  "private": true,
-  "description": "StoryForge extension for the nineday affine-mcp fork: sf_* tools and the sf CLI used by local StoryForge.",
+  "name": "@nineday/storyforge-cloud",
+  "version": "1.1.0",
+  "description": "StoryForge's cloud data layout (docs inside an AFFiNE workspace) and the StoryForge extension for the nineday affine-mcp fork: sf_* tools and the sf CLI.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jim3878/StoryForge.git",
+    "directory": "cloud"
+  },
   "type": "module",
-  "main": "dist/index.js",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./layout": {
+      "types": "./dist/layout.d.ts",
+      "default": "./dist/layout.js"
+    },
+    "./assets/*": "./assets/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "assets",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.18.1"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "generate": "node scripts/gen-version.mjs && node scripts/copy-assets.mjs",
+    "build": "npm run generate && tsc -p tsconfig.json",
     "test": "npm run build && node --test test/schema.test.mjs",
+    "prepublishOnly": "npm test",
     "install-into-mcp": "npm run build && node scripts/install-into-mcp.mjs"
+  },
+  "peerDependencies": {
+    "yjs": "^13.6.0"
+  },
+  "peerDependenciesMeta": {
+    "yjs": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^24.13.4",

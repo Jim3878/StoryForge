@@ -1,0 +1,45 @@
+name: Publish @nineday/storyforge-cloud
+
+# Publishes cloud/ to npm when a tag `cloud-v<version>` is pushed, where <version> must equal
+# cloud/package.json's version. Uses npm trusted publishing (OIDC): no token or secret — the package's
+# settings on npmjs.com name this repository and this workflow file as the trusted publisher.
+on:
+  push:
+    tags: ["cloud-v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloud
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships an older one.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Check that the tag matches package.json
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ "cloud-v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match cloud/package.json version $v"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm test
+
+      - run: npm publish --access public
