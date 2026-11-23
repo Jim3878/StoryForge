@@ -627,7 +627,7 @@ public sealed class CgManagerState : IDisposable
 
     // ---- 生成 spine 發包檔 ----
 
-    // <發包資料夾>\<月>月Spine\<CG>\ 底下放 clip 旁的 PSD、每個構圖的 1920 PNG、差分說明檔。不碰 clip 同級資料夾與 Unity。
+    // <發包資料夾>\<月>月Spine\<CG>\ 底下放 clip 的複本（手動另存 PSD 用）、每個構圖的 1920 PNG、差分說明檔。不碰 clip 同級資料夾與 Unity。
     private async Task RunSpineHandoffAsync(CgJob job, CancellationToken token)
     {
         if (string.IsNullOrWhiteSpace(_settings.SpineHandoffFolder))
@@ -690,17 +690,35 @@ public sealed class CgManagerState : IDisposable
         OpenFolder(monthFolder);
     }
 
-    // clip → PSD 的自動轉換還沒有：先複製 clip 旁邊手動從 CSP 匯出的同名 PSD。回傳要提醒的事（null = 沒問題）。
+    // clip → PSD 的自動轉換還沒有：把 clip 複製過去，讓人在發包資料夾裡開啟、手動另存成 PSD。
+    // 發包資料夾裡已有的 PSD（手動存的）不動；沒有時，clip 旁邊有不比 clip 舊的同名 PSD 就順便帶過去。
+    // 回傳要提醒的事（null = PSD 已就緒）。
     private static string? CopyHandoffPsd(CgEntry owner, string folder)
     {
-        var psd = Path.ChangeExtension(owner.Clip!, ".psd");
-        if (!File.Exists(psd))
-            return "但 clip 旁邊沒有同名 PSD，資料夾裡缺 PSD（請從 CSP 匯出後再生成一次）。";
+        var name = CgNaming.SafeFileName(owner.CgId);
+        try
+        {
+            File.Copy(owner.Clip!, Path.Combine(folder, name + ".clip"), true);
+        }
+        catch (IOException e)
+        {
+            return $"但 clip 複製失敗（發包資料夾裡的 clip 是否正開在 CSP？）：{e.Message}";
+        }
 
-        File.Copy(psd, Path.Combine(folder, CgNaming.SafeFileName(owner.CgId) + ".psd"), true);
-        return File.GetLastWriteTimeUtc(psd) < File.GetLastWriteTimeUtc(owner.Clip!).AddMinutes(-5)
-            ? "但 PSD 比 clip 舊，可能不是最新版（請確認是否要從 CSP 重新匯出）。"
-            : null;
+        var target = Path.Combine(folder, name + ".psd");
+        if (File.Exists(target))
+            return File.GetLastWriteTimeUtc(target) < File.GetLastWriteTimeUtc(owner.Clip!).AddMinutes(-5)
+                ? "但資料夾裡的 PSD 比 clip 舊，請開啟資料夾裡的 clip 重新另存成 PSD。"
+                : null;
+
+        var psd = Path.ChangeExtension(owner.Clip!, ".psd");
+        if (File.Exists(psd) && File.GetLastWriteTimeUtc(psd) >= File.GetLastWriteTimeUtc(owner.Clip!).AddMinutes(-5))
+        {
+            File.Copy(psd, target);
+            return null;
+        }
+
+        return "還沒有 PSD：請開啟資料夾裡的 clip 另存成 PSD。";
     }
 
     // ---- 輸出至 Unity ----
