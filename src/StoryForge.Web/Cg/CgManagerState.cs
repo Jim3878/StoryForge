@@ -336,6 +336,9 @@ public sealed class CgManagerState : IDisposable
     public void EnqueueExportPng(IEnumerable<CgEntry> entries) =>
         Enqueue("輸出 PNG", entries.ToList(), RunExportPngAsync);
 
+    public void EnqueueSpineHandoff(IEnumerable<CgEntry> entries) =>
+        Enqueue("生成 spine 發包檔", entries.ToList(), RunSpineHandoffAsync);
+
     // 回傳要先問「覆蓋 / 略過」的 CG；暫代圖不問，直接覆蓋。
     public List<CgOverwriteQuestion> GetOverwriteQuestions(IEnumerable<CgEntry> entries)
     {
@@ -620,6 +623,84 @@ public sealed class CgManagerState : IDisposable
 
         MarkActive(clipOwners, "處理中：輸出 PNG");
         await RenderClipsAsync(clipOwners, full: true, token);
+    }
+
+    // ---- 生成 spine 發包檔 ----
+
+    // <發包資料夾>\<月>月Spine\<CG>\ 底下放 clip 旁的 PSD、每個構圖的 1920 PNG、差分說明檔。不碰 clip 同級資料夾與 Unity。
+    private async Task RunSpineHandoffAsync(CgJob job, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(_settings.SpineHandoffFolder))
+            throw new InvalidOperationException("請先到設定填「Spine 發包資料夾」。");
+
+        var owners = OwnersOf(job.Entries);
+        foreach (var skipped in owners.Where(e => e.Clip == null))
+            AddLog(CgLogLevel.Info, $"[{skipped.CgId}] 沒有 clip，略過生成 spine 發包檔。");
+
+        var clipOwners = owners.Where(e => e.Clip != null).ToList();
+        if (clipOwners.Count == 0)
+            return;
+
+        MarkActive(job.Entries, "處理中：spine 發包檔");
+        var monthFolder = CgSpineHandoff.MonthFolder(_settings.SpineHandoffFolder, DateTime.Now);
+        var folders = new Dictionary<string, string>(StringComparer.Ordinal);
+        var jobs = new List<CspClipJob>();
+        foreach (var owner in clipOwners)
+        {
+            var folder = Path.Combine(monthFolder, CgSpineHandoff.CgFolderName(owner.CgId));
+            Directory.CreateDirectory(folder);
+            DeleteClipExports(folder, owner.CgId);
+            folders[owner.CgId] = folder;
+            jobs.Add(new CspClipJob
+            {
+                Clip = owner.Clip!,
+                RenderAll = new List<CspOutput> { CspOutput.Full(Path.Combine(folder, $"{CgNaming.SafeFileName(owner.CgId)}_{{comp}}.png")) }
+            });
+        }
+
+        SetStage("啟動 Csp 工具", string.Empty);
+        var results = await CspBatchClient.RunAsync(_settings.CspExePath, jobs, OnToolProgress, token);
+        foreach (var owner in clipOwners)
+        {
+            var folder = folders[owner.CgId];
+            var result = results.FirstOrDefault(r => string.Equals(Path.GetFullPath(r.Clip), Path.GetFullPath(owner.Clip!), StringComparison.OrdinalIgnoreCase));
+            foreach (var error in result?.Errors ?? new List<string> { "Csp 工具沒有回報這個 clip 的結果" })
+                AddLog(CgLogLevel.Error, $"[{owner.CgId}] {error}");
+
+            var comps = result?.Comps.Where(c => !string.IsNullOrWhiteSpace(c)).ToList() ?? new List<string>();
+            if (comps.Count == 0)
+                continue;
+
+            _local.SetCachedDiffs(owner.Clip!, comps);
+
+            // 共用這張 CG prefab 的其他 CG，差分圖也在同一個 clip 裡，備註一起收。
+            var family = Entries.Where(e => e.OwnerId == owner.CgId).ToList();
+            var notesPath = Path.Combine(folder, CgNaming.SafeFileName(owner.CgId) + ".txt");
+            var notes = CgSpineHandoff.BuildNotes(owner.CgId, comps, diff =>
+                family.SelectMany(e => e.Diffs).Where(v => v.Diff == diff && !v.NotOwned).Select(v => v.Memo));
+            if (!CgSpineHandoff.WriteNotes(notesPath, notes))
+                AddLog(CgLogLevel.Anomaly, $"[{owner.CgId}] 說明檔已存在且內容不同（可能手動改過），保留原檔；要重新產生請先刪掉 {notesPath}");
+
+            var psdNote = CopyHandoffPsd(owner, folder);
+            AddLog(psdNote == null ? CgLogLevel.Done : CgLogLevel.Anomaly,
+                $"[{owner.CgId}] 發包檔已輸出（{comps.Count} 個差分）{(psdNote == null ? "。" : "，" + psdNote)}");
+        }
+
+        SaveLocal();
+        OpenFolder(monthFolder);
+    }
+
+    // clip → PSD 的自動轉換還沒有：先複製 clip 旁邊手動從 CSP 匯出的同名 PSD。回傳要提醒的事（null = 沒問題）。
+    private static string? CopyHandoffPsd(CgEntry owner, string folder)
+    {
+        var psd = Path.ChangeExtension(owner.Clip!, ".psd");
+        if (!File.Exists(psd))
+            return "但 clip 旁邊沒有同名 PSD，資料夾裡缺 PSD（請從 CSP 匯出後再生成一次）。";
+
+        File.Copy(psd, Path.Combine(folder, CgNaming.SafeFileName(owner.CgId) + ".psd"), true);
+        return File.GetLastWriteTimeUtc(psd) < File.GetLastWriteTimeUtc(owner.Clip!).AddMinutes(-5)
+            ? "但 PSD 比 clip 舊，可能不是最新版（請確認是否要從 CSP 重新匯出）。"
+            : null;
     }
 
     // ---- 輸出至 Unity ----

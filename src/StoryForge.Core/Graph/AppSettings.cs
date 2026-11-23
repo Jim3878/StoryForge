@@ -79,6 +79,9 @@ public sealed class AppSettings
     public string CgTemplateFolder { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\美術\CG圖\Sample";
     public string CgTemplateClip { get; set; } = @"01_source\FalseBadgeCG.clip";
 
+    // CG 管理「生成 spine 發包檔」的輸出位置；底下依月份開 <月>月Spine\<CG> 資料夾（見 CgSpineHandoff）。
+    public string SpineHandoffFolder { get; set; } = @"E:\本地端\遊戲專案管理\臥底治安官\美術\外包";
+
     // 雲端同步: the AFFiNE workspace holding this project's StoryForge module docs, and the command that runs
     // the nineday affine-mcp (its StoryForge extension does the actual download/upload; login lives in
     // affine-mcp's own config, not here). Empty workspace id = cloud sync off.

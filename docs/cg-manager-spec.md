@@ -57,6 +57,15 @@
   - clip 每次都重新匯出 1920 PNG，存一份在 clip 同級資料夾 `{CG}_{差分}.png`（先刪該 CG 舊檔）。
   - 輸出 Log 列：缺檔 / 缺 spine / 異常 / 已完成（附原因）。
 - **輸出 PNG**：只做 clip → clip 同級 1920 PNG，不碰 Unity。沒 clip 灰掉/略過。
+- **生成 spine 發包檔**（2026-11-23 定案，每月底把畫好的 CG 交給 spine 外包用）：
+  - 範圍：目前篩選出來的 CG（共用 CG 改對主 CG 做）；沒有 clip 的略過並記 Log。不碰 clip 同級資料夾與 Unity。
+  - 位置：設定頁「Spine 發包資料夾」（預設 `美術\外包`）`\<月>月Spine\<CG 去掉 CG_ 前綴>\`，版面照以前手動整理的。
+  - 內容：`{CG}_{差分}.png`（clip 每個構圖一張 1920 PNG，先刪該 CG 舊圖）、`{CG}.txt`（每個差分一段 `# {CG}_{差分}`，
+    底下列劇本 `OpenCg` / `Diff` 的 `;備註`，含共用這張 prefab 的其他 CG 的備註；沒備註只留標題）、`{CG}.psd`。
+  - 說明檔已存在且內容不同（手動補過）→ 保留原檔並記 Log，不覆蓋。
+  - PSD：目標是工具自動把 clip 轉 PSD（Csp 專案的轉換器尚未實作）。在那之前複製 clip 旁邊手動從 CSP 匯出的同名 `.psd`；
+    沒有、或比 clip 舊超過 5 分鐘 → Log 標異常。
+  - 完成後用檔案總管開啟當月資料夾。
 - **覆蓋詢問**：開始前一次問完。覆蓋 / 略過 / 取消，加「套用到剩下 N 張」。類型改變時註明。暫代圖直接覆蓋。
 - **Unity 執行**：Forge 準備好檔案（clip 匯出的 PNG / 暫代圖 / 縮圖放暫存資料夾），寫 `Library/StoryForgeCgImport/pending.json`。
   PNG 複製進 Gallery、spine 的 Spine CLI 匯出（沿用 `SpineCgImportService` 的匯出設定與 PMA）由 Unity 端 `CgImportQueue` 做。
@@ -83,7 +92,7 @@
 
 ## 介面
 
-- 工具列：章節多選｜缺檔/缺 spine/異常/已完成 計數（可點篩選）｜預覽大小滑桿｜重新掃描｜更新預覽圖｜輸出 PNG｜輸出至 Unity｜從 Unity 刪除｜CG 共用表｜取消。
+- 工具列：章節多選｜缺檔/缺 spine/異常/已完成 計數（可點篩選）｜預覽大小滑桿｜重新掃描｜更新預覽圖｜輸出 PNG｜生成 spine 發包檔｜輸出至 Unity｜從 Unity 刪除｜CG 共用表｜取消。
   批次按鈕只作用於目前篩選出的 CG。
 - 卡片：預覽＋差分切換、CG 名稱、`clip`/`png`/`spine` 標籤、Unity 狀態標籤、類型下拉、更新預覽、輸出至 Unity、劇本名稱（點擊跳流程圖節點）。
 - 右鍵：複製 CG 名稱｜開啟 clip 檔｜開啟 spine 檔（無則灰）｜開啟 clip 資料夾｜開啟 spine 資料夾｜輸出 PNG｜從範本建立資料夾（見下）｜開啟劇本檔（.md）｜跳到流程圖節點（多劇本時二級選單）｜從 Unity 刪除。
@@ -111,4 +120,4 @@
 
 ## 設定頁新增
 
-CG 根目錄、Csp EXE 路徑、Spine CLI 路徑、Unity.exe 路徑（預設依 `ProjectVersion.txt` 推 Hub 路徑）、CG 範本資料夾（預設 `CG圖\Sample`）、範本 clip（範本資料夾底下的相對路徑，預設 `01_source\FalseBadgeCG.clip`）。
+CG 根目錄、Csp EXE 路徑、Spine CLI 路徑、Unity.exe 路徑（預設依 `ProjectVersion.txt` 推 Hub 路徑）、CG 範本資料夾（預設 `CG圖\Sample`）、範本 clip（範本資料夾底下的相對路徑，預設 `01_source\FalseBadgeCG.clip`）、Spine 發包資料夾（預設 `美術\外包`）。

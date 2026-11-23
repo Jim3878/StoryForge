@@ -127,6 +127,10 @@
                     <input type="text" @bind="_cgTemplateClip" />
                 </label>
                 <label>
+                    <span>Spine 發包資料夾（「生成 spine 發包檔」會在底下開當月的「N月Spine」資料夾）</span>
+                    <input type="text" @bind="_spineHandoffFolder" />
+                </label>
+                <label>
                     <span>雲端同步：AFFiNE workspace id（空白＝不使用雲端同步）</span>
                     <input type="text" @bind="_cloudWorkspaceId" />
                 </label>
@@ -187,6 +191,7 @@
     private string _unityExePath = string.Empty;
     private string _cgTemplateFolder = string.Empty;
     private string _cgTemplateClip = string.Empty;
+    private string _spineHandoffFolder = string.Empty;
     private string _cloudWorkspaceId = string.Empty;
     private string _affineMcpCommand = string.Empty;
 
@@ -210,6 +215,7 @@
         _unityExePath = AppSettingsStore.UnityExePath;
         _cgTemplateFolder = AppSettingsStore.CgTemplateFolder;
         _cgTemplateClip = AppSettingsStore.CgTemplateClip;
+        _spineHandoffFolder = AppSettingsStore.SpineHandoffFolder;
         _cloudWorkspaceId = AppSettingsStore.CloudWorkspaceId;
         _affineMcpCommand = AppSettingsStore.AffineMcpCommand;
         _statusMessage = string.Empty;
@@ -244,6 +250,7 @@
         AppSettingsStore.UnityExePath = _unityExePath;
         AppSettingsStore.CgTemplateFolder = _cgTemplateFolder;
         AppSettingsStore.CgTemplateClip = _cgTemplateClip;
+        AppSettingsStore.SpineHandoffFolder = (_spineHandoffFolder ?? string.Empty).Trim();
         AppSettingsStore.CloudWorkspaceId = (_cloudWorkspaceId ?? string.Empty).Trim();
         AppSettingsStore.AffineMcpCommand = string.IsNullOrWhiteSpace(_affineMcpCommand) ? "affine-mcp.cmd" : _affineMcpCommand.Trim();
         AppSettingsStore.Save();

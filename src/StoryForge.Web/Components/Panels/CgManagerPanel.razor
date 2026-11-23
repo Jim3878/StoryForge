@@ -39,6 +39,8 @@
         <button @onclick="State.ScanAsync" disabled="@State.IsScanning">重新掃描</button>
         <button @onclick="() => State.EnqueuePreview(Visible)" title="只處理目前篩選出來的 CG">更新預覽圖</button>
         <button @onclick="() => State.EnqueueExportPng(Visible)" title="從 clip 輸出 1920 PNG 到 clip 同級資料夾，不碰 Unity">輸出 PNG</button>
+        <button @onclick="() => State.EnqueueSpineHandoff(Visible)"
+                title="把目前篩選出來的 CG 整理成給 spine 外包的資料夾（發包資料夾\當月Spine\CG）：PSD、每個差分的 1920 PNG、差分說明檔">生成 spine 發包檔</button>
         <button class="cg-primary" @onclick="() => StartUnityExport(Visible)" title="只處理目前篩選出來的 CG">輸出至 Unity</button>
         <button class="cg-danger" @onclick="() => StartUnityDelete(Visible)" disabled="@(!State.CanBatchDeleteFromUnity)"
                 title='@(State.CanBatchDeleteFromUnity ? "把目前篩選出來的 CG 從 Unity 專案刪除（打包試玩版用）" : "請先用章節篩選選出要刪的章節")'>從 Unity 刪除</button>
