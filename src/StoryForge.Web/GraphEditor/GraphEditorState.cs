@@ -107,8 +107,9 @@ public sealed class GraphEditorState
 
             RefreshSyncState();
             StatusMessage = prefix + StatusMessage + DescribeSyncState() + DescribeContentFileState();
-            if (IsCloudManaged)
-                StatusMessage += "；" + CloudManagedMessage;
+            EnsureCloudBase();
+            if (IsCloudMergeWaiting)
+                StatusMessage += "；" + CloudMergeWaitingMessage;
             return ToPayload();
         }
         catch (Exception e)
@@ -125,7 +126,7 @@ public sealed class GraphEditorState
     // 存檔：把畫布的內容套用到模型，只寫入藍圖，不碰 Unity 的檔案
     public void ApplyAndSave(GraphEditorExport export)
     {
-        if (RefuseCloudManaged("存檔"))
+        if (RefuseWhileMergeWaiting("存檔"))
             return;
         if (_model == null)
         {
@@ -177,7 +178,7 @@ public sealed class GraphEditorState
     // 用 Unity 的版本覆蓋藍圖。覆蓋前若藍圖和 Unity 不同，先把藍圖備份起來。呼叫端之後要重新載入流程圖。
     public void ImportFromUnity()
     {
-        if (RefuseCloudManaged("從Unity匯入"))
+        if (RefuseWhileMergeWaiting("從Unity匯入"))
             return;
         if (_model == null || _blueprintPath == null)
         {
@@ -411,19 +412,65 @@ public sealed class GraphEditorState
 
     // ---------- 雲端同步 (cloud-managed flow graph) ----------
 
-    // Once the flow graph has been uploaded to the cloud workspace, the cloud copy is the master: edits happen
-    // in the AFFiNE web editor and arrive here through 雲端同步's 下載. Exporting (匯出成C#, 匯出至Unity) still works.
+    // Once the flow graph is in the cloud workspace it is edited on both sides: here and in the AFFiNE web
+    // editor. 雲端同步's 上傳 / 下載 merge the two (three-way, against the base in CloudBaseStore); a place both
+    // sides changed parks the graph in a wait merge (FlowGraphWaitStore), and only then is this tab read-only.
     public bool IsCloudManaged => StoryForge.Core.Cloud.CloudBaseStore.FlowGraphManagedFor(_appSettings);
 
-    public const string CloudManagedMessage = "流程圖由雲端管理：請在 AFFiNE 網頁版的「StoryForge 流程圖」編輯，再到「雲端同步」按「下載」。";
+    public bool IsCloudMergeWaiting => StoryForge.Core.Cloud.FlowGraphWaitStore.IsWaiting(_appSettings.ExternalDataFolder);
 
-    private bool RefuseCloudManaged(string action)
+    public const string CloudMergeWaitingMessage = "流程圖正在等待合併（本機和雲端改到同一處），暫時唯讀：請到「雲端同步」分頁完成合併。";
+
+    public ProcessNodeSchemaDocument? Schema => _model?.Schema;
+
+    private bool RefuseWhileMergeWaiting(string action)
     {
-        if (!IsCloudManaged)
+        if (!IsCloudMergeWaiting)
             return false;
-        StatusMessage = $"{action}已擋下。{CloudManagedMessage}";
-        LastSaveReport = new SaveReport(SaveOutcome.Failure, $"{action}已擋下", new[] { CloudManagedMessage });
+        StatusMessage = $"{action}已擋下。{CloudMergeWaitingMessage}";
+        LastSaveReport = new SaveReport(SaveOutcome.Failure, $"{action}已擋下", new[] { CloudMergeWaitingMessage });
         return true;
+    }
+
+    // A machine that synced the flow graph while the local copy was still a read-only download has the
+    // marker but no base. Its saved graph is exactly that download, so it becomes the base — done at load,
+    // before anything can be edited (a base taken after an edit would hide that edit from 上傳).
+    private void EnsureCloudBase()
+    {
+        try
+        {
+            if (!IsCloudManaged)
+                return;
+            var store = new StoryForge.Core.Cloud.CloudBaseStore(_appSettings.CloudWorkspaceId.Trim());
+            if (store.FlowGraphBaseJson == null && BuildLocalSnapshot(null) is { } snapshot)
+                store.FlowGraphBaseJson = snapshot.ToJson(_model?.Schema);
+        }
+        catch (Exception e)
+        {
+            DiagnosticsLog.Write($"EnsureCloudBase failed: {e.Message}");
+        }
+    }
+
+    // The saved flow graph (as on disk, not unsaved canvas edits) with its node texts, for 雲端同步. Texts the
+    // local files cannot hold (a memo on a node that is not a named 劇本 node) are carried over from
+    // `carryFrom`, so they never look like something deleted here.
+    public StoryForge.Core.Cloud.FlowGraphSnapshot? BuildLocalSnapshot(StoryForge.Core.Cloud.FlowGraphSnapshot? carryFrom)
+    {
+        if (_blueprintPath == null || !File.Exists(_blueprintPath))
+            return null;
+        var blueprint = CanonicalGraphJson.ParseBlueprint(File.ReadAllText(_blueprintPath));
+        CanonicalGraphJson.Normalize(blueprint.Graph, _model?.Schema);
+        var (memos, content) = ReadNodeTexts(blueprint.Graph.Nodes);
+        var snapshot = new StoryForge.Core.Cloud.FlowGraphSnapshot { Graph = blueprint.Graph, Memos = memos, Content = content };
+        if (carryFrom != null)
+        {
+            var held = blueprint.Graph.Nodes
+                .Where(n => n.Type == PlayscriptProcessNodeTypeName && !string.IsNullOrEmpty(n.Data.Value<string>("playscriptId")))
+                .Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
+            foreach (var (id, field) in carryFrom.TextKeys().Where(k => !held.Contains(k.NodeId)).ToList())
+                snapshot.SetText(id, field, carryFrom.GetText(id, field));
+        }
+        return snapshot;
     }
 
     // What 雲端同步 uploads the first time: the saved graph (as on disk, not unsaved canvas edits), memos and
@@ -478,7 +525,7 @@ public sealed class GraphEditorState
         return (memos, content);
     }
 
-    // 下載: the cloud graph replaces the blueprint's `graph`; `baseGraph` (what Unity last saw) stays, so
+    // 雲端同步: the merged graph (local + cloud) replaces the blueprint's `graph`; `baseGraph` (what Unity last saw) stays, so
     // 匯出至Unity still merges against Unity correctly. Memos go to the nodes' .json files. Returns a summary;
     // the caller reloads the canvas afterwards (ReloadCoordinator).
     /// <param name="content">衝突/變化/角色/地點 per node id; null = the cloud has none yet, keep the local ones.</param>
@@ -765,7 +812,7 @@ public sealed class GraphEditorState
     // to open the 流程圖 tab and press 存檔 themselves.
     public void SaveModelOnly()
     {
-        if (RefuseCloudManaged("存檔"))
+        if (RefuseWhileMergeWaiting("存檔"))
             return;
         try
         {
@@ -1356,8 +1403,7 @@ public sealed class GraphEditorState
 
     public void SetNodeMemo(string nodeGuid, string memo)
     {
-        // Memos are part of the cloud flow graph once it is cloud-managed.
-        if (RefuseCloudManaged("修改 Memo"))
+        if (RefuseWhileMergeWaiting("修改 Memo"))
             return;
         UpdateNodeContent(nodeGuid, entry => entry.Memo = memo);
     }
@@ -1388,7 +1434,7 @@ public sealed class GraphEditorState
     // makes calling it again there for an already-created node a safe no-op.
     public void CreateNode(string guid, string typeName, float x, float y)
     {
-        if (IsCloudManaged || _model == null || _model.FindNode(guid) != null)
+        if (IsCloudMergeWaiting || _model == null || _model.FindNode(guid) != null)
             return;
 
         var schema = _model.GetSchema(typeName);
@@ -1514,7 +1560,7 @@ public sealed class GraphEditorState
         var node = _model?.FindNode(nodeGuid);
         if (node == null)
             return null;
-        if (RefuseCloudManaged("修改節點欄位"))
+        if (RefuseWhileMergeWaiting("修改節點欄位"))
             return node.Fields.TryGetValue(fieldName, out var current) ? current?.ToString() ?? string.Empty : string.Empty;
 
         if (string.IsNullOrEmpty(value))
@@ -1622,7 +1668,7 @@ public sealed class GraphEditorState
 
         var payload = new GraphEditorPayload
         {
-            ReadOnly = IsCloudManaged,
+            ReadOnly = IsCloudMergeWaiting,
             Settings = new GraphSettingsDto
             {
                 NodeFrozenTextSize = model.Settings.NodeFrozenTextSize,

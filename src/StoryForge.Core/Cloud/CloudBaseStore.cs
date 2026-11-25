@@ -55,8 +55,8 @@ public sealed class CloudBaseStore
         File.Move(tmp, PathFor(guid), overwrite: true);
     }
 
-    // Once the flow graph has been uploaded (or a download found it enabled in the cloud), the cloud graph is
-    // the master: local StoryForge only downloads it and its flow graph tab is read-only.
+    // Set once the flow graph has been uploaded (or a download found one in the cloud): from then on 上傳 /
+    // 下載 merge the local graph with the cloud's instead of seeding it.
     private string FlowGraphMarker => Path.Combine(_folder, "flowgraph-managed.json");
 
     public bool IsFlowGraphManaged => File.Exists(FlowGraphMarker);
@@ -65,6 +65,27 @@ public sealed class CloudBaseStore
     {
         Directory.CreateDirectory(_folder);
         File.WriteAllText(FlowGraphMarker, JsonConvert.SerializeObject(new { since = DateTime.Now }));
+    }
+
+    // The flow graph's sync base: the cloud graph (with memos and node content, a FlowGraphSnapshot as JSON)
+    // this machine last merged with. Local edits are whatever differs from it; null = never synced here.
+    private string FlowGraphBasePath => Path.Combine(_folder, "flowgraph-base.json");
+
+    public string? FlowGraphBaseJson
+    {
+        get => File.Exists(FlowGraphBasePath) ? File.ReadAllText(FlowGraphBasePath) : null;
+        set
+        {
+            Directory.CreateDirectory(_folder);
+            if (value == null)
+            {
+                if (File.Exists(FlowGraphBasePath)) File.Delete(FlowGraphBasePath);
+                return;
+            }
+            var tmp = FlowGraphBasePath + ".tmp";
+            File.WriteAllText(tmp, value);
+            File.Move(tmp, FlowGraphBasePath, overwrite: true);
+        }
     }
 
     // Is the flow graph cloud-managed for the workspace these settings point at?

@@ -2,7 +2,7 @@
 // Input and output are JSON files (UTF-8) so nothing depends on console encoding.
 //
 //   sf pull  --workspace <id> --out <file>
-//   sf push  --workspace <id> --in <file> --out <file>   (body: { playscripts, rules?, references?, contentSeed?, graph? })
+//   sf push  --workspace <id> --in <file> --out <file>   (body: { playscripts, rules?, references?, contentSeed?, graph?, graphMerge? })
 //   sf info  --workspace <id>
 //   sf sync-pull --workspace <id> [--since <ms>] [--graph-since <ms>] [--no-tables] [--no-graph] [--only guid,guid] --out <file>
 //                (index + changed graph/tables, one connection)
@@ -62,7 +62,7 @@ export async function runCli(args: string[], ctx: HostContext) {
       const body = JSON.parse(readFileSync(input, "utf8").replace(/^﻿/, ""));
       writeJson(out, await store.withSession(workspaceId, s =>
         store.pushAllEx(s, body.playscripts ?? [], body.rules ?? undefined, body.references ?? undefined, body.contentSeed ?? undefined,
-          body.graph ?? undefined)));
+          body.graph ?? undefined, body.graphMerge ?? undefined)));
       return;
     }
     case "sync-pull": {

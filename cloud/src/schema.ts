@@ -104,8 +104,8 @@ export function createSchema(Y: typeof YType) {
     }
   }
 
-  // The flow graph module is on once a graph was uploaded: from then on the cloud graph is the master and
-  // local StoryForge's flow graph tab is read-only.
+  // The flow graph module is on once a graph was uploaded: from then on it is edited both here and in local
+  // StoryForge, whose 上傳 / 下載 merge the two.
   function enableFlowGraph(doc: YType.Doc) {
     const meta = doc.getMap("meta");
     const modules = { ...((meta.get("modules") ?? {}) as Record<string, any>) };

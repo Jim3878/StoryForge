@@ -1670,7 +1670,7 @@ window.storyForgeGraph = (function () {
         const canvasEl = document.getElementById(canvasElementId);
         canvas = new LGraphCanvas("#" + canvasElementId, graph);
         canvas.allow_searchbox = false;
-        // 雲端同步: a cloud-managed flow graph is only viewed here (edits happen in the AFFiNE web editor).
+        // 雲端同步: read-only only while the flow graph waits for a merge (both sides changed the same place).
         canvas.read_only = !!payload.readOnly;
         canvas.render_canvas_border = false;
         canvas.links_render_mode = LiteGraph.LINEAR_LINK;

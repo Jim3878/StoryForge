@@ -62,7 +62,7 @@ public sealed class CloudProgressInfo
 public sealed record CloudRunResult(bool Success, string Title, string Message, TimeSpan Elapsed, DateTime At);
 
 // 雲端同步 tab. Git-style: 下載 = pull (whole-playscript decisions), 上傳 = push (fast-forward only, per
-// playscript). The cloud side is reached only through SfCloudClient (affine-mcp's StoryForge extension).
+// playscript). The flow graph merges three-way per field instead; see MergeFlowGraphAsync. The cloud side is reached only through SfCloudClient (affine-mcp's StoryForge extension).
 public sealed class CloudSyncState
 {
     private readonly AppSettings _settings;
@@ -171,12 +171,22 @@ public sealed class CloudSyncState
             var pull = await Client().SyncPullAsync(baseStore.LastPullServerTime, baseStore.LastGraphPullServerTime, tables, graph);
             SetPhase("套用流程圖");
             string? graphSummary = null;
-            if (graph && pull.Graph is { Exists: true, Graph: not null })
-                graphSummary = await ApplyFlowGraphAsync(pull.Graph);
-            else if (graph && pull.Graph is { Exists: false } && !baseStore.IsFlowGraphManaged)
-                graphSummary = "雲端還沒有流程圖（按「上傳」會把本機的流程圖一起傳上去）";
             if (graph)
-                baseStore.LastGraphPullServerTime = pull.ServerTime;
+            {
+                // A part that was not merged keeps its old server time, so the next download reads it again.
+                if (FlowGraphWaitStore.IsWaiting(DataFolder))
+                    graphSummary = "流程圖等待合併中，這次沒有下載流程圖";
+                else if (pull.Graph is { Exists: true, Graph: not null } && _graph.HasUnsavedChanges())
+                    graphSummary = "流程圖分頁還有沒存檔的修改，流程圖這次沒有下載（存檔後再按下載）";
+                else
+                {
+                    if (pull.Graph is { Exists: true, Graph: not null })
+                        graphSummary = (await MergeFlowGraphAsync(pull.Graph)).Summary;
+                    else if (pull.Graph is { Exists: false } && !baseStore.IsFlowGraphManaged)
+                        graphSummary = "雲端還沒有流程圖（按「上傳」會把本機的流程圖一起傳上去）";
+                    baseStore.LastGraphPullServerTime = pull.ServerTime;
+                }
+            }
             LastPullAt = DateTime.Now;
             _cloudIndex = pull.Index;
             if (!tables)
@@ -308,10 +318,53 @@ public sealed class CloudSyncState
                 rules = null; // already in the cloud
             var sentHashes = baseStore.ReferenceHashes;
             var references = BuildReferences().Where(r => !sentHashes.TryGetValue(r.Name, out var h) || h != r.Hash).ToList();
-            // The flow graph goes up only the first time (the cloud has none yet): after that the cloud copy is
-            // the master and the local one is a read-only download of it.
+            // The flow graph: the first time (the cloud has none yet) the whole local graph goes up as the seed.
+            // After that only the local edits do — what differs from the base — after merging in whatever the
+            // cloud changed meanwhile; a place both sides changed stops the graph's upload in a wait merge.
             CloudGraphSeed? graphSeed = null;
+            CloudGraphMerge? graphMerge = null;
+            FlowGraphSnapshot? graphMine = null;
+            var graphFailed = false;
             string? graphNote = null;
+            if (graph && baseStore.IsFlowGraphManaged)
+            {
+                if (FlowGraphWaitStore.IsWaiting(DataFolder))
+                    graphNote = "流程圖等待合併中，這次沒有上傳流程圖";
+                else if (_graph.HasUnsavedChanges())
+                    graphNote = "流程圖分頁還有沒存檔的修改，流程圖這次沒有上傳（存檔後再按上傳）";
+                else
+                {
+                    var schema = _graph.Schema;
+                    var baseSnap = ReadGraphBase();
+                    var mine = _graph.BuildLocalSnapshot(baseSnap);
+                    if (baseSnap == null || mine == null)
+                        graphNote = "流程圖還沒有和雲端對過，這次沒有上傳流程圖（請先按一次「下載」）";
+                    else if (!FlowGraphMerge.AreEqual(mine, baseSnap, schema))
+                    {
+                        SetPhase("檢查雲端");
+                        var graphPull = await Client().SyncPullAsync(null, baseStore.LastGraphPullServerTime, tables: false, graph: true);
+                        var conflict = false;
+                        if (graphPull.Graph is { Exists: true, Graph: not null })
+                        {
+                            var merged = await MergeFlowGraphAsync(graphPull.Graph);
+                            conflict = merged.Conflict;
+                            if (conflict)
+                            {
+                                graphNote = merged.Summary + "，流程圖沒有上傳";
+                                graphFailed = true;
+                            }
+                            baseSnap = ReadGraphBase();
+                            mine = _graph.BuildLocalSnapshot(baseSnap);
+                        }
+                        baseStore.LastGraphPullServerTime = graphPull.ServerTime;
+                        if (!conflict && mine != null && baseSnap != null && !FlowGraphMerge.AreEqual(mine, baseSnap, schema))
+                        {
+                            graphMerge = new CloudGraphMerge(mine.ToJObject(schema), baseSnap.ToJObject(schema), ReadNodeSchema());
+                            graphMine = mine;
+                        }
+                    }
+                }
+            }
             if (graph && !baseStore.IsFlowGraphManaged)
             {
                 if (_graph.HasUnsavedChanges())
@@ -323,28 +376,44 @@ public sealed class CloudSyncState
             }
             var contentSeed = graph && graphSeed == null && baseStore.IsFlowGraphManaged && !baseStore.NodeContentSeeded
                 ? _graph.BuildCloudNodeContent() : null;
-            if (items.Count == 0 && rules == null && references.Count == 0 && contentSeed == null && graphSeed == null)
+            if (items.Count == 0 && rules == null && references.Count == 0 && contentSeed == null && graphSeed == null && graphMerge == null)
             {
                 StatusMessage = null;
-                Finish(graphNote == null, "上傳完成", "沒有要上傳的改動。" + (graphNote != null ? graphNote + "。" : "") + (rulesWarning ?? ""));
+                Finish(graphNote == null, graphNote == null ? "上傳完成" : "沒有上傳", "沒有要上傳的改動。" + (graphNote != null ? graphNote + "。" : "") + (rulesWarning ?? ""));
                 return;
             }
 
-            var outcome = await Client().PushAsync(items, rules, references, contentSeed, graphSeed);
+            var outcome = await Client().PushAsync(items, rules, references, contentSeed, graphSeed, graphMerge);
             if (outcome.Graph is { } gr)
             {
-                // Rejected = the cloud already has a flow graph (someone uploaded it): it is the master now too.
                 baseStore.SetFlowGraphManaged();
                 if (gr.Status == "ok")
                 {
                     baseStore.NodeContentSeeded = true;
-                    graphNote = "流程圖已上傳，之後請在 AFFiNE 網頁版編輯，本機流程圖分頁改成唯讀";
+                    if (_graph.BuildLocalSnapshot(null) is { } seeded)
+                        baseStore.FlowGraphBaseJson = seeded.ToJson(_graph.Schema);
+                    graphNote = "流程圖已上傳，之後本機和 AFFiNE 網頁版都能編輯，按「上傳」／「下載」互相同步";
                 }
                 else
                 {
-                    graphNote = "雲端已經有流程圖，改以雲端為主（本機流程圖分頁改成唯讀），按「下載」取得雲端的版本";
+                    // Rejected = the cloud already has a flow graph (someone else uploaded theirs first).
+                    graphNote = "雲端已經有流程圖，這次沒有上傳流程圖；請按「下載」取得雲端的版本（本機的流程圖會先備份再換成雲端的）";
                 }
-                await _reload.RequestReloadAsync();
+            }
+            if (graphMerge != null)
+            {
+                if (outcome.GraphMerge is { Status: "ok" })
+                {
+                    baseStore.FlowGraphBaseJson = graphMine!.ToJson(_graph.Schema);
+                    graphNote = "流程圖的本機修改已上傳";
+                }
+                else
+                {
+                    graphFailed = true;
+                    graphNote = outcome.GraphMerge == null
+                        ? "流程圖沒有上傳：affine-mcp 裡的 StoryForge 擴充太舊（需要 @nineday/storyforge-cloud 1.2.0 以上）"
+                        : $"流程圖沒有上傳：{outcome.GraphMerge.Message}";
+                }
             }
             var results = outcome.Results;
             if (rules != null)
@@ -374,7 +443,8 @@ public sealed class CloudSyncState
             }
 
             StatusMessage = null;
-            Finish(rejected == 0, rejected == 0 ? "上傳完成" : "上傳完成，但有劇本被擋下",
+            Finish(rejected == 0 && !graphFailed,
+                rejected > 0 ? "上傳完成，但有劇本被擋下" : graphFailed ? "上傳完成，但流程圖沒有上傳" : "上傳完成",
                 (graphNote != null ? graphNote + "；" : "") +
                 (tables ? $"劇本上傳 {ok} 份" : "沒有上傳劇本表格") +
                 (rejected > 0 ? $"；{rejected} 份被擋下（雲端在上次下載後又改過，請先下載）" : "") +
@@ -396,20 +466,161 @@ public sealed class CloudSyncState
 
     // ---------- flow graph ----------
 
-    // Pulls the cloud flow graph (if one was uploaded) into blueprint.json and reloads the canvas, before the
-    // tables are downloaded so nodes created in the web editor already exist locally. Null = no cloud graph.
-    private async Task<string?> ApplyFlowGraphAsync(CloudGraphPull pull)
+    public FlowGraphWaitState? GraphWait => IsConfigured ? FlowGraphWaitStore.State(DataFolder) : null;
+    public string GraphWaitFolder => FlowGraphWaitStore.Folder(DataFolder);
+
+    private FlowGraphSnapshot? ReadGraphBase() =>
+        Base().FlowGraphBaseJson is { } json ? FlowGraphSnapshot.Parse(json, _graph.Schema) : null;
+
+    private FlowGraphSnapshot CloudSnapshot(CloudGraphPull pull, FlowGraphSnapshot contentFallback)
     {
-        if (!pull.Exists || pull.Graph == null)
-            return null;
-        Base().SetFlowGraphManaged();
-        var graph = CanonicalGraphJson.Parse(pull.Graph.ToString(Newtonsoft.Json.Formatting.None));
-        var summary = _graph.ApplyCloudGraph(graph, pull.Memos, pull.ContentSeeded ? pull.Content : null);
+        var snapshot = FlowGraphSnapshot.From(pull.Graph!, pull.Memos, pull.ContentSeeded ? pull.Content : null, _graph.Schema);
+        // A graph uploaded before node content was synced has none: that is "never sent", not "cleared".
+        if (!pull.ContentSeeded)
+            snapshot.Content = contentFallback.Clone().Content;
+        return snapshot;
+    }
+
+    // Merges the cloud flow graph into the local one (three-way, on the base both last agreed on) and reloads
+    // the canvas; the base becomes the cloud's version, so whatever the local graph still differs by is what
+    // the next 上傳 sends. A place both sides changed starts the flow graph's wait merge instead (nothing
+    // local is touched, the base stays).
+    private async Task<(string Summary, bool Conflict)> MergeFlowGraphAsync(CloudGraphPull pull)
+    {
+        var schema = _graph.Schema ?? throw new InvalidOperationException("流程圖尚未載入，請先切換到流程圖分頁。");
+        var baseStore = Base();
+        var baseSnap = ReadGraphBase();
+        var mine = _graph.BuildLocalSnapshot(baseSnap);
+        baseStore.SetFlowGraphManaged();
         if (pull.ContentSeeded)
-            Base().NodeContentSeeded = true;
+            baseStore.NodeContentSeeded = true;
+
+        if (mine == null)
+        {
+            // No blueprint yet (never saved here): the cloud graph simply becomes the local one.
+            var cloudOnly = FlowGraphSnapshot.From(pull.Graph!, pull.Memos, pull.ContentSeeded ? pull.Content : null, schema);
+            var first = await ApplyGraphAsync(cloudOnly, pull.ContentSeeded);
+            baseStore.FlowGraphBaseJson = (_graph.BuildLocalSnapshot(cloudOnly) ?? cloudOnly).ToJson(schema);
+            return (first, false);
+        }
+
+        // Never synced here: the local graph counts as unchanged, so the cloud's version wins everywhere.
+        baseSnap ??= mine;
+        var theirs = CloudSnapshot(pull, baseSnap);
+        var outcome = FlowGraphMerge.Merge(baseSnap, mine, theirs, schema);
+        if (outcome.HasConflicts)
+        {
+            FlowGraphWaitStore.Start(DataFolder, baseSnap, mine, theirs, outcome, schema);
+            await _reload.RequestReloadAsync(); // the flow graph tab turns read-only
+            return ($"流程圖有 {outcome.ConflictCount} 處本機和雲端都改過，已進入等待合併（合併用的檔案在 {GraphWaitFolder}）", true);
+        }
+
+        var summary = FlowGraphMerge.AreEqual(outcome.Merged, mine, schema) ? "流程圖沒有變動" : await ApplyGraphAsync(outcome.Merged, true);
+        baseStore.FlowGraphBaseJson = theirs.ToJson(schema);
+        if (!FlowGraphMerge.AreEqual(outcome.Merged, theirs, schema))
+            summary += "（本機還有修改沒上傳）";
+        return (summary, false);
+    }
+
+    private async Task<string> ApplyGraphAsync(FlowGraphSnapshot snapshot, bool withContent, Action? beforeReload = null)
+    {
+        var summary = _graph.ApplyCloudGraph(CanonicalGraphJson.Clone(snapshot.Graph), snapshot.Memos, withContent ? snapshot.Content : null);
+        beforeReload?.Invoke();
         await _reload.RequestReloadAsync();
         var collisions = _graph.SyncRenamedFilesAfterCloudDownload();
         return collisions > 0 ? $"{summary}（{collisions} 個改名的劇本檔撞名，沒有搬，請到流程圖分頁處理）" : summary;
+    }
+
+    // 繼續合併 (flow graph): the working file must load and pass the graph checks; a cloud that changed again
+    // during the wait is merged in on top (and only stops the merge if it hits the same places again).
+    private bool _graphUnchangedWarned;
+
+    public async Task ContinueGraphMergeAsync()
+    {
+        if (!FlowGraphWaitStore.IsWaiting(DataFolder) || !await BeginAsync("檢查流程圖合併結果…", "檢查流程圖合併結果"))
+            return;
+        const string notYet = "還不能完成流程圖合併";
+        try
+        {
+            var schema = _graph.Schema ?? throw new InvalidOperationException("流程圖尚未載入，請先切換到流程圖分頁。");
+            FlowGraphSnapshot working;
+            try
+            {
+                working = FlowGraphWaitStore.ReadWorking(DataFolder, schema);
+            }
+            catch (Exception e)
+            {
+                Finish(false, notYet, $"merged.json 讀不進來：{e.Message}");
+                return;
+            }
+            var validation = CanonicalGraphJson.Validate(working.Graph, schema);
+            if (!validation.IsValid)
+            {
+                Finish(false, notYet, "merged.json 的流程圖檢查沒過：" + string.Join("；", validation.Errors.Take(5)) +
+                                      (validation.Errors.Count > 5 ? $"…（共 {validation.Errors.Count} 個）" : ""));
+                return;
+            }
+
+            var baseSnap = FlowGraphWaitStore.ReadBase(DataFolder, schema);
+            var mine = FlowGraphWaitStore.ReadMine(DataFolder, schema);
+            var theirs = FlowGraphWaitStore.ReadTheirs(DataFolder, schema);
+            var untouched = FlowGraphMerge.AreEqual(working, FlowGraphMerge.Merge(baseSnap, mine, theirs, schema).Merged, schema);
+            if (untouched && !_graphUnchangedWarned)
+            {
+                _graphUnchangedWarned = true;
+                Finish(false, notYet, "merged.json 沒有改動，看起來還沒合併。如果確定衝突的地方全部用本機的，再按一次「繼續合併」。");
+                return;
+            }
+
+            var pull = await Client().SyncPullAsync(null, null, tables: false, graph: true);
+            if (pull.Graph is not { Exists: true, Graph: not null })
+                throw new InvalidOperationException("雲端讀不到流程圖。");
+            var cloud = CloudSnapshot(pull.Graph, theirs);
+            if (!FlowGraphMerge.AreEqual(cloud, theirs, schema))
+            {
+                // What the cloud changed since `theirs`, on top of the merge result (which already has theirs).
+                var again = FlowGraphMerge.Merge(theirs, working, cloud, schema);
+                if (again.HasConflicts)
+                {
+                    FlowGraphWaitStore.Restack(DataFolder, theirs, working, cloud, again, schema);
+                    _graphUnchangedWarned = false;
+                    Finish(false, notYet, $"雲端在等待期間又被改了，而且有 {again.ConflictCount} 處和合併結果改到同一個地方。" +
+                                          "已把目前的合併結果當成新的 mine.json、最新的雲端版本當成新的 theirs.json，conflicts.md 和 merged.json 也更新了，請再合併一次。");
+                    return;
+                }
+                working = again.Merged;
+                theirs = cloud;
+            }
+
+            var summary = await ApplyGraphAsync(working, true, () => FlowGraphWaitStore.Finish(DataFolder));
+            var baseStore = Base();
+            baseStore.FlowGraphBaseJson = theirs.ToJson(schema);
+            baseStore.LastGraphPullServerTime = pull.ServerTime;
+            _graphUnchangedWarned = false;
+            StatusMessage = null;
+            Finish(true, "流程圖合併完成", $"{summary}。已解除唯讀，按「上傳」送出合併結果。");
+        }
+        catch (Exception e)
+        {
+            StatusMessage = null;
+            Finish(false, "流程圖合併失敗", e.Message);
+        }
+        finally
+        {
+            End();
+        }
+    }
+
+    // Drops the wait: the local graph is still as it was, and the next 下載 / 上傳 will find the same conflicts.
+    public async Task CancelGraphWaitAsync()
+    {
+        if (IsBusy || !FlowGraphWaitStore.IsWaiting(DataFolder))
+            return;
+        FlowGraphWaitStore.Finish(DataFolder);
+        _graphUnchangedWarned = false;
+        StatusMessage = "已取消流程圖的等待合併，本機流程圖維持原樣並解除唯讀。下次下載或上傳時，同樣的衝突會再出現。";
+        await _reload.RequestReloadAsync();
+        Notify();
     }
 
     // Files an AI that only has MCP needs (AGENTS.md tells it to read them), uploaded read-only for

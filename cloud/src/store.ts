@@ -9,7 +9,7 @@ import {
 import { parseRules, type Rules } from "./rules.js";
 import { EXTENSION_VERSION } from "./version.js";
 import type { SessionPool } from "./session-pool.js";
-import { createFlowGraph, flowgraphDocId, type CanonicalGraph, type NodeContent } from "./flowgraph.js";
+import { createFlowGraph, flowgraphDocId, type CanonicalGraph, type GraphChangeStats, type NodeContent } from "./flowgraph.js";
 
 /** Reference files local StoryForge uploads for AIs that only have MCP (AGENTS.md, the world book, ...). */
 export function referencesDocId(ws: string) { return `db$${ws}$sf.references`; }
@@ -121,8 +121,11 @@ export function createStore(ctx: HostContext, progress: Progress = () => {}, poo
    * download must not read that as "cleared". Written only while the doc is not marked seeded yet.
    */
   async function pushAllEx(s: DocSession, items: PushItem[], rulesUpload?: { json: string; hash: string }, references?: ReferenceUpload[],
-    contentSeed?: Record<string, NodeContent>, graphSeed?: GraphPush) {
+    contentSeed?: Record<string, NodeContent>, graphSeed?: GraphPush, graphMerge?: GraphMergePush) {
     let contentSeeded: boolean | undefined;
+    // Local flow graph edits (what changed since the base both sides agreed on), before the tables so a
+    // table pushed for a node created locally finds its node.
+    const graphMergeResult = graphMerge ? await pushGraphMerge(s, graphMerge) : undefined;
     // First upload of the flow graph, in the same call (seed only: never over an existing cloud graph).
     let graph: Awaited<ReturnType<typeof pushGraph>> | undefined;
     if (graphSeed) {
@@ -145,7 +148,7 @@ export function createStore(ctx: HostContext, progress: Progress = () => {}, poo
         contentSeeded = true;
       }
     }
-    return { results: await pushTables(s, items, rulesUpload, references), contentSeeded, graph };
+    return { results: await pushTables(s, items, rulesUpload, references), contentSeeded, graph, graphMerge: graphMergeResult };
   }
 
   async function pushTables(s: DocSession, items: PushItem[], rulesUpload?: { json: string; hash: string }, references?: ReferenceUpload[]) {
@@ -287,7 +290,7 @@ export function createStore(ctx: HostContext, progress: Progress = () => {}, poo
     return out;
   }
 
-  // ----- flow graph (cloud is the master once seeded) -----
+  // ----- flow graph (edited both in the cloud and in local StoryForge; local edits arrive as a diff) -----
 
   async function pullGraph(s: DocSession) {
     const doc = await s.load(flowgraphDocId(s.workspaceId));
@@ -342,7 +345,42 @@ export function createStore(ctx: HostContext, progress: Progress = () => {}, poo
     return { status: "ok" as const, stats };
   }
 
-  return { flow, pushAllEx, writeReferences, readReferences, syncPull, pullGraph, pushGraph, schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
+  type GraphSnapshot = { graph: CanonicalGraph; memos?: Record<string, string>; content?: Record<string, NodeContent> };
+  type GraphMergePush = GraphSnapshot & { base: GraphSnapshot; nodeSchema?: string };
+
+  /**
+   * Local StoryForge's flow graph edits: only what differs between `base` (the cloud graph that machine last
+   * merged with) and the graph sent is written, field by field, so edits made in the cloud meanwhile to other
+   * fields survive. The caller downloads and merges first, so a field changed on both sides never gets here.
+   */
+  async function pushGraphMerge(s: DocSession, body: GraphMergePush) {
+    progress("檢查雲端");
+    await requireWritable(s);
+    progress("上傳流程圖");
+    const docId = flowgraphDocId(s.workspaceId);
+    const doc = await s.load(docId);
+    if (flow.isEmpty(doc)) return { status: "rejected" as const, message: "雲端還沒有流程圖。" };
+    const before = Y.encodeStateVector(doc);
+    let stats: GraphChangeStats | undefined;
+    let content = 0;
+    doc.transact(() => {
+      stats = flow.writeGraph(doc, body.graph, body.base.graph);
+      stats.memos = flow.writeMemos(doc, body.memos ?? {}, body.base.memos ?? {});
+      // Node content is only diffed once the cloud has it at all (contentSeed does the first full copy).
+      if (doc.getMap("meta").get("contentSeeded") === true)
+        content = flow.writeContent(doc, body.content ?? {}, body.base.content ?? {});
+    });
+    await s.push(docId, doc, before);
+    if (body.nodeSchema) {
+      await mutate(s, rulesDocId(s.workspaceId), d => {
+        const rules = d.getMap("rules");
+        if (rules.get("nodeSchema") !== body.nodeSchema) rules.set("nodeSchema", body.nodeSchema);
+      });
+    }
+    return { status: "ok" as const, stats, content };
+  }
+
+  return { flow, pushAllEx, pushGraphMerge, writeReferences, readReferences, syncPull, pullGraph, pushGraph, schema, withSession, mutate, project, requireWritable, rules, resolveGuid, readPlayscript, pullAll, pushAll };
 }
 
 export type Store = ReturnType<typeof createStore>;

@@ -1,6 +1,6 @@
 {
   "name": "@nineday/storyforge-cloud",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "StoryForge's cloud data layout (docs inside an AFFiNE workspace) and the StoryForge extension for the nineday affine-mcp fork: sf_* tools and the sf CLI.",
   "license": "UNLICENSED",
   "repository": {

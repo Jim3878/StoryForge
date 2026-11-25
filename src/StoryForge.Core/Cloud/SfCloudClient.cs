@@ -45,6 +45,10 @@ public sealed class CloudGraphPushResult
 public sealed record CloudGraphSeed(string GraphJson, IReadOnlyDictionary<string, string> Memos,
     IReadOnlyDictionary<string, Dictionary<string, string>> Content, string? NodeSchemaJson);
 
+/// <summary>Local flow graph edits: the local graph and the base (the cloud graph last merged with), both as
+/// FlowGraphSnapshot JSON objects. The extension writes only what differs between the two.</summary>
+public sealed record CloudGraphMerge(Newtonsoft.Json.Linq.JObject Snapshot, Newtonsoft.Json.Linq.JObject Base, string? NodeSchemaJson);
+
 /// <summary>A reference file uploaded for MCP-only AIs (AGENTS.md, the world book, ...).</summary>
 public sealed record CloudReference(string Name, string Text, string Hash);
 
@@ -53,6 +57,9 @@ public sealed class CloudPushOutcome
     public List<CloudPushResult> Results { get; set; } = new();
     // Set when a flow graph seed was sent: status "ok" or "rejected" (the cloud already has one) + message.
     public CloudGraphPushResult? Graph { get; set; }
+    // Set when a graphMerge was sent: status "ok" or "rejected" + message. Null from an extension too old to
+    // know graphMerge (before @nineday/storyforge-cloud 1.2.0).
+    public CloudGraphPushResult? GraphMerge { get; set; }
     // Set when contentSeed was sent: true once the cloud graph has node content (now or already before).
     public bool? ContentSeeded { get; set; }
 }
@@ -169,6 +176,7 @@ public sealed class SfCloudClient
         IReadOnlyList<CloudReference>? references = null,
         IReadOnlyDictionary<string, Dictionary<string, string>>? contentSeed = null,
         CloudGraphSeed? graphSeed = null,
+        CloudGraphMerge? graphMerge = null,
         CancellationToken ct = default)
     {
         var inPath = TempFile("push-in");
@@ -192,6 +200,14 @@ public sealed class SfCloudClient
                     ["memos"] = Newtonsoft.Json.Linq.JObject.FromObject(graphSeed.Memos),
                     ["content"] = Newtonsoft.Json.Linq.JObject.FromObject(graphSeed.Content),
                     ["nodeSchema"] = graphSeed.NodeSchemaJson,
+                },
+                graphMerge = graphMerge == null ? null : new Newtonsoft.Json.Linq.JObject
+                {
+                    ["graph"] = graphMerge.Snapshot["graph"],
+                    ["memos"] = graphMerge.Snapshot["memos"],
+                    ["content"] = graphMerge.Snapshot["content"],
+                    ["base"] = graphMerge.Base,
+                    ["nodeSchema"] = graphMerge.NodeSchemaJson,
                 },
             };
             await File.WriteAllTextAsync(inPath, JsonConvert.SerializeObject(body), new UTF8Encoding(false), ct);

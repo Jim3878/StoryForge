@@ -141,15 +141,25 @@ Blank rows are kept in sync (`ReadRowsFromFile(path, keepBlankRows: true)`), but
 empty one (`CloudRows.Normalize`).
 
 **Flow graph:** the first 上傳 with 流程圖 checked seeds it (the `graph` part of `sf push`, refused if the cloud
-already has one — then the cloud one is adopted as the master); from then on the cloud copy `db$<ws>$sf.flowgraph.main`
-(`cloud/src/flowgraph.ts`: the canonical graph as Y maps, plus per-node Memo Y.Texts) is the master. It is edited
-in the AFFiNE web editor (the same `graph-editor.js` canvas, saved as per-field changes relative to what that
-editor loaded); 下載 pulls it into blueprint.json's `graph` (keeping `baseGraph`, so 匯出至Unity still merges
-against Unity), writes the Memos to the nodes' .json and moves renamed nodes' files. The marker
-`cloud-base/<ws>/flowgraph-managed.json` makes the local flow graph tab read-only (`GraphEditorState.IsCloudManaged`
-refuses 存檔 / 從Unity匯入 / field and Memo edits; the canvas gets `read_only`). There is deliberately no "overwrite the
-cloud with the local graph" action: the local copy is only the last download, so it could only throw away
-everyone's later edits (restoring and Unity-side changes need their own features). The node schema (ProcessNodeSchema.json) travels with the graph upload into the rules doc.
+already has one). From then on the cloud copy `db$<ws>$sf.flowgraph.main` (`cloud/src/flowgraph.ts`: the canonical
+graph as Y maps, plus per-node Memo Y.Texts) and the local blueprint are **both editable** — the AFFiNE web editor
+(the same `graph-editor.js` canvas, saved as per-field changes relative to what that editor loaded) and the local
+flow graph tab — and 上傳 / 下載 merge them. The base is `cloud-base/<ws>/flowgraph-base.json`: the cloud graph
+(+ memos + node content, a `FlowGraphSnapshot`) this machine last merged with. 下載 = `FlowGraphMerge.Merge(base,
+local, cloud)` (`Core/Cloud/FlowGraphSync.cs`, on top of `CanonicalGraphJson.Merge`; node texts merge per field),
+written into blueprint.json's `graph` (keeping `baseGraph`, so 匯出至Unity still merges against Unity), the Memos
+into the nodes' .json, renamed nodes' files moved; the base becomes the cloud's version. 上傳 first does that same
+merge if the cloud changed, then sends `graphMerge` (local snapshot + base) and the extension writes only the
+fields that differ (`pushGraphMerge` -> `writeGraph(doc, target, base)`), so other people's edits elsewhere survive.
+A field both sides changed differently (positions excepted: local wins) is a conflict: nothing is merged, and
+`FlowGraphWaitStore` writes `Conflicts/_flowgraph/{base,mine,theirs}.json` + `conflicts.md` + `README.md` + the
+working file `merged.json` (everything that merged by itself, local values at the conflicts) for an AI to finish;
+only during that wait is the local flow graph tab read-only (`GraphEditorState.IsCloudMergeWaiting`: refuses 存檔 /
+從Unity匯入 / field and Memo edits; the canvas gets `read_only`) and the graph left out of 上傳 / 下載. 繼續合併
+validates `merged.json`, merges in whatever the cloud changed during the wait (base = the old theirs), applies it
+locally and sets the base to the cloud's version — the result goes up with the next 上傳. A machine that only has
+the old `flowgraph-managed.json` marker gets its base from the saved graph at load (`EnsureCloudBase`), before
+anything can be edited. Both 上傳 and 下載 skip the graph while the flow graph tab has unsaved changes. The node schema (ProcessNodeSchema.json) travels with the graph upload into the rules doc.
 The nodes' other `NodeContentStore` texts (衝突/變化/角色/地點) live in the same doc's `content` map. A graph uploaded
 before that existed has none, so 下載 applies them only once the doc's `meta.contentSeeded` is set — the next 上傳
 seeds them (`contentSeed`, written only while unseeded); until then the MCP tools refuse to write them.

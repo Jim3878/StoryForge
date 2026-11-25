@@ -59,15 +59,26 @@
                 <div class="cs-hint">規則跟 git 一樣：雲端有新改動就要先下載；兩邊都改過的劇本要先處理才能上傳。上傳時一併更新規則 JSON。</div>
             </div>
 
-            <div class="cs-card">
+            <div class="cs-card @(State.GraphWait != null ? "cs-card-wait" : "")">
                 <div class="cs-card-title">流程圖</div>
-                @if (State.IsFlowGraphManaged)
+                @if (State.GraphWait is { } gw)
                 {
-                    <div>由雲端管理。請在 AFFiNE 網頁版編輯，按「下載」取得最新版；本機流程圖分頁是唯讀。</div>
+                    <div class="cs-warn">等待合併：本機和雲端有 @gw.ConflictCount 處改到同一個地方。</div>
+                    <div class="cs-hint">流程圖分頁暫時唯讀，上傳／下載也先跳過流程圖。請叫 Claude 照資料夾裡的 README.md 和 conflicts.md 把結果改進 merged.json，再按「繼續合併」。</div>
+                    <div class="cs-wait-path">@State.GraphWaitFolder</div>
+                    <div class="cs-actions">
+                        <button @onclick="State.ContinueGraphMergeAsync" disabled="@State.IsBusy">繼續合併</button>
+                        <button @onclick="State.CancelGraphWaitAsync" disabled="@State.IsBusy">取消等待</button>
+                    </div>
+                }
+                else if (State.IsFlowGraphManaged)
+                {
+                    <div>本機和 AFFiNE 網頁版都能編輯。「下載」把雲端的修改合併進本機，「上傳」把本機的修改送上去（會先合併雲端的新修改）。</div>
+                    <div class="cs-hint">兩邊改到不同節點或不同欄位會自動合併；改到同一處才會停下來等待合併。</div>
                 }
                 else
                 {
-                    <div>還沒上傳。勾著「流程圖」按「上傳」就會一起傳上去；之後雲端是主版本，大家在網頁版編輯，本機流程圖分頁改成唯讀。</div>
+                    <div>還沒上傳。勾著「流程圖」按「上傳」就會一起傳上去；之後本機和網頁版都能編輯，用「上傳」／「下載」互相同步。</div>
                 }
             </div>
 
