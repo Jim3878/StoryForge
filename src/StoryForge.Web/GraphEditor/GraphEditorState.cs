@@ -537,7 +537,11 @@ public sealed class GraphEditorState
 
         CanonicalGraphJson.Normalize(cloudGraph, _model.Schema);
         var current = _model.BuildCanonicalDocument();
-        var known = current.Nodes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
+        // Nodes that already had a playscript name here. One that is new, or was still unnamed (created in the
+        // web editor and named later), gets its files below.
+        var known = current.Nodes
+            .Where(n => n.Type != PlayscriptProcessNodeTypeName || !string.IsNullOrEmpty(n.Data.Value<string>("playscriptId")))
+            .Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
         var changes = CanonicalGraphJson.DescribeChanges(current, cloudGraph, _model.Schema).Count;
         if (changes > 0 && File.Exists(_blueprintPath))
             Backup(_blueprintPath, "blueprint");

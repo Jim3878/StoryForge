@@ -448,8 +448,10 @@ public sealed class PipelineStatusState
         }
 
         PendingScriptFileConflict = null;
-        SetBuildStatusMessage();
         await RefreshAsync();
+        // After the refresh: it ends by writing its own summary into StatusMessage, which used to wipe this
+        // one out and leave the button looking like it did nothing.
+        SetBuildStatusMessage();
     }
 
     private void SetBuildStatusMessage()
@@ -845,7 +847,12 @@ public sealed class PipelineStatusState
         }
 
         if (_cSharpExportQueue.Count == 0)
+        {
+            // Nothing to export at all: say why, instead of silently unchecking the rows.
+            StatusMessage = $"沒有匯出：勾選的 {excludedForNoContent.Count} 份劇本檔都沒有內容（還沒建立劇本檔，或表格還是空白範本）：" +
+                            string.Join("、", excludedForNoContent.Take(5)) + (excludedForNoContent.Count > 5 ? "…" : "");
             return excludedForNoContent;
+        }
 
         _cSharpExportConflictAutoMode = ConflictAutoMode.None;
         _playPlayscriptWarningAutoMode = ConflictAutoMode.None;
